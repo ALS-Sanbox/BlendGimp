@@ -8,6 +8,8 @@ from ..core import gimp_manager
 from ..ipc.connection import (
     connection_manager,
     direct_paint_owns_refresh,
+    GimpEngineShutdownRefusedError,
+    GimpImageNotFoundError,
     set_direct_paint_refresh_owner,
 )
 from ..painting.stroke_tool import (
@@ -19,6 +21,36 @@ try:
     import numpy as np
 except Exception:
     np = None
+
+
+# ============================================================
+# GIMP ENGINE LIFECYCLE RUNTIME
+# ============================================================
+
+ENGINE_LIFECYCLE_POLL_INTERVAL = 0.5
+ENGINE_HEALTHCHECK_INTERVAL = 5.0
+ENGINE_CONNECT_BACKOFF_MAX = 5.0
+ENGINE_RESTART_BACKOFF_MAX = 30.0
+
+_ENGINE_LIFECYCLE_RUNTIME = {
+    "next_connect_at": 0.0,
+    "next_healthcheck_at": 0.0,
+    "next_restart_at": 0.0,
+    "connect_failures": 0,
+    "restart_failures": 0,
+}
+
+
+def reset_engine_lifecycle_runtime():
+    _ENGINE_LIFECYCLE_RUNTIME.update(
+        {
+            "next_connect_at": 0.0,
+            "next_healthcheck_at": 0.0,
+            "next_restart_at": 0.0,
+            "connect_failures": 0,
+            "restart_failures": 0,
+        }
+    )
 
 
 # ============================================================
@@ -218,6 +250,532 @@ def clear_image_results(
     scene.blendgimp_images_json = "[]"
     scene.blendgimp_layers_json = "{}"
     scene.blendgimp_texture_sync_json = "{}"
+
+
+def clear_gimp_session_bindings(
+    scene,
+    status="No GIMP image selected"
+):
+    """Clear IDs that are valid only for one GIMP process session."""
+
+    clear_image_results(
+        scene
+    )
+
+    scene.blendgimp_auto_sync_enabled = False
+    scene.blendgimp_auto_sync_image_id = -1
+    scene.blendgimp_auto_sync_revision = 0
+    scene.blendgimp_auto_sync_status = str(status)
+    scene.blendgimp_auto_sync_detector = ""
+
+    scene.blendgimp_blender_paint_sync_enabled = False
+    scene.blendgimp_blender_paint_sync_image_id = -1
+    scene.blendgimp_blender_paint_sync_layer_id = -1
+    scene.blendgimp_blender_paint_sync_status = "Off"
+
+    set_direct_paint_refresh_owner(
+        False
+    )
+    reset_auto_sync_runtime()
+    reset_blender_paint_sync_runtime()
+
+
+def store_engine_connection(
+    scene,
+    response
+):
+    """Store a successful HELLO/READY handshake in Blender scene state."""
+
+    scene.blendgimp_connected = True
+
+    scene.blendgimp_protocol_version = int(
+        response.get(
+            "protocol",
+            0
+        )
+    )
+
+    scene.blendgimp_remote_version = str(
+        response.get(
+            "blendgimp_version",
+            response.get(
+                "server",
+                ""
+            )
+        )
+    )
+
+    scene.blendgimp_runtime_gimp_version = str(
+        response.get(
+            "gimp_version",
+            ""
+        )
+    )
+
+    scene.blendgimp_engine_state = (
+        gimp_manager.ENGINE_STATE_CONNECTED
+    )
+    scene.blendgimp_engine_last_error = ""
+
+    gimp_manager.mark_engine_connected()
+
+    _ENGINE_LIFECYCLE_RUNTIME[
+        "connect_failures"
+    ] = 0
+    _ENGINE_LIFECYCLE_RUNTIME[
+        "restart_failures"
+    ] = 0
+    _ENGINE_LIFECYCLE_RUNTIME[
+        "next_restart_at"
+    ] = 0.0
+    _ENGINE_LIFECYCLE_RUNTIME[
+        "next_healthcheck_at"
+    ] = (
+        time.monotonic()
+        + ENGINE_HEALTHCHECK_INTERVAL
+    )
+
+
+def clear_engine_connection(
+    scene,
+    clear_results=True
+):
+    scene.blendgimp_connected = False
+    scene.blendgimp_protocol_version = 0
+    scene.blendgimp_remote_version = ""
+    scene.blendgimp_runtime_gimp_version = ""
+
+    if clear_results:
+        clear_image_results(
+            scene
+        )
+
+
+def start_scene_engine(
+    scene,
+    automatic=False
+):
+    """Start the selected engine mode and schedule a non-blocking connect."""
+
+    gimp_path = str(
+        scene.blendgimp_gimp_path
+        or ""
+    )
+
+    if not gimp_path:
+        scene.blendgimp_engine_state = (
+            gimp_manager.ENGINE_STATE_FAILED
+        )
+        scene.blendgimp_engine_last_error = (
+            "GIMP has not been detected"
+        )
+        return False, None
+
+    if not os.path.isfile(
+        gimp_path
+    ):
+        scene.blendgimp_gimp_detected = False
+        scene.blendgimp_gimp_running = False
+        scene.blendgimp_engine_state = (
+            gimp_manager.ENGINE_STATE_FAILED
+        )
+        scene.blendgimp_engine_last_error = (
+            "The detected GIMP executable no longer exists"
+        )
+        return False, None
+
+    process_was_running = (
+        gimp_manager.is_gimp_running()
+    )
+
+    success, pid = gimp_manager.launch_gimp(
+        gimp_path,
+        scene.blendgimp_engine_mode
+    )
+
+    if not success:
+        snapshot = (
+            gimp_manager.get_engine_snapshot()
+        )
+        scene.blendgimp_gimp_running = False
+        scene.blendgimp_engine_state = str(
+            snapshot.get(
+                "state",
+                gimp_manager.ENGINE_STATE_FAILED
+            )
+        )
+        scene.blendgimp_engine_last_error = str(
+            snapshot.get(
+                "last_error",
+                "Could not launch GIMP"
+            )
+        )
+        return False, None
+
+    if not process_was_running:
+        clear_gimp_session_bindings(
+            scene,
+            status=(
+                "Waiting for a Blender-owned texture"
+            )
+        )
+
+    scene.blendgimp_engine_should_run = True
+    scene.blendgimp_gimp_running = True
+    scene.blendgimp_engine_state = (
+        gimp_manager.ENGINE_STATE_STARTING
+    )
+    scene.blendgimp_engine_last_error = ""
+
+    if automatic:
+        scene.blendgimp_engine_restart_count += 1
+
+    _ENGINE_LIFECYCLE_RUNTIME[
+        "next_connect_at"
+    ] = time.monotonic() + 0.25
+    _ENGINE_LIFECYCLE_RUNTIME[
+        "next_restart_at"
+    ] = 0.0
+
+    return True, pid
+
+
+def connect_scene_engine(
+    scene
+):
+    """Attempt one handshake; the lifecycle timer owns retry scheduling."""
+
+    scene.blendgimp_engine_state = (
+        gimp_manager.ENGINE_STATE_CONNECTING
+    )
+    gimp_manager.mark_engine_connecting()
+
+    try:
+        response = (
+            connection_manager.connect()
+        )
+
+        store_engine_connection(
+            scene,
+            response
+        )
+
+        clear_image_results(
+            scene
+        )
+
+        print(
+            "BLENDGIMP: "
+            "GIMP engine connection established"
+        )
+
+        return response
+
+    except Exception as exc:
+        clear_engine_connection(
+            scene
+        )
+
+        gimp_manager.mark_engine_disconnected(
+            str(exc)
+        )
+
+        snapshot = (
+            gimp_manager.get_engine_snapshot()
+        )
+
+        scene.blendgimp_engine_state = str(
+            snapshot.get(
+                "state",
+                gimp_manager.ENGINE_STATE_DISCONNECTED
+            )
+        )
+        scene.blendgimp_engine_last_error = str(
+            exc
+        )
+
+        raise
+
+
+def stop_scene_engine(
+    scene
+):
+    """Disconnect Blender and stop only the GIMP process BlendGimp owns."""
+
+    scene.blendgimp_engine_should_run = False
+
+    graceful_requested = False
+
+    if connection_manager.is_connected():
+        try:
+            connection_manager.shutdown_engine(
+                force=False
+            )
+            graceful_requested = True
+
+        except GimpEngineShutdownRefusedError as exc:
+            scene.blendgimp_engine_should_run = True
+            scene.blendgimp_engine_state = (
+                gimp_manager.ENGINE_STATE_CONNECTED
+            )
+            scene.blendgimp_engine_last_error = str(exc)
+            print(
+                "BLENDGIMP: "
+                f"GIMP shutdown refused: {exc}"
+            )
+            return False, None, False
+
+        except Exception as exc:
+            # If the plug-in or socket disappeared, the process manager still
+            # performs its bounded platform-termination fallback.
+            print(
+                "BLENDGIMP: "
+                "Clean shutdown request failed; "
+                f"using fallback: {exc}"
+            )
+
+    connection_manager.disconnect()
+    clear_engine_connection(
+        scene
+    )
+
+    success, exit_code, forced = (
+        gimp_manager.stop_gimp(
+            graceful_requested=graceful_requested
+        )
+    )
+
+    if success:
+        clear_gimp_session_bindings(
+            scene,
+            status="Engine stopped"
+        )
+
+    reset_engine_lifecycle_runtime()
+
+    scene.blendgimp_gimp_running = (
+        gimp_manager.is_gimp_running()
+    )
+
+    snapshot = (
+        gimp_manager.get_engine_snapshot()
+    )
+    scene.blendgimp_engine_state = str(
+        snapshot.get(
+            "state",
+            gimp_manager.ENGINE_STATE_STOPPED
+        )
+    )
+    scene.blendgimp_engine_last_error = str(
+        snapshot.get(
+            "last_error",
+            ""
+        )
+    )
+
+    return success, exit_code, forced
+
+
+def blendgimp_engine_lifecycle_timer():
+    """Monitor, reconnect, and recover the persistent GIMP engine."""
+
+    if not hasattr(
+        bpy.types.Scene,
+        "blendgimp_engine_state"
+    ):
+        return None
+
+    scene = getattr(
+        bpy.context,
+        "scene",
+        None
+    )
+
+    if scene is None:
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
+    now = time.monotonic()
+    running = (
+        gimp_manager.is_gimp_running()
+    )
+
+    scene.blendgimp_gimp_running = running
+
+    # A socket can look connected until the next read. Use a quiet, infrequent
+    # PING so disappearance is detected even when painting and Auto Sync are
+    # idle.
+    if connection_manager.is_connected():
+        if now >= float(
+            _ENGINE_LIFECYCLE_RUNTIME.get(
+                "next_healthcheck_at",
+                0.0
+            )
+        ):
+            try:
+                connection_manager.ping(
+                    quiet=True
+                )
+
+                store_engine_connection(
+                    scene,
+                    {
+                        "protocol": connection_manager.remote_protocol,
+                        "blendgimp_version": connection_manager.remote_version,
+                        "gimp_version": connection_manager.remote_gimp_version,
+                    }
+                )
+
+            except Exception as exc:
+                clear_engine_connection(
+                    scene
+                )
+                gimp_manager.mark_engine_disconnected(
+                    str(exc)
+                )
+                scene.blendgimp_engine_last_error = str(
+                    exc
+                )
+
+        else:
+            scene.blendgimp_connected = True
+            scene.blendgimp_engine_state = (
+                gimp_manager.ENGINE_STATE_CONNECTED
+            )
+
+    if connection_manager.is_connected():
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
+    scene.blendgimp_connected = False
+
+    if not scene.blendgimp_engine_should_run:
+        snapshot = (
+            gimp_manager.get_engine_snapshot()
+        )
+        scene.blendgimp_engine_state = str(
+            snapshot.get(
+                "state",
+                gimp_manager.ENGINE_STATE_STOPPED
+            )
+        )
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
+    if running:
+        scene.blendgimp_engine_state = (
+            gimp_manager.ENGINE_STATE_CONNECTING
+        )
+        gimp_manager.mark_engine_connecting()
+
+        if now >= float(
+            _ENGINE_LIFECYCLE_RUNTIME.get(
+                "next_connect_at",
+                0.0
+            )
+        ):
+            try:
+                connect_scene_engine(
+                    scene
+                )
+
+            except Exception as exc:
+                failures = int(
+                    _ENGINE_LIFECYCLE_RUNTIME.get(
+                        "connect_failures",
+                        0
+                    )
+                ) + 1
+
+                _ENGINE_LIFECYCLE_RUNTIME[
+                    "connect_failures"
+                ] = failures
+
+                delay = min(
+                    ENGINE_CONNECT_BACKOFF_MAX,
+                    0.5 * (2 ** min(failures - 1, 4))
+                )
+
+                _ENGINE_LIFECYCLE_RUNTIME[
+                    "next_connect_at"
+                ] = now + delay
+
+                print(
+                    "BLENDGIMP: "
+                    "Engine connection not ready; "
+                    f"retrying in {delay:.1f}s: {exc}"
+                )
+
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
+    # The owned process exited. Close any stale socket state and either wait
+    # in FAILED or schedule an automatic restart with bounded backoff.
+    connection_manager.disconnect()
+    clear_engine_connection(
+        scene
+    )
+
+    snapshot = (
+        gimp_manager.get_engine_snapshot()
+    )
+    scene.blendgimp_engine_last_error = str(
+        snapshot.get(
+            "last_error",
+            "GIMP engine is not running"
+        )
+    )
+
+    if not scene.blendgimp_engine_auto_reconnect:
+        scene.blendgimp_engine_state = (
+            gimp_manager.ENGINE_STATE_FAILED
+        )
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
+    next_restart_at = float(
+        _ENGINE_LIFECYCLE_RUNTIME.get(
+            "next_restart_at",
+            0.0
+        )
+    )
+
+    if next_restart_at <= 0.0:
+        failures = int(
+            _ENGINE_LIFECYCLE_RUNTIME.get(
+                "restart_failures",
+                0
+            )
+        )
+        delay = min(
+            ENGINE_RESTART_BACKOFF_MAX,
+            1.0 * (2 ** min(failures, 5))
+        )
+        _ENGINE_LIFECYCLE_RUNTIME[
+            "next_restart_at"
+        ] = now + delay
+        scene.blendgimp_engine_state = (
+            gimp_manager.ENGINE_STATE_DISCONNECTED
+        )
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
+    if now >= next_restart_at:
+        failures = int(
+            _ENGINE_LIFECYCLE_RUNTIME.get(
+                "restart_failures",
+                0
+            )
+        ) + 1
+        _ENGINE_LIFECYCLE_RUNTIME[
+            "restart_failures"
+        ] = failures
+
+        success, _pid = start_scene_engine(
+            scene,
+            automatic=True
+        )
+
+        if not success:
+            _ENGINE_LIFECYCLE_RUNTIME[
+                "next_restart_at"
+            ] = 0.0
+
+    return ENGINE_LIFECYCLE_POLL_INTERVAL
 
 
 def get_stored_images(
@@ -923,24 +1481,67 @@ def _find_blendgimp_image(
 ):
     """
     Find the persistent Blender Image associated with a GIMP runtime image.
-    Prefer the generated session token, with image ID as migration fallback.
+
+    A non-empty synchronization token is authoritative. GIMP runtime image IDs
+    are process-local and can be reused after a headless engine restart, while
+    Blender Image datablocks survive that restart. Falling back to a matching
+    runtime ID when the incoming token is different can therefore bind a new
+    GIMP image to a stale Blender image with an incompatible pixel buffer.
+
+    Runtime-ID fallback is retained only for legacy responses that do not carry
+    a synchronization token.
     """
 
+    image_id = int(image_id)
     sync_token = str(
         sync_token or ""
-    )
+    ).strip()
 
-    for candidate in bpy.data.images:
-        candidate_token = str(
-            candidate.get(
-                "blendgimp_sync_token",
-                ""
-            )
-        )
+    if sync_token:
+        for candidate in bpy.data.images:
+            candidate_token = str(
+                candidate.get(
+                    "blendgimp_sync_token",
+                    ""
+                )
+            ).strip()
 
-        if sync_token and candidate_token == sync_token:
-            return candidate
+            if candidate_token == sync_token:
+                return candidate
 
+        # A token was supplied but no token match exists. Do not reuse a
+        # datablock solely because its old process-local GIMP ID happens to
+        # equal the current process-local ID. Log the collision for diagnostics.
+        for candidate in bpy.data.images:
+            try:
+                candidate_id = int(
+                    candidate.get(
+                        "blendgimp_gimp_image_id",
+                        -1
+                    )
+                )
+            except Exception:
+                candidate_id = -1
+
+            if candidate_id == image_id:
+                candidate_token = str(
+                    candidate.get(
+                        "blendgimp_sync_token",
+                        ""
+                    )
+                ).strip()
+                print(
+                    "BLENDGIMP: Ignoring stale Blender Image pairing "
+                    f"for reused GIMP runtime image ID {image_id}; "
+                    f"incoming token={sync_token[:12]} "
+                    f"stored token={candidate_token[:12] or 'legacy'}"
+                )
+                break
+
+        return None
+
+    # Legacy compatibility path: only token-less protocol responses may use
+    # process-local image IDs for pairing.
     for candidate in bpy.data.images:
         try:
             candidate_id = int(
@@ -952,7 +1553,7 @@ def _find_blendgimp_image(
         except Exception:
             candidate_id = -1
 
-        if candidate_id == int(image_id):
+        if candidate_id == image_id:
             return candidate
 
     return None
@@ -1054,6 +1655,17 @@ def get_or_update_blender_image_from_pixels(
         sync_token
     )
 
+    if blender_image is not None:
+        blender_owned_name = str(
+            blender_image.get(
+                "blendgimp_texture_name",
+                ""
+            )
+        ).strip()
+
+        if blender_owned_name:
+            desired_name = blender_owned_name
+
     if blender_image is None:
         blender_image = bpy.data.images.new(
             name=desired_name,
@@ -1090,6 +1702,28 @@ def get_or_update_blender_image_from_pixels(
         blender_image.alpha_mode = "STRAIGHT"
     except Exception:
         pass
+
+    expected_components = width * height * 4
+    actual_components = len(
+        blender_image.pixels
+    )
+    actual_channels = int(
+        getattr(
+            blender_image,
+            "channels",
+            0
+        )
+    )
+
+    if actual_components != expected_components:
+        raise RuntimeError(
+            "Blender Image pixel buffer mismatch. "
+            f"Image={blender_image.name!r} "
+            f"size={width}x{height} channels={actual_channels}; "
+            f"expected {expected_components} RGBA float components, "
+            f"got {actual_components}. "
+            "This usually indicates a stale runtime-image pairing."
+        )
 
     if np is not None:
         rgba_u8 = np.frombuffer(
@@ -2769,6 +3403,23 @@ def blendgimp_auto_sync_timer():
             )
         )
 
+    except GimpImageNotFoundError:
+        scene.blendgimp_connected = (
+            connection_manager.is_connected()
+        )
+        clear_gimp_session_bindings(
+            scene,
+            status=(
+                "Previous GIMP image closed; "
+                "waiting for a Blender-owned texture"
+            )
+        )
+        print(
+            "BLENDGIMP: "
+            "Auto Sync released a stale GIMP image ID"
+        )
+        return AUTO_SYNC_POLL_INTERVAL
+
     except Exception as exc:
         scene.blendgimp_connected = (
             connection_manager.is_connected()
@@ -3765,10 +4416,10 @@ class BLENDGIMP_OT_launch_gimp(
 ):
 
     bl_idname = "blendgimp.launch_gimp"
-    bl_label = "Launch GIMP"
+    bl_label = "Start GIMP Engine"
 
     bl_description = (
-        "Launch the detected GIMP installation"
+        "Start the selected persistent GIMP engine mode and connect to it"
     )
 
     def execute(
@@ -3778,59 +4429,142 @@ class BLENDGIMP_OT_launch_gimp(
 
         scene = context.scene
 
-        gimp_path = (
-            scene.blendgimp_gimp_path
-        )
-
-        if not gimp_path:
-
-            self.report(
-                {"ERROR"},
-                "GIMP has not been detected"
-            )
-
-            return {"CANCELLED"}
-
-        if not os.path.isfile(
-            gimp_path
-        ):
-
-            scene.blendgimp_gimp_detected = False
-            scene.blendgimp_gimp_running = False
-
-            self.report(
-                {"ERROR"},
-                "The detected GIMP executable "
-                "no longer exists"
-            )
-
-            return {"CANCELLED"}
-
-        success, pid = (
-            gimp_manager.launch_gimp(
-                gimp_path
-            )
+        success, pid = start_scene_engine(
+            scene
         )
 
         if success:
-
-            scene.blendgimp_gimp_running = True
-
             self.report(
                 {"INFO"},
-                f"GIMP running PID {pid}"
+                (
+                    "GIMP engine starting "
+                    f"PID {pid} "
+                    f"({scene.blendgimp_engine_mode})"
+                )
             )
 
             return {"FINISHED"}
 
-        scene.blendgimp_gimp_running = False
-
         self.report(
             {"ERROR"},
-            "Could not launch GIMP"
+            (
+                scene.blendgimp_engine_last_error
+                or "Could not launch GIMP engine"
+            )
         )
 
         return {"CANCELLED"}
+
+
+# ============================================================
+# STOP GIMP ENGINE
+# ============================================================
+
+class BLENDGIMP_OT_stop_gimp(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.stop_gimp"
+    bl_label = "Stop GIMP Engine"
+
+    bl_description = (
+        "Disconnect and stop the GIMP process started by BlendGimp"
+    )
+
+    def execute(
+        self,
+        context
+    ):
+        success, _exit_code, forced = (
+            stop_scene_engine(
+                context.scene
+            )
+        )
+
+        if not success:
+            self.report(
+                {"ERROR"},
+                (
+                    context.scene.blendgimp_engine_last_error
+                    or "Could not stop GIMP engine"
+                )
+            )
+            return {"CANCELLED"}
+
+        self.report(
+            {"WARNING" if forced else "INFO"},
+            (
+                "GIMP engine stopped"
+                + (
+                    " after forced timeout"
+                    if forced
+                    else ""
+                )
+            )
+        )
+        return {"FINISHED"}
+
+
+# ============================================================
+# RESTART GIMP ENGINE
+# ============================================================
+
+class BLENDGIMP_OT_restart_gimp(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.restart_gimp"
+    bl_label = "Restart GIMP Engine"
+
+    bl_description = (
+        "Restart GIMP in the selected engine mode and reconnect"
+    )
+
+    def execute(
+        self,
+        context
+    ):
+        scene = context.scene
+
+        success, _exit_code, _forced = (
+            stop_scene_engine(
+                scene
+            )
+        )
+
+        if not success:
+            self.report(
+                {"ERROR"},
+                (
+                    scene.blendgimp_engine_last_error
+                    or "Could not stop GIMP engine"
+                )
+            )
+            return {"CANCELLED"}
+
+        success, pid = start_scene_engine(
+            scene
+        )
+
+        if not success:
+            self.report(
+                {"ERROR"},
+                (
+                    scene.blendgimp_engine_last_error
+                    or "Could not restart GIMP engine"
+                )
+            )
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                "GIMP engine restarting "
+                f"PID {pid} "
+                f"({scene.blendgimp_engine_mode})"
+            )
+        )
+        return {"FINISHED"}
 
 
 # ============================================================
@@ -3849,8 +4583,14 @@ class BLENDGIMP_OT_check_gimp(
         context
     ):
 
-        running = (
-            gimp_manager.is_gimp_running()
+        snapshot = (
+            gimp_manager.get_engine_snapshot()
+        )
+        running = bool(
+            snapshot.get(
+                "running",
+                False
+            )
         )
 
         context.scene.blendgimp_gimp_running = (
@@ -3859,16 +4599,39 @@ class BLENDGIMP_OT_check_gimp(
 
         if running:
 
+            context.scene.blendgimp_engine_state = str(
+                snapshot.get(
+                    "state",
+                    gimp_manager.ENGINE_STATE_STARTING
+                )
+            )
+
             self.report(
                 {"INFO"},
-                "GIMP is running"
+                (
+                    "GIMP engine is running "
+                    f"PID {snapshot.get('pid')}"
+                )
             )
 
         else:
 
+            context.scene.blendgimp_engine_state = str(
+                snapshot.get(
+                    "state",
+                    gimp_manager.ENGINE_STATE_STOPPED
+                )
+            )
+            context.scene.blendgimp_engine_last_error = str(
+                snapshot.get(
+                    "last_error",
+                    ""
+                )
+            )
+
             self.report(
                 {"INFO"},
-                "GIMP is not running"
+                "GIMP engine is not running"
             )
 
         return {"FINISHED"}
@@ -3898,45 +4661,11 @@ class BLENDGIMP_OT_connect(
 
         try:
 
-            response = (
-                connection_manager.connect()
-            )
-
-            scene.blendgimp_connected = True
-
-            scene.blendgimp_protocol_version = (
-                int(
-                    response.get(
-                        "protocol",
-                        0
-                    )
-                )
-            )
-
-            scene.blendgimp_remote_version = (
-                str(
-                    response.get(
-                        "blendgimp_version",
-                        response.get(
-                            "server",
-                            ""
-                        )
-                    )
-                )
-            )
-
-            scene.blendgimp_runtime_gimp_version = (
-                str(
-                    response.get(
-                        "gimp_version",
-                        ""
-                    )
-                )
-            )
-
-            clear_image_results(
+            response = connect_scene_engine(
                 scene
             )
+
+            scene.blendgimp_engine_should_run = True
 
             self.report(
                 {"INFO"},
@@ -3947,9 +4676,7 @@ class BLENDGIMP_OT_connect(
 
         except Exception as exc:
 
-            scene.blendgimp_connected = False
-
-            clear_image_results(
+            clear_engine_connection(
                 scene
             )
 
@@ -4022,6 +4749,154 @@ class BLENDGIMP_OT_ping(
                 f"PING failed: {exc}"
             )
 
+            return {"CANCELLED"}
+
+
+# ============================================================
+# CREATE BLENDER-OWNED GIMP IMAGE
+# ============================================================
+
+class BLENDGIMP_OT_create_image(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.create_image"
+    bl_label = "Create BlendGimp Texture"
+
+    bl_description = (
+        "Create a new GIMP image and initial layer, create its paired Blender "
+        "Image, assign it to the active material, and start Auto Sync"
+    )
+
+    def execute(
+        self,
+        context
+    ):
+
+        scene = context.scene
+
+        if not connection_manager.is_connected():
+            scene.blendgimp_connected = False
+            scene.blendgimp_create_status = "Create failed: not connected"
+            self.report(
+                {"ERROR"},
+                "BlendGimp is not connected to GIMP"
+            )
+            return {"CANCELLED"}
+
+        if (
+            scene.blendgimp_create_format == "RGB"
+            and scene.blendgimp_create_background == "TRANSPARENT"
+        ):
+            scene.blendgimp_create_status = (
+                "Create failed: RGB requires a solid background"
+            )
+            self.report(
+                {"ERROR"},
+                "RGB textures require a solid background"
+            )
+            return {"CANCELLED"}
+
+        scene.blendgimp_create_status = "Creating texture in GIMP..."
+
+        try:
+            response = connection_manager.create_image(
+                name=scene.blendgimp_create_name,
+                width=scene.blendgimp_create_width,
+                height=scene.blendgimp_create_height,
+                image_format=scene.blendgimp_create_format,
+                background=scene.blendgimp_create_background,
+                background_color=scene.blendgimp_create_background_color,
+                layer_name=scene.blendgimp_create_layer_name,
+            )
+
+            image_id = int(response["image_id"])
+            layer_id = int(response["layer_id"])
+
+            scene.blendgimp_created_image_id = image_id
+            scene.blendgimp_created_layer_id = layer_id
+
+            # Populate the normal image cards immediately. The created image
+            # uses the same painting and synchronization paths as any other
+            # open GIMP image.
+            images_response = connection_manager.get_images()
+            images = images_response.get("images", [])
+            scene.blendgimp_images_queried = True
+            scene.blendgimp_image_count = len(images)
+            scene.blendgimp_images_json = json.dumps(
+                images,
+                ensure_ascii=False
+            )
+
+            sync_result = synchronize_gimp_composite(
+                context,
+                image_id,
+                assign_material=True
+            )
+
+            blender_image = sync_result["blender_image"]
+            texture_name = str(
+                scene.blendgimp_create_name
+                or "BlendGimp Texture"
+            ).strip()
+
+            blender_image["blendgimp_created_by_blender"] = True
+            blender_image["blendgimp_texture_name"] = texture_name
+            blender_image["blendgimp_gimp_image_id"] = image_id
+            blender_image["blendgimp_gimp_layer_id"] = layer_id
+            blender_image["blendgimp_texture_format"] = str(
+                scene.blendgimp_create_format
+            )
+            blender_image.name = texture_name
+            blender_image.update()
+
+            state = connection_manager.get_image_state(image_id)
+            revision = int(state.get("revision", 0))
+
+            scene.blendgimp_auto_sync_enabled = True
+            scene.blendgimp_auto_sync_image_id = image_id
+            scene.blendgimp_auto_sync_revision = revision
+            scene.blendgimp_auto_sync_status = (
+                f"Watching revision {revision}"
+            )
+            scene.blendgimp_auto_sync_detector = str(
+                state.get("detector", "")
+            )
+
+            reset_auto_sync_runtime(
+                image_id,
+                revision
+            )
+
+            scene.blendgimp_create_status = (
+                f"Created {texture_name} — image {image_id}, layer {layer_id}"
+            )
+
+            print(
+                "BLENDGIMP: "
+                f"Blender-owned texture created: {texture_name} "
+                f"image ID={image_id} layer ID={layer_id}; Auto Sync started"
+            )
+
+            self.report(
+                {"INFO"},
+                f"Created {texture_name} and started Auto Sync"
+            )
+            return {"FINISHED"}
+
+        except Exception as exc:
+            scene.blendgimp_connected = connection_manager.is_connected()
+            scene.blendgimp_create_status = f"Create failed: {exc}"
+
+            print(
+                "BLENDGIMP: "
+                f"CREATE_IMAGE workflow failed: {exc}"
+            )
+
+            self.report(
+                {"ERROR"},
+                f"Create BlendGimp Texture failed: {exc}"
+            )
             return {"CANCELLED"}
 
 
@@ -6381,13 +7256,25 @@ class BLENDGIMP_OT_disconnect(
         context
     ):
 
+        context.scene.blendgimp_engine_should_run = False
+
         connection_manager.disconnect()
 
-        context.scene.blendgimp_connected = False
-
-        clear_image_results(
+        clear_engine_connection(
             context.scene
         )
+
+        if gimp_manager.is_gimp_running():
+            gimp_manager.mark_engine_disconnected(
+                "Disconnected manually"
+            )
+            context.scene.blendgimp_engine_state = (
+                gimp_manager.ENGINE_STATE_DISCONNECTED
+            )
+        else:
+            context.scene.blendgimp_engine_state = (
+                gimp_manager.ENGINE_STATE_STOPPED
+            )
 
         print(
             "BLENDGIMP: "
@@ -6445,8 +7332,77 @@ class BLENDGIMP_PT_main_panel(
         gimp_box = layout.box()
 
         gimp_box.label(
-            text="GIMP"
+            text="GIMP Engine"
         )
+
+        gimp_box.prop(
+            scene,
+            "blendgimp_engine_mode",
+            text="Mode"
+        )
+
+        gimp_box.prop(
+            scene,
+            "blendgimp_engine_auto_reconnect",
+            text="Automatic Recovery"
+        )
+
+        engine_snapshot = (
+            gimp_manager.get_engine_snapshot()
+        )
+        engine_state = str(
+            scene.blendgimp_engine_state
+            or engine_snapshot.get(
+                "state",
+                gimp_manager.ENGINE_STATE_STOPPED
+            )
+        )
+
+        state_icon = (
+            "CHECKMARK"
+            if engine_state == gimp_manager.ENGINE_STATE_CONNECTED
+            else (
+                "ERROR"
+                if engine_state == gimp_manager.ENGINE_STATE_FAILED
+                else "INFO"
+            )
+        )
+
+        gimp_box.label(
+            text=(
+                "State: "
+                + engine_state.replace(
+                    "_",
+                    " "
+                ).title()
+            ),
+            icon=state_icon
+        )
+
+        if engine_snapshot.get(
+            "pid"
+        ):
+            gimp_box.label(
+                text=(
+                    "PID: "
+                    f"{engine_snapshot.get('pid')}"
+                )
+            )
+
+        if scene.blendgimp_engine_restart_count > 0:
+            gimp_box.label(
+                text=(
+                    "Automatic Restarts: "
+                    f"{scene.blendgimp_engine_restart_count}"
+                )
+            )
+
+        if scene.blendgimp_engine_last_error:
+            error_box = gimp_box.box()
+            error_box.label(
+                text=scene.blendgimp_engine_last_error,
+                icon="ERROR"
+            )
 
         if scene.blendgimp_gimp_detected:
 
@@ -6462,33 +7418,46 @@ class BLENDGIMP_PT_main_panel(
                 )
             )
 
-            # ================================================
-            # PROCESS
-            # ================================================
-
             if scene.blendgimp_gimp_running:
-
-                gimp_box.label(
-                    text="Process Running",
-                    icon="CHECKMARK"
+                controls = gimp_box.row(
+                    align=True
                 )
-
-                gimp_box.operator(
-                    "blendgimp.check_gimp",
-                    text="Check Process"
+                controls.operator(
+                    "blendgimp.stop_gimp",
+                    text="Stop",
+                    icon="CANCEL"
+                )
+                controls.operator(
+                    "blendgimp.restart_gimp",
+                    text="Restart",
+                    icon="FILE_REFRESH"
                 )
 
             else:
-
-                gimp_box.label(
-                    text="Process Not Running"
-                )
-
                 gimp_box.operator(
                     "blendgimp.launch_gimp",
-                    text="Launch GIMP",
+                    text="Start Engine",
                     icon="PLAY"
                 )
+
+            if (
+                scene.blendgimp_gimp_running
+                and engine_snapshot.get(
+                    "mode"
+                )
+                and engine_snapshot.get(
+                    "mode"
+                ) != scene.blendgimp_engine_mode
+            ):
+                gimp_box.label(
+                    text="Restart to apply the selected mode",
+                    icon="INFO"
+                )
+
+            gimp_box.operator(
+                "blendgimp.check_gimp",
+                text="Check Process"
+            )
 
             gimp_box.separator()
 
@@ -6507,7 +7476,7 @@ class BLENDGIMP_PT_main_panel(
                 icon="ERROR"
             )
 
-        layout.operator(
+        gimp_box.operator(
             "blendgimp.detect_gimp",
             text="Detect GIMP",
             icon="VIEWZOOM"
@@ -6555,6 +7524,87 @@ class BLENDGIMP_PT_main_panel(
                     f"{scene.blendgimp_remote_version}"
                 )
             )
+
+            connection_box.separator()
+
+            create_box = connection_box.box()
+            create_box.label(
+                text="New BlendGimp Texture",
+                icon="ADD"
+            )
+            create_box.prop(
+                scene,
+                "blendgimp_create_name",
+                text="Name"
+            )
+
+            size_row = create_box.row(align=True)
+            size_row.prop(
+                scene,
+                "blendgimp_create_width",
+                text="Width"
+            )
+            size_row.prop(
+                scene,
+                "blendgimp_create_height",
+                text="Height"
+            )
+
+            create_box.prop(
+                scene,
+                "blendgimp_create_format",
+                text="Format"
+            )
+            create_box.prop(
+                scene,
+                "blendgimp_create_background",
+                text="Background"
+            )
+
+            if scene.blendgimp_create_background == "SOLID":
+                create_box.prop(
+                    scene,
+                    "blendgimp_create_background_color",
+                    text="Color"
+                )
+
+            if (
+                scene.blendgimp_create_format == "RGB"
+                and scene.blendgimp_create_background == "TRANSPARENT"
+            ):
+                create_box.label(
+                    text="RGB requires a solid background",
+                    icon="ERROR"
+                )
+
+            create_box.prop(
+                scene,
+                "blendgimp_create_layer_name",
+                text="Initial Layer"
+            )
+
+            create_button_row = create_box.row()
+            create_button_row.enabled = not (
+                scene.blendgimp_create_format == "RGB"
+                and scene.blendgimp_create_background == "TRANSPARENT"
+            )
+            create_button_row.operator(
+                "blendgimp.create_image",
+                text="Create",
+                icon="IMAGE_DATA"
+            )
+
+            if scene.blendgimp_create_status:
+                create_box.label(
+                    text=scene.blendgimp_create_status,
+                    icon=(
+                        "ERROR"
+                        if scene.blendgimp_create_status.startswith(
+                            "Create failed"
+                        )
+                        else "CHECKMARK"
+                    )
+                )
 
             connection_box.separator()
 
@@ -6740,6 +7790,93 @@ class BLENDGIMP_PT_main_panel(
                                     )
                                 )
 
+                            geometry_box = direct_box.box()
+
+                            geometry_box.enabled = (
+                                not direct_paint_active
+                            )
+
+                            geometry_box.label(
+                                text="Geometry Protection"
+                            )
+
+                            geometry_box.prop(
+                                scene,
+                                "blendgimp_direct_paint_projection_mesh",
+                                text="Projection Mesh"
+                            )
+
+                            if scene.blendgimp_direct_paint_projection_mesh == "AUTO":
+
+                                geometry_box.label(
+                                    text=(
+                                        "Auto uses evaluated modifiers when "
+                                        "the active UV map is preserved"
+                                    )
+                                )
+
+                            geometry_box.prop(
+                                scene,
+                                "blendgimp_direct_paint_occlusion_mode",
+                                text="Surface Mode"
+                            )
+
+                            if scene.blendgimp_direct_paint_occlusion_mode == "THROUGH":
+
+                                geometry_box.label(
+                                    text=(
+                                        "Paint Through traces every surface "
+                                        "under the cursor"
+                                    )
+                                )
+
+                            geometry_box.prop(
+                                scene,
+                                "blendgimp_direct_paint_footprint_protection",
+                                text="Protect Brush Footprint"
+                            )
+
+                            if scene.blendgimp_direct_paint_footprint_protection:
+
+                                geometry_box.prop(
+                                    scene,
+                                    "blendgimp_direct_paint_footprint_samples",
+                                    text="Footprint Rays"
+                                )
+
+                                geometry_box.prop(
+                                    scene,
+                                    "blendgimp_direct_paint_footprint_safe_ratio",
+                                    text="Surface Coverage"
+                                )
+
+                                geometry_box.label(
+                                    text=(
+                                        "Silhouette misses remain strictly "
+                                        "protected"
+                                    )
+                                )
+
+                            geometry_box.prop(
+                                scene,
+                                "blendgimp_direct_paint_front_faces_only",
+                                text="Front Faces Only"
+                            )
+
+                            geometry_box.prop(
+                                scene,
+                                "blendgimp_direct_paint_normal_angle_enabled",
+                                text="Limit View Angle"
+                            )
+
+                            if scene.blendgimp_direct_paint_normal_angle_enabled:
+
+                                geometry_box.prop(
+                                    scene,
+                                    "blendgimp_direct_paint_normal_angle_limit",
+                                    text="Maximum Angle (degrees)"
+                                )
+
                             if scene.blendgimp_direct_paint_status:
 
                                 direct_box.label(
@@ -6750,7 +7887,7 @@ class BLENDGIMP_PT_main_panel(
                                 )
 
                             direct_box.label(
-                                text="Live chunks • topology-aware UV seams • one GIMP undo"
+                                text="Live • seam-safe • brush-footprint protected"
                             )
 
                             paint_sync_active = (
@@ -7093,11 +8230,17 @@ classes = (
 
     BLENDGIMP_OT_launch_gimp,
 
+    BLENDGIMP_OT_stop_gimp,
+
+    BLENDGIMP_OT_restart_gimp,
+
     BLENDGIMP_OT_check_gimp,
 
     BLENDGIMP_OT_connect,
 
     BLENDGIMP_OT_ping,
+
+    BLENDGIMP_OT_create_image,
 
     BLENDGIMP_OT_get_images,
 
@@ -7169,6 +8312,75 @@ def register():
                 "Direct GIMP Brush 3D Paint operator registered"
             )
 
+    bpy.types.Scene.blendgimp_engine_mode = (
+        bpy.props.EnumProperty(
+            name="GIMP Engine Mode",
+            description=(
+                "Run GIMP invisibly for normal BlendGimp work or visibly "
+                "for debugging and regression testing"
+            ),
+            items=(
+                (
+                    gimp_manager.ENGINE_MODE_HEADLESS,
+                    "Headless",
+                    "Run a dedicated persistent GIMP engine without its "
+                    "traditional interface"
+                ),
+                (
+                    gimp_manager.ENGINE_MODE_VISIBLE_DEBUG,
+                    "Visible / Debug",
+                    "Use the original visible GIMP launch path for "
+                    "troubleshooting and regression testing"
+                ),
+            ),
+            default=gimp_manager.ENGINE_MODE_HEADLESS
+        )
+    )
+
+    bpy.types.Scene.blendgimp_engine_auto_reconnect = (
+        bpy.props.BoolProperty(
+            name="Automatic Engine Recovery",
+            description=(
+                "Reconnect when the socket drops and restart the managed "
+                "GIMP engine when its process exits unexpectedly"
+            ),
+            default=True
+        )
+    )
+
+    bpy.types.Scene.blendgimp_engine_should_run = (
+        bpy.props.BoolProperty(
+            name="GIMP Engine Requested",
+            default=False,
+            options={"SKIP_SAVE"}
+        )
+    )
+
+    bpy.types.Scene.blendgimp_engine_state = (
+        bpy.props.StringProperty(
+            name="GIMP Engine State",
+            default=gimp_manager.ENGINE_STATE_STOPPED,
+            options={"SKIP_SAVE"}
+        )
+    )
+
+    bpy.types.Scene.blendgimp_engine_last_error = (
+        bpy.props.StringProperty(
+            name="GIMP Engine Last Error",
+            default="",
+            options={"SKIP_SAVE"}
+        )
+    )
+
+    bpy.types.Scene.blendgimp_engine_restart_count = (
+        bpy.props.IntProperty(
+            name="GIMP Engine Automatic Restarts",
+            default=0,
+            min=0,
+            options={"SKIP_SAVE"}
+        )
+    )
+
     bpy.types.Scene.blendgimp_gimp_detected = (
         bpy.props.BoolProperty(
             name="GIMP Detected",
@@ -7222,6 +8434,112 @@ def register():
         bpy.props.StringProperty(
             name="Runtime GIMP Version",
             default=""
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_name = (
+        bpy.props.StringProperty(
+            name="Texture Name",
+            description="Name shared by the Blender-owned texture pair",
+            default="BaseColor"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_width = (
+        bpy.props.IntProperty(
+            name="Texture Width",
+            default=2048,
+            min=1,
+            max=32768
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_height = (
+        bpy.props.IntProperty(
+            name="Texture Height",
+            default=2048,
+            min=1,
+            max=32768
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_format = (
+        bpy.props.EnumProperty(
+            name="Texture Format",
+            items=(
+                (
+                    "RGBA",
+                    "RGBA",
+                    "RGB color with an alpha channel"
+                ),
+                (
+                    "RGB",
+                    "RGB",
+                    "Opaque RGB color without an alpha channel"
+                ),
+            ),
+            default="RGBA"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_background = (
+        bpy.props.EnumProperty(
+            name="Texture Background",
+            items=(
+                (
+                    "TRANSPARENT",
+                    "Transparent",
+                    "Initialize the RGBA layer with transparent pixels"
+                ),
+                (
+                    "SOLID",
+                    "Solid",
+                    "Initialize the layer with the selected opaque color"
+                ),
+            ),
+            default="TRANSPARENT"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_background_color = (
+        bpy.props.FloatVectorProperty(
+            name="Background Color",
+            subtype="COLOR",
+            size=4,
+            min=0.0,
+            max=1.0,
+            default=(0.0, 0.0, 0.0, 1.0)
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_layer_name = (
+        bpy.props.StringProperty(
+            name="Initial Layer Name",
+            default="BaseColor"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_created_image_id = (
+        bpy.props.IntProperty(
+            name="Last Created GIMP Image ID",
+            default=-1,
+            options={"SKIP_SAVE"}
+        )
+    )
+
+    bpy.types.Scene.blendgimp_created_layer_id = (
+        bpy.props.IntProperty(
+            name="Last Created GIMP Layer ID",
+            default=-1,
+            options={"SKIP_SAVE"}
+        )
+    )
+
+    bpy.types.Scene.blendgimp_create_status = (
+        bpy.props.StringProperty(
+            name="Create Texture Status",
+            default="",
+            options={"SKIP_SAVE"}
         )
     )
 
@@ -7295,6 +8613,132 @@ def register():
             name="Direct GIMP Brush",
             default="",
             options={"SKIP_SAVE"}
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_front_faces_only = (
+        bpy.props.BoolProperty(
+            name="Front Faces Only",
+            description=(
+                "Reject direct-paint ray hits whose surface normal faces "
+                "away from the viewport"
+            ),
+            default=True
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_occlusion_mode = (
+        bpy.props.EnumProperty(
+            name="Direct Paint Surface Mode",
+            description=(
+                "Choose nearest-visible-surface painting or raycast through "
+                "all mesh surfaces"
+            ),
+            items=(
+                (
+                    "VISIBLE",
+                    "Visible Surface",
+                    "Paint only the nearest visible surface"
+                ),
+                (
+                    "THROUGH",
+                    "Paint Through",
+                    "Paint every allowed mesh surface along the viewport ray"
+                ),
+            ),
+            default="VISIBLE"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_projection_mesh = (
+        bpy.props.EnumProperty(
+            name="Direct Paint Projection Mesh",
+            description=(
+                "Choose whether direct paint projects onto the viewport's "
+                "evaluated modifier result or the original mesh"
+            ),
+            items=(
+                (
+                    "AUTO",
+                    "Evaluated (Auto Fallback)",
+                    "Use evaluated geometry and automatically fall back to "
+                    "the original mesh if the active UV map is unavailable"
+                ),
+                (
+                    "EVALUATED",
+                    "Require Evaluated",
+                    "Require modifier-evaluated geometry and cancel startup "
+                    "instead of falling back when its UV map is unavailable"
+                ),
+                (
+                    "ORIGINAL",
+                    "Original Mesh",
+                    "Project onto the original unmodified mesh"
+                ),
+            ),
+            default="AUTO"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_footprint_protection = (
+        bpy.props.BoolProperty(
+            name="Protect Brush Footprint",
+            description=(
+                "Raycast around the projected GIMP brush radius and reject "
+                "stamps that cross a silhouette, UV boundary, or thin "
+                "occluding surface"
+            ),
+            default=True
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_footprint_samples = (
+        bpy.props.IntProperty(
+            name="Footprint Rays",
+            description=(
+                "Number of protective raycasts around the brush perimeter"
+            ),
+            default=8,
+            min=4,
+            max=16
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_footprint_safe_ratio = (
+        bpy.props.FloatProperty(
+            name="Footprint Surface Coverage",
+            description=(
+                "Minimum compatible perimeter-ray coverage for surface "
+                "boundaries; true silhouette misses are always rejected"
+            ),
+            default=0.75,
+            min=0.5,
+            max=1.0,
+            subtype="FACTOR",
+            precision=2
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_normal_angle_enabled = (
+        bpy.props.BoolProperty(
+            name="Limit View Angle",
+            description=(
+                "Reject surfaces viewed beyond the configured normal angle"
+            ),
+            default=False
+        )
+    )
+
+    bpy.types.Scene.blendgimp_direct_paint_normal_angle_limit = (
+        bpy.props.FloatProperty(
+            name="Maximum View Angle",
+            description=(
+                "Largest allowed angle between the surface normal and view"
+            ),
+            default=75.0,
+            min=0.0,
+            max=180.0,
+            precision=1
         )
     )
 
@@ -7401,8 +8845,18 @@ def register():
         )
     )
 
+    reset_engine_lifecycle_runtime()
     reset_auto_sync_runtime()
     reset_blender_paint_sync_runtime()
+
+    if not bpy.app.timers.is_registered(
+        blendgimp_engine_lifecycle_timer
+    ):
+        bpy.app.timers.register(
+            blendgimp_engine_lifecycle_timer,
+            first_interval=ENGINE_LIFECYCLE_POLL_INTERVAL,
+            persistent=True
+        )
 
     if not bpy.app.timers.is_registered(
         blendgimp_blender_paint_sync_timer
@@ -7434,14 +8888,69 @@ def register():
 def unregister():
 
     # --------------------------------------------------------
-    # Close Blender's socket.
-    #
-    # Do not terminate GIMP.
+    # Stop lifecycle recovery before closing the connection.
     # --------------------------------------------------------
 
-    connection_manager.disconnect()
+    try:
+        if bpy.app.timers.is_registered(
+            blendgimp_engine_lifecycle_timer
+        ):
+            bpy.app.timers.unregister(
+                blendgimp_engine_lifecycle_timer
+            )
+    except Exception:
+        pass
 
-    gimp_manager.clear_process_reference()
+    engine_snapshot = (
+        gimp_manager.get_engine_snapshot()
+    )
+
+    # A normal headless session belongs to BlendGimp and should not be left
+    # orphaned after the extension is disabled. A visible debug session may
+    # contain manual work, so preserve the original behavior and leave it open.
+    if (
+        engine_snapshot.get(
+            "running",
+            False
+        )
+        and engine_snapshot.get(
+            "mode"
+        ) == gimp_manager.ENGINE_MODE_HEADLESS
+    ):
+        graceful_requested = False
+        shutdown_refused = False
+
+        if connection_manager.is_connected():
+            try:
+                connection_manager.shutdown_engine(
+                    force=False
+                )
+                graceful_requested = True
+            except GimpEngineShutdownRefusedError as exc:
+                shutdown_refused = True
+                print(
+                    "BLENDGIMP: "
+                    "Headless engine kept alive to protect unsaved "
+                    f"image changes: {exc}"
+                )
+            except Exception as exc:
+                print(
+                    "BLENDGIMP: "
+                    "Extension shutdown request failed; "
+                    f"using process fallback: {exc}"
+                )
+
+        connection_manager.disconnect()
+
+        if shutdown_refused:
+            gimp_manager.clear_process_reference()
+        else:
+            gimp_manager.stop_gimp(
+                graceful_requested=graceful_requested
+            )
+    else:
+        connection_manager.disconnect()
+        gimp_manager.clear_process_reference()
 
     try:
         if bpy.app.timers.is_registered(
@@ -7463,8 +8972,79 @@ def unregister():
     except Exception:
         pass
 
+    reset_engine_lifecycle_runtime()
     reset_auto_sync_runtime()
     reset_blender_paint_sync_runtime()
+
+    del (
+        bpy.types.Scene.
+        blendgimp_engine_restart_count
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_engine_last_error
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_engine_state
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_engine_should_run
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_engine_auto_reconnect
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_engine_mode
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_normal_angle_limit
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_normal_angle_enabled
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_footprint_safe_ratio
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_footprint_samples
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_footprint_protection
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_occlusion_mode
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_projection_mesh
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_direct_paint_front_faces_only
+    )
 
     del (
         bpy.types.Scene.
@@ -7564,6 +9144,56 @@ def unregister():
     del (
         bpy.types.Scene.
         blendgimp_images_queried
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_status
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_created_layer_id
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_created_image_id
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_layer_name
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_background_color
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_background
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_format
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_height
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_width
+    )
+
+    del (
+        bpy.types.Scene.
+        blendgimp_create_name
     )
 
     del (

@@ -83,6 +83,16 @@ EXPORT_COMPOSITE_TIMEOUT = 30.0
 IMAGE_STATE_TIMEOUT = 5.0
 GET_IMAGE_PIXELS_TIMEOUT = 30.0
 GET_IMAGE_DIRTY_PIXELS_TIMEOUT = 30.0
+ENGINE_SHUTDOWN_TIMEOUT = 5.0
+CREATE_IMAGE_TIMEOUT = 30.0
+
+
+class GimpImageNotFoundError(RuntimeError):
+    """The selected image ID does not exist in the current GIMP session."""
+
+
+class GimpEngineShutdownRefusedError(RuntimeError):
+    """GIMP refused to close because doing so could discard image changes."""
 
 
 # ============================================================
@@ -98,6 +108,7 @@ class BlendGimpConnection:
         HELLO      -> READY
         PING       -> PONG
         STATUS     -> STATUS
+        CREATE_IMAGE     -> IMAGE_CREATED
         GET_IMAGES       -> IMAGES
         GET_IMAGE_LAYERS    -> IMAGE_LAYERS
         SET_ACTIVE_LAYER    -> ACTIVE_LAYER_SET
@@ -738,14 +749,18 @@ class BlendGimpConnection:
     # PING
     # ========================================================
 
-    def ping(self):
+    def ping(
+        self,
+        quiet=False
+    ):
 
         response = self.request(
             {
                 "type": "PING",
                 "component": "blender",
                 "protocol": PROTOCOL_VERSION,
-            }
+            },
+            quiet=quiet
         )
 
         response_type = str(
@@ -776,6 +791,101 @@ class BlendGimpConnection:
                 "protocol": PROTOCOL_VERSION,
             }
         )
+
+        return response
+
+    # ========================================================
+    # CREATE IMAGE
+    # ========================================================
+
+    def create_image(
+        self,
+        name,
+        width,
+        height,
+        image_format="RGBA",
+        background="TRANSPARENT",
+        background_color=(0.0, 0.0, 0.0, 1.0),
+        layer_name="BaseColor",
+    ):
+        """Create a new GIMP image owned and initialized by Blender."""
+
+        name = str(name or "BlendGimp Texture").strip()
+        layer_name = str(layer_name or "BaseColor").strip()
+        width = int(width)
+        height = int(height)
+        image_format = str(image_format or "RGBA").upper()
+        background = str(background or "TRANSPARENT").upper()
+
+        if not name:
+            raise ValueError("Image name cannot be empty")
+
+        if not layer_name:
+            raise ValueError("Initial layer name cannot be empty")
+
+        if not 1 <= width <= 32768 or not 1 <= height <= 32768:
+            raise ValueError("Image dimensions must be between 1 and 32768")
+
+        if image_format not in {"RGB", "RGBA"}:
+            raise ValueError("Image format must be RGB or RGBA")
+
+        if background not in {"TRANSPARENT", "SOLID"}:
+            raise ValueError("Background must be TRANSPARENT or SOLID")
+
+        if image_format == "RGB" and background == "TRANSPARENT":
+            raise ValueError("RGB images require a solid background")
+
+        try:
+            color = [
+                max(0.0, min(1.0, float(component)))
+                for component in background_color
+            ]
+        except (TypeError, ValueError):
+            raise ValueError("Background color must contain four numbers")
+
+        if len(color) != 4:
+            raise ValueError("Background color must contain four numbers")
+
+        request_id = self._next_request_id("create-image")
+
+        response = self.request(
+            {
+                "type": "CREATE_IMAGE",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "name": name,
+                "width": width,
+                "height": height,
+                "format": image_format,
+                "background": background,
+                "background_color": color,
+                "layer_name": layer_name,
+            },
+            timeout=CREATE_IMAGE_TIMEOUT,
+        )
+
+        response_type = str(response.get("type", "")).upper()
+
+        if response_type == "ERROR":
+            raise RuntimeError(
+                str(response.get("error", "GIMP could not create the image"))
+            )
+
+        if response_type != "IMAGE_CREATED" or not response.get("ok", False):
+            raise RuntimeError("GIMP did not return IMAGE_CREATED")
+
+        image_id = int(response.get("image_id", -1))
+        layer_id = int(response.get("layer_id", -1))
+
+        if image_id < 0 or layer_id < 0:
+            raise RuntimeError("GIMP returned invalid image or layer IDs")
+
+        if (
+            int(response.get("width", -1)) != width
+            or int(response.get("height", -1)) != height
+        ):
+            raise RuntimeError("GIMP returned unexpected image dimensions")
 
         return response
 
@@ -1652,6 +1762,82 @@ class BlendGimpConnection:
 
         return response
 
+    def paint_stroke_segments_chunk(
+        self,
+        image_id,
+        layer_id,
+        stroke_id,
+        segments
+    ):
+        """Send several disconnected, topology-safe segments in one packet."""
+
+        normalized_segments = []
+
+        for segment in segments:
+            coordinates = [
+                float(
+                    value
+                )
+                for value in segment
+            ]
+
+            if len(
+                coordinates
+            ) >= 2:
+                normalized_segments.append(
+                    coordinates
+                )
+
+        if not normalized_segments:
+            return {
+                "type": "PAINT_STROKE_CHUNKED",
+                "ok": True,
+                "point_count": 0,
+                "segment_count": 0,
+            }
+
+        response = self.request(
+            {
+                "type": "PAINT_STROKE_CHUNK",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "image_id": int(
+                    image_id
+                ),
+                "layer_id": int(
+                    layer_id
+                ),
+                "stroke_id": str(
+                    stroke_id
+                ),
+                "segments": normalized_segments,
+                "request_id": self._next_request_id(
+                    "paint-stroke-segments-chunk"
+                ),
+            },
+            timeout=10.0
+        )
+
+        if response.get(
+            "type"
+        ) == "ERROR":
+            raise RuntimeError(
+                response.get(
+                    "error",
+                    "GIMP returned an error"
+                )
+            )
+
+        if response.get(
+            "type"
+        ) != "PAINT_STROKE_CHUNKED":
+            raise RuntimeError(
+                "Unexpected PAINT_STROKE_CHUNK response: "
+                f"{response.get('type')}"
+            )
+
+        return response
+
     def end_paint_stroke(
         self,
         stroke_id
@@ -2376,9 +2562,22 @@ class BlendGimpConnection:
             quiet=True
         )
 
-        if response.get(
-            "type"
-        ) == "ERROR":
+        response_type = str(
+            response.get(
+                "type",
+                ""
+            )
+        ).upper()
+
+        if response_type == "IMAGE_NOT_FOUND":
+            raise GimpImageNotFoundError(
+                response.get(
+                    "error",
+                    f"GIMP image ID {image_id} is no longer open"
+                )
+            )
+
+        if response_type == "ERROR":
             raise RuntimeError(
                 response.get(
                     "error",
@@ -2386,9 +2585,7 @@ class BlendGimpConnection:
                 )
             )
 
-        if response.get(
-            "type"
-        ) != "IMAGE_STATE":
+        if response_type != "IMAGE_STATE":
             raise RuntimeError(
                 "Unexpected GET_IMAGE_STATE response: "
                 f"{response.get('type')}"
@@ -2415,6 +2612,72 @@ class BlendGimpConnection:
         if returned_image_id != image_id:
             raise RuntimeError(
                 "GIMP returned state for the wrong image"
+            )
+
+        return response
+
+
+    # ========================================================
+    # SHUT DOWN GIMP ENGINE
+    # ========================================================
+
+    def shutdown_engine(
+        self,
+        force=False
+    ):
+        """
+        Ask the connected GIMP application to close itself cleanly.
+
+        GIMP may refuse a non-forced request when an image has unsaved
+        changes. BlendGimp never silently discards those changes.
+        """
+
+        response = self.request(
+            {
+                "type": "SHUTDOWN_ENGINE",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "force": bool(force),
+                "request_id": self._next_request_id(
+                    "shutdown-engine"
+                ),
+            },
+            timeout=ENGINE_SHUTDOWN_TIMEOUT
+        )
+
+        response_type = str(
+            response.get(
+                "type",
+                ""
+            )
+        ).upper()
+
+        if response_type == "ENGINE_SHUTDOWN_REFUSED":
+            raise GimpEngineShutdownRefusedError(
+                response.get(
+                    "error",
+                    "GIMP refused the shutdown request"
+                )
+            )
+
+        if response_type == "ERROR":
+            raise RuntimeError(
+                response.get(
+                    "error",
+                    "GIMP shutdown request failed"
+                )
+            )
+
+        if (
+            response_type != "ENGINE_SHUTDOWN_ACCEPTED"
+            or not response.get(
+                "ok",
+                False
+            )
+        ):
+            raise RuntimeError(
+                "Unexpected SHUTDOWN_ENGINE response: "
+                f"{response.get('type')}"
             )
 
         return response

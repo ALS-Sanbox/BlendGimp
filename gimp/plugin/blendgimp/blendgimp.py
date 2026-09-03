@@ -33,6 +33,12 @@ PROTOCOL_VERSION = 1
 # avoiding dependence on user document names such as "Demo.xcf".
 BLENDGIMP_COMPOSITE_TOKENS = {}
 
+# GIMP assigns generic "Untitled" names to new unsaved images. Keep the
+# Blender-requested texture name for this engine session so GET_IMAGES and all
+# synchronization responses can identify Blender-owned textures without an XCF
+# file or a fake on-disk filename.
+BLENDGIMP_IMAGE_NAMES = {}
+
 # Per-image visual state maintained only for the lifetime of the persistent
 # BlendGimp GIMP plug-in process. `revision` increases whenever the visible
 # composite fingerprint changes. It does not alter GIMP's own dirty/save state.
@@ -83,6 +89,18 @@ def _blendgimp_composite_token(image_id):
     return token
 
 
+def _blendgimp_image_name(image):
+    image_id = int(image.get_id())
+
+    requested_name = BLENDGIMP_IMAGE_NAMES.get(image_id)
+
+    if requested_name:
+        return str(requested_name)
+
+    name = image.get_name()
+    return "" if name is None else str(name)
+
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -103,7 +121,14 @@ class GimpMainThreadDispatcher:
         # executing on GIMP's plug-in main thread.
         self._main_thread_id = threading.get_ident()
 
-    def call(self, function, *args, timeout=5.0, **kwargs):
+    def call(
+        self,
+        function,
+        *args,
+        timeout=5.0,
+        log_exceptions=True,
+        **kwargs
+    ):
         """Run *function* on GIMP's main thread and return its result."""
 
         # Avoid scheduling through GLib when already on the GIMP main thread.
@@ -133,7 +158,11 @@ class GimpMainThreadDispatcher:
             )
 
         if "error" in result:
-            log("Main-thread command failed:\n" + result.get("traceback", ""))
+            if log_exceptions:
+                log(
+                    "Main-thread command failed:\n"
+                    + result.get("traceback", "")
+                )
             raise result["error"]
 
         return result.get("value")
@@ -154,18 +183,206 @@ def gimp_get_images_snapshot():
     images_snapshot = []
 
     for image in Gimp.get_images():
-        name = image.get_name()
+        name = _blendgimp_image_name(image)
 
         images_snapshot.append(
             {
                 "id": int(image.get_id()),
-                "name": "" if name is None else str(name),
+                "name": name,
                 "width": int(image.get_width()),
                 "height": int(image.get_height()),
             }
         )
 
     return images_snapshot
+
+
+def gimp_get_shutdown_state():
+    """
+    MAIN THREAD ONLY.
+
+    Report whether GIMP can close without discarding unsaved image changes.
+    """
+
+    images = list(
+        Gimp.get_images()
+    )
+    dirty_images = []
+
+    for image in images:
+        if not image.is_dirty():
+            continue
+
+        name = _blendgimp_image_name(image)
+
+        dirty_images.append(
+            {
+                "id": int(image.get_id()),
+                "name": "" if name is None else str(name),
+            }
+        )
+
+    return {
+        "image_count": len(images),
+        "dirty_images": dirty_images,
+        "dirty_image_count": len(dirty_images),
+    }
+
+
+def gimp_create_image(
+    name,
+    width,
+    height,
+    image_format,
+    background,
+    background_color,
+    layer_name,
+):
+    """MAIN THREAD ONLY. Create a Blender-owned GIMP image and base layer."""
+
+    name = str(name or "BlendGimp Texture").strip()
+    layer_name = str(layer_name or "BaseColor").strip()
+    width = int(width)
+    height = int(height)
+    image_format = str(image_format or "RGBA").upper()
+    background = str(background or "TRANSPARENT").upper()
+
+    if not name:
+        raise ValueError("Image name cannot be empty")
+
+    if not layer_name:
+        raise ValueError("Initial layer name cannot be empty")
+
+    if not 1 <= width <= 32768 or not 1 <= height <= 32768:
+        raise ValueError("Image dimensions must be between 1 and 32768")
+
+    if image_format not in {"RGB", "RGBA"}:
+        raise ValueError("Image format must be RGB or RGBA")
+
+    if background not in {"TRANSPARENT", "SOLID"}:
+        raise ValueError("Background must be TRANSPARENT or SOLID")
+
+    if image_format == "RGB" and background == "TRANSPARENT":
+        raise ValueError("RGB images require a solid background")
+
+    try:
+        color = tuple(
+            max(0.0, min(1.0, float(component)))
+            for component in background_color
+        )
+    except (TypeError, ValueError):
+        raise ValueError("Background color must contain four numbers")
+
+    if len(color) != 4:
+        raise ValueError("Background color must contain four numbers")
+
+    image = None
+    context_pushed = False
+
+    try:
+        image = Gimp.Image.new(
+            width,
+            height,
+            Gimp.ImageBaseType.RGB,
+        )
+
+        if image is None or not image.is_valid():
+            raise RuntimeError("GIMP could not create the image")
+
+        layer_type = (
+            Gimp.ImageType.RGBA_IMAGE
+            if image_format == "RGBA"
+            else Gimp.ImageType.RGB_IMAGE
+        )
+
+        layer = Gimp.Layer.new(
+            image,
+            layer_name,
+            width,
+            height,
+            layer_type,
+            100.0,
+            image.get_default_new_layer_mode(),
+        )
+
+        if layer is None or not layer.is_valid():
+            raise RuntimeError("GIMP could not create the initial layer")
+
+        if background == "TRANSPARENT":
+            filled = layer.fill(Gimp.FillType.TRANSPARENT)
+        else:
+            context_pushed = bool(Gimp.context_push())
+
+            if not context_pushed:
+                raise RuntimeError("GIMP could not isolate the fill context")
+
+            # A solid background is opaque by definition. Gegl.Color accepts
+            # normalized floating-point CSS color components.
+            solid_color = Gegl.Color.new(
+                "rgba("
+                f"{color[0]:.9f},"
+                f"{color[1]:.9f},"
+                f"{color[2]:.9f},1.0)"
+            )
+
+            if not Gimp.context_set_foreground(solid_color):
+                raise RuntimeError("GIMP could not set the background color")
+
+            filled = layer.fill(Gimp.FillType.FOREGROUND)
+
+        if filled is False:
+            raise RuntimeError("GIMP could not initialize the layer pixels")
+
+        if context_pushed:
+            Gimp.context_pop()
+            context_pushed = False
+
+        if not image.insert_layer(layer, None, 0):
+            raise RuntimeError("GIMP could not insert the initial layer")
+
+        image.set_selected_layers([layer])
+
+        image_id = int(image.get_id())
+        layer_id = int(layer.get_id())
+
+        BLENDGIMP_IMAGE_NAMES[image_id] = name
+        sync_token = _blendgimp_composite_token(image_id)
+
+        Gimp.displays_flush()
+
+        return {
+            "image_id": image_id,
+            "layer_id": layer_id,
+            "name": name,
+            "layer_name": str(layer.get_name() or layer_name),
+            "width": int(image.get_width()),
+            "height": int(image.get_height()),
+            "format": image_format,
+            "background": background,
+            "background_color": [
+                color[0],
+                color[1],
+                color[2],
+                0.0 if background == "TRANSPARENT" else 1.0,
+            ],
+            "sync_token": sync_token,
+            "blender_owned": True,
+        }
+
+    except Exception:
+        if image is not None and image.is_valid():
+            try:
+                image.delete()
+            except Exception:
+                pass
+        raise
+
+    finally:
+        if context_pushed:
+            try:
+                Gimp.context_pop()
+            except Exception:
+                pass
 
 
 
@@ -320,7 +537,7 @@ def gimp_get_image_layers_snapshot(image_id):
 
         return total
 
-    image_name = image.get_name()
+    image_name = _blendgimp_image_name(image)
 
     return {
         "image_id": image_id,
@@ -1765,7 +1982,7 @@ def gimp_get_brush_state():
         "brush_opacity": float(
             Gimp.context_get_opacity()
         ),
-        "brush_spacing": int(
+        "brush_spacing": float(
             Gimp.context_get_brush_spacing()
         ),
         "paint_method": str(
@@ -1780,7 +1997,9 @@ def gimp_get_brush_state():
 def gimp_paint_stroke(
     image_id,
     layer_id,
-    strokes
+    strokes,
+    flush=True,
+    include_brush_state=True
 ):
     """
     MAIN THREAD ONLY.
@@ -1873,9 +2092,14 @@ def gimp_paint_stroke(
             "GIMP paintbrush_default returned failure"
         )
 
-    Gimp.displays_flush()
+    if flush:
+        Gimp.displays_flush()
 
-    brush_state = gimp_get_brush_state()
+    brush_state = (
+        gimp_get_brush_state()
+        if include_brush_state
+        else {}
+    )
 
     return {
         "image_id": image_id,
@@ -1999,7 +2223,8 @@ def gimp_paint_direct_stroke_chunk(
     image_id,
     layer_id,
     stroke_id,
-    strokes
+    strokes,
+    segments=None
 ):
     """
     MAIN THREAD ONLY.
@@ -2046,11 +2271,49 @@ def gimp_paint_direct_stroke_chunk(
             "Direct paint stroke target changed while streaming"
         )
 
-    result = gimp_paint_stroke(
-        image_id,
-        layer_id,
-        strokes
-    )
+    if isinstance(
+        segments,
+        (list, tuple)
+    ) and segments:
+        stroke_segments = list(
+            segments
+        )
+    else:
+        stroke_segments = [
+            strokes
+        ]
+
+    total_point_count = 0
+
+    for segment in stroke_segments:
+        result = gimp_paint_stroke(
+            image_id,
+            layer_id,
+            segment,
+            flush=False,
+            include_brush_state=False
+        )
+
+        total_point_count += int(
+            result.get(
+                "point_count",
+                0
+            )
+        )
+
+    Gimp.displays_flush()
+
+    result = {
+        "image_id": image_id,
+        "layer_id": layer_id,
+        "point_count": int(
+            total_point_count
+        ),
+        "segment_count": len(
+            stroke_segments
+        ),
+        **gimp_get_brush_state(),
+    }
 
     active[
         "chunk_count"
@@ -3739,7 +4002,7 @@ def gimp_get_image_pixels_binary(
         image_id
     )
 
-    image_name = image.get_name()
+    image_name = _blendgimp_image_name(image)
 
     return {
         "image_id": image_id,
@@ -3813,7 +4076,7 @@ def gimp_get_image_pixels(
         "ascii"
     )
 
-    image_name = image.get_name()
+    image_name = _blendgimp_image_name(image)
 
     return {
         "image_id": image_id,
@@ -3942,13 +4205,7 @@ def gimp_get_image_dirty_pixels_binary(
         "sync_token": _blendgimp_composite_token(
             image_id
         ),
-        "image_name": (
-            ""
-            if image.get_name() is None
-            else str(
-                image.get_name()
-            )
-        ),
+        "image_name": _blendgimp_image_name(image),
         "width": width,
         "height": height,
         "channels": 4,
@@ -4242,7 +4499,7 @@ def gimp_get_image_dirty_pixels(
         current_pixels
     )
 
-    image_name = image.get_name()
+    image_name = _blendgimp_image_name(image)
 
     if dirty_bbox is None:
         return {
@@ -4534,7 +4791,7 @@ def gimp_get_image_state(image_id):
         "revision": revision,
     }
 
-    image_name = image.get_name()
+    image_name = _blendgimp_image_name(image)
 
     pending_damage = tracker.get(
         "damage"
@@ -4703,7 +4960,7 @@ def gimp_export_composite(image_id):
         )
 
     stat = os.stat(output_path)
-    image_name = image.get_name()
+    image_name = _blendgimp_image_name(image)
 
     return {
         "image_id": image_id,
@@ -4733,6 +4990,7 @@ class BlendGimpIPCServer:
         self._stop_event = threading.Event()
         self._thread = None
         self._server_socket = None
+        self._shutdown_scheduled = False
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -5044,6 +5302,106 @@ class BlendGimpIPCServer:
             self._copy_request_id(message, response)
             log("Sent STATUS")
             return response
+
+        if message_type == "SHUTDOWN_ENGINE":
+            force = bool(
+                message.get(
+                    "force",
+                    False
+                )
+            )
+
+            try:
+                shutdown_state = self.dispatcher.call(
+                    gimp_get_shutdown_state,
+                    timeout=5.0,
+                )
+
+                dirty_image_count = int(
+                    shutdown_state.get(
+                        "dirty_image_count",
+                        0
+                    )
+                )
+
+                if dirty_image_count and not force:
+                    response = {
+                        "type": "ENGINE_SHUTDOWN_REFUSED",
+                        "ok": False,
+                        "error": (
+                            "GIMP has unsaved image changes; "
+                            "save or close them before stopping the engine"
+                        ),
+                        **shutdown_state,
+                    }
+                    self._copy_request_id(message, response)
+                    log(
+                        "Graceful shutdown refused: "
+                        f"{dirty_image_count} dirty image(s)"
+                    )
+                    return response
+
+                response = {
+                    "type": "ENGINE_SHUTDOWN_ACCEPTED",
+                    "ok": True,
+                    **shutdown_state,
+                    "_shutdown_after_response": True,
+                    "_shutdown_force": force,
+                }
+                self._copy_request_id(message, response)
+                log("Graceful GIMP shutdown accepted")
+                return response
+
+            except Exception as exc:
+                log(f"SHUTDOWN_ENGINE failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="SHUTDOWN_ENGINE",
+                    error=str(exc),
+                )
+
+        if message_type == "CREATE_IMAGE":
+            log("CREATE_IMAGE received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_create_image,
+                    message.get("name", "BlendGimp Texture"),
+                    message.get("width"),
+                    message.get("height"),
+                    message.get("format", "RGBA"),
+                    message.get("background", "TRANSPARENT"),
+                    message.get(
+                        "background_color",
+                        [0.0, 0.0, 0.0, 1.0],
+                    ),
+                    message.get("layer_name", "BaseColor"),
+                    timeout=30.0,
+                )
+
+                response = {
+                    "type": "IMAGE_CREATED",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+
+                log(
+                    "IMAGE_CREATED "
+                    f"image ID {result['image_id']} "
+                    f"layer ID {result['layer_id']} "
+                    f"{result['width']}x{result['height']} "
+                    f"{result['format']}"
+                )
+                return response
+
+            except Exception as exc:
+                log(f"CREATE_IMAGE failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="CREATE_IMAGE",
+                    error=str(exc),
+                )
 
         if message_type == "GET_IMAGES":
             log("GET_IMAGES received")
@@ -5874,6 +6232,9 @@ class BlendGimpIPCServer:
                         "strokes",
                         []
                     ),
+                    message.get(
+                        "segments"
+                    ),
                     timeout=10.0,
                 )
 
@@ -5892,6 +6253,7 @@ class BlendGimpIPCServer:
                     "PAINT_STROKE_CHUNK "
                     f"stroke={result['stroke_id']} "
                     f"chunk={result['chunk_index']} "
+                    f"segments={result.get('segment_count', 1)} "
                     f"points={result['point_count']} "
                     f"total={result['total_point_count']}"
                 )
@@ -6358,6 +6720,8 @@ class BlendGimpIPCServer:
 
 
         if message_type == "GET_IMAGE_STATE":
+            image_id = -1
+
             try:
                 image_id = int(
                     message["image_id"]
@@ -6367,6 +6731,7 @@ class BlendGimpIPCServer:
                     gimp_get_image_state,
                     image_id,
                     timeout=5.0,
+                    log_exceptions=False,
                 )
 
                 response = {
@@ -6410,10 +6775,18 @@ class BlendGimpIPCServer:
 
                 return response
 
+            except ValueError as exc:
+                response = {
+                    "type": "IMAGE_NOT_FOUND",
+                    "ok": False,
+                    "image_id": image_id,
+                    "error": str(exc),
+                }
+                self._copy_request_id(message, response)
+                return response
+
             except Exception as exc:
-                log(
-                    f"GET_IMAGE_STATE failed: {exc}"
-                )
+                log(f"GET_IMAGE_STATE failed: {exc}")
 
                 return self._error_response(
                     message,
@@ -6490,8 +6863,8 @@ class BlendGimpIPCServer:
 
         return response
 
-    @staticmethod
     def _send_response(
+        self,
         client,
         payload
     ):
@@ -6501,6 +6874,24 @@ class BlendGimpIPCServer:
 
         `_binary_payload` is internal-only and is never serialized to JSON.
         """
+
+        shutdown_after_response = False
+        shutdown_force = False
+
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            shutdown_after_response = bool(
+                payload.pop(
+                    "_shutdown_after_response",
+                    False
+                )
+            )
+            shutdown_force = bool(
+                payload.pop(
+                    "_shutdown_force",
+                    False
+                )
+            )
 
         if (
             isinstance(
@@ -6544,7 +6935,7 @@ class BlendGimpIPCServer:
                 binary_payload
             )
 
-            BlendGimpIPCServer._send_json(
+            self._send_json(
                 client,
                 header
             )
@@ -6554,12 +6945,75 @@ class BlendGimpIPCServer:
                     binary_payload
                 )
 
+            if shutdown_after_response:
+                self._schedule_application_shutdown(
+                    shutdown_force
+                )
+
             return
 
-        BlendGimpIPCServer._send_json(
+        self._send_json(
             client,
             payload
         )
+
+        if shutdown_after_response:
+            self._schedule_application_shutdown(
+                shutdown_force
+            )
+
+    def _schedule_application_shutdown(
+        self,
+        force=False
+    ):
+        """Ask GIMP itself to exit after the IPC acknowledgement is sent."""
+
+        if self._shutdown_scheduled:
+            return
+
+        self._shutdown_scheduled = True
+
+        GLib.idle_add(
+            self._quit_gimp_application,
+            bool(force)
+        )
+
+    def _quit_gimp_application(
+        self,
+        force=False
+    ):
+        """MAIN THREAD ONLY. Invoke GIMP's application quit procedure."""
+
+        try:
+            pdb = Gimp.get_pdb()
+            procedure = pdb.lookup_procedure(
+                "gimp-quit"
+            )
+
+            if procedure is None:
+                raise RuntimeError(
+                    "The gimp-quit procedure is unavailable"
+                )
+
+            config = procedure.create_config()
+
+            if config.find_property("force") is not None:
+                config.set_property(
+                    "force",
+                    bool(force)
+                )
+
+            log("Requesting clean GIMP application exit")
+            procedure.run(config)
+
+        except Exception:
+            self._shutdown_scheduled = False
+            log(
+                "Clean GIMP application exit failed:\n"
+                + traceback.format_exc()
+            )
+
+        return GLib.SOURCE_REMOVE
 
     @staticmethod
     def _send_json(client, payload):
