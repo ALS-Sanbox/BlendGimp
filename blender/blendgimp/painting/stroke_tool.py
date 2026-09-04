@@ -1,6 +1,7 @@
 import math
 import time
 import uuid
+import json
 from types import SimpleNamespace
 
 import bpy
@@ -78,11 +79,14 @@ def _mesh_uv_layer(
     if mesh is None:
         return None
 
-    uv_layers = getattr(
-        mesh,
-        "uv_layers",
-        None
-    )
+    try:
+        uv_layers = getattr(
+            mesh,
+            "uv_layers",
+            None
+        )
+    except ReferenceError:
+        return None
 
     if uv_layers is None:
         return None
@@ -1513,6 +1517,384 @@ def _normalize_gimp_brush_spacing(
     )
 
 
+def _current_blendgimp_blender_image(
+    scene,
+    image_id
+):
+    """Resolve the current-session Blender Image paired with one GIMP ID."""
+
+    try:
+        sync_results = json.loads(
+            getattr(
+                scene,
+                "blendgimp_texture_sync_json",
+                "{}"
+            )
+            or "{}"
+        )
+    except Exception:
+        sync_results = {}
+
+    sync_result = sync_results.get(
+        str(int(image_id)),
+        {}
+    )
+
+    image_name = str(
+        sync_result.get(
+            "blender_image",
+            ""
+        )
+        or ""
+    )
+
+    if image_name:
+        image = bpy.data.images.get(image_name)
+        if image is not None:
+            return image
+
+    for image in bpy.data.images:
+        try:
+            if int(image.get("blendgimp_gimp_image_id", -1)) == int(image_id):
+                return image
+        except Exception:
+            continue
+
+    return None
+
+
+def _activate_blendgimp_texture_owner(
+    context,
+    image_id
+):
+    """Activate the object that owns the requested BlendGimp texture."""
+
+    blender_image = _current_blendgimp_blender_image(
+        context.scene,
+        image_id
+    )
+
+    if blender_image is None:
+        return context.active_object
+
+    owner_name = str(
+        blender_image.get(
+            "blendgimp_owner_object",
+            ""
+        )
+        or ""
+    )
+
+    if not owner_name:
+        return context.active_object
+
+    obj = bpy.data.objects.get(owner_name)
+
+    if obj is None:
+        return context.active_object
+
+    try:
+        for candidate in context.view_layer.objects:
+            if candidate != obj:
+                try:
+                    candidate.select_set(False)
+                except Exception:
+                    pass
+
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+    except Exception:
+        pass
+
+    material_name = str(
+        blender_image.get(
+            "blendgimp_owner_material",
+            ""
+        )
+        or ""
+    )
+
+    if material_name:
+        material = bpy.data.materials.get(material_name)
+        try:
+            slots = list(obj.data.materials)
+            if material in slots:
+                obj.active_material_index = slots.index(material)
+        except Exception:
+            pass
+
+    return obj
+
+
+def _texture_paint_unified_settings(image_paint, tool_settings=None):
+    """Resolve Blender's Texture Paint unified settings across API versions."""
+
+    # Blender 5.2 exposes the per-mode unified settings on Paint/ImagePaint.
+    # Older Blender releases also exposed ToolSettings.unified_paint_settings,
+    # so retain that as a compatibility fallback.
+    try:
+        unified = getattr(
+            image_paint,
+            "unified_paint_settings",
+            None
+        )
+        if unified is not None:
+            return unified
+    except Exception:
+        pass
+
+    if tool_settings is not None:
+        try:
+            return getattr(
+                tool_settings,
+                "unified_paint_settings",
+                None
+            )
+        except Exception:
+            pass
+
+    return None
+
+
+def _normalize_paint_color(color):
+    if color is None:
+        return None
+
+    try:
+        values = [
+            float(color[0]),
+            float(color[1]),
+            float(color[2]),
+            1.0,
+        ]
+    except Exception:
+        return None
+
+    return [
+        max(0.0, min(1.0, value))
+        for value in values
+    ]
+
+
+def _cache_texture_paint_color(scene, rgba):
+    if scene is None or rgba is None:
+        return None
+
+    values = [float(value) for value in list(rgba)[:4]]
+    if len(values) == 3:
+        values.append(1.0)
+
+    try:
+        previous = scene.get(
+            "blendgimp_texture_paint_color",
+            None
+        )
+        previous_values = (
+            None
+            if previous is None
+            else [float(value) for value in list(previous)[:4]]
+        )
+        scene["blendgimp_texture_paint_color"] = values
+
+        if previous_values != values:
+            print(
+                "BLENDGIMP: "
+                f"Cached Texture Paint color rgba={values}"
+            )
+    except Exception:
+        pass
+
+    return values
+
+
+def _cached_texture_paint_color(scene):
+    if scene is None:
+        return None
+
+    try:
+        cached = scene.get(
+            "blendgimp_texture_paint_color",
+            None
+        )
+    except Exception:
+        return None
+
+    if cached is None:
+        return None
+
+    try:
+        values = [float(value) for value in list(cached)[:4]]
+    except Exception:
+        return None
+
+    if len(values) == 3:
+        values.append(1.0)
+
+    if len(values) != 4:
+        return None
+
+    return [
+        max(0.0, min(1.0, value))
+        for value in values
+    ]
+
+
+def _live_blender_texture_paint_color(context):
+    """Read the active Blender Texture Paint brush color while available."""
+
+    try:
+        scene = context.scene
+        tool_settings = scene.tool_settings
+        image_paint = tool_settings.image_paint
+    except Exception:
+        return None
+
+    if image_paint is None:
+        return None
+
+    brush = None
+    try:
+        brush = getattr(image_paint, "brush", None)
+    except Exception:
+        pass
+
+    unified = _texture_paint_unified_settings(
+        image_paint,
+        tool_settings
+    )
+
+    # In Blender 5.2 the unified-color toggle is per brush.  Fall back to the
+    # legacy UnifiedPaintSettings toggle for compatibility with older files.
+    use_unified = False
+    try:
+        if brush is not None and hasattr(brush, "use_unified_color"):
+            use_unified = bool(brush.use_unified_color)
+        elif unified is not None:
+            use_unified = bool(
+                getattr(unified, "use_unified_color", False)
+            )
+    except Exception:
+        use_unified = False
+
+    candidates = []
+
+    if use_unified and unified is not None:
+        candidates.append(getattr(unified, "color", None))
+
+    if brush is not None:
+        candidates.append(getattr(brush, "color", None))
+
+    if unified is not None:
+        candidates.append(getattr(unified, "color", None))
+
+    for color in candidates:
+        normalized = _normalize_paint_color(color)
+        if normalized is not None:
+            return normalized
+
+    return None
+
+
+def cache_blender_texture_paint_color(context):
+    """Capture Blender Texture Paint color before leaving Texture Paint mode."""
+
+    try:
+        active_object = getattr(context, "active_object", None)
+        if (
+            active_object is None
+            or str(active_object.mode) != "TEXTURE_PAINT"
+        ):
+            return None
+    except Exception:
+        return None
+
+    live_color = _live_blender_texture_paint_color(context)
+    if live_color is None:
+        return None
+
+    return _cache_texture_paint_color(
+        getattr(context, "scene", None),
+        live_color
+    )
+
+
+def _blender_texture_paint_color(context):
+    """Return live Texture Paint color, or the last color cached in that mode."""
+
+    scene = getattr(context, "scene", None)
+
+    try:
+        active_object = getattr(context, "active_object", None)
+        in_texture_paint = (
+            active_object is not None
+            and str(active_object.mode) == "TEXTURE_PAINT"
+        )
+    except Exception:
+        in_texture_paint = False
+
+    # Once the user has left Texture Paint, prefer the value captured while
+    # that mode was authoritative.  This avoids treating a default/unbound
+    # ImagePaint unified color as the user's selected color in Layout mode.
+    if not in_texture_paint:
+        cached = _cached_texture_paint_color(scene)
+        if cached is not None:
+            print(
+                "BLENDGIMP: "
+                f"Using cached Texture Paint color rgba={cached}"
+            )
+            return cached
+
+    live_color = _live_blender_texture_paint_color(context)
+
+    if live_color is not None:
+        return _cache_texture_paint_color(
+            scene,
+            live_color
+        )
+
+    cached = _cached_texture_paint_color(scene)
+
+    if cached is not None:
+        print(
+            "BLENDGIMP: "
+            f"Using cached Texture Paint color rgba={cached}"
+        )
+
+    return cached
+
+
+def _apply_gimp_foreground_to_blender(context, rgba):
+    """Keep Blender's visible paint swatch aligned with GIMP foreground."""
+
+    try:
+        values = list(rgba)
+        if len(values) < 3:
+            return
+
+        rgb = tuple(float(value) for value in values[:3])
+        tool_settings = context.scene.tool_settings
+        image_paint = tool_settings.image_paint
+        brush = getattr(image_paint, "brush", None)
+
+        if brush is not None and hasattr(brush, "color"):
+            brush.color = rgb
+
+        unified = _texture_paint_unified_settings(
+            image_paint,
+            tool_settings
+        )
+
+        if unified is not None and hasattr(unified, "color"):
+            unified.color = rgb
+
+        _cache_texture_paint_color(
+            getattr(context, "scene", None),
+            [rgb[0], rgb[1], rgb[2], 1.0]
+        )
+    except Exception:
+        pass
+
+
 class BLENDGIMP_OT_direct_gimp_brush_paint(
     bpy.types.Operator
 ):
@@ -1643,6 +2025,58 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             context.window.cursor_modal_restore()
         except Exception:
             pass
+
+    def _projection_context_valid(
+        self,
+        context
+    ):
+        owner_name = str(
+            getattr(
+                self,
+                "_source_object_name",
+                ""
+            )
+            or ""
+        )
+
+        if not owner_name:
+            return False, "Paint object identity is unavailable"
+
+        obj = bpy.data.objects.get(owner_name)
+
+        if obj is None:
+            return False, "Paint object was removed"
+
+        if obj.type != "MESH":
+            return False, "Paint object is no longer a mesh"
+
+        if context.active_object != obj:
+            return False, "Active object changed during direct paint"
+
+        try:
+            mesh = obj.data
+            if mesh is None:
+                return False, "Paint mesh was removed"
+            _ = mesh.uv_layers
+            _ = self._raycast_mesh.uv_layers
+        except ReferenceError:
+            return False, "Paint projection mesh was invalidated"
+        except Exception as exc:
+            return False, f"Paint projection became invalid: {exc}"
+
+        expected_mesh_name = str(
+            getattr(
+                self,
+                "_source_mesh_name",
+                ""
+            )
+            or ""
+        )
+
+        if expected_mesh_name and mesh.name != expected_mesh_name:
+            return False, "Paint object's mesh datablock changed"
+
+        return True, ""
 
     def _begin_segment(
         self
@@ -3737,7 +4171,10 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
             return {"CANCELLED"}
 
-        obj = context.active_object
+        obj = _activate_blendgimp_texture_owner(
+            context,
+            self.image_id
+        )
 
         if (
             obj is None
@@ -3789,6 +4226,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
             self._source_object = obj
             self._source_mesh = obj.data
+            self._source_object_name = str(obj.name)
+            self._source_mesh_name = str(obj.data.name)
             self._raycast_object = projection[
                 "object"
             ]
@@ -3864,16 +4303,42 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
 
         try:
-            layer_response = (
-                connection_manager.ensure_paint_layer(
-                    self.image_id,
-                    BLENDGIMP_DIRECT_PAINT_LAYER_NAME
-                )
+            layer_response = connection_manager.resolve_active_raster_layer(
+                self.image_id,
+                BLENDGIMP_DIRECT_PAINT_LAYER_NAME,
+                create_if_missing=True
             )
 
-            brush_state = (
-                connection_manager.get_brush_state()
+            if bool(layer_response.get("created", False)):
+                baseline = connection_manager.consume_dirty_baseline(
+                    self.image_id
+                )
+                print(
+                    "BLENDGIMP: "
+                    f"Direct paint baselined new layer structural damage "
+                    f"for image ID {self.image_id}; "
+                    f"changed={bool(baseline.get('changed', False))}"
+                )
+
+            blender_color = _blender_texture_paint_color(
+                context
             )
+
+            if blender_color is not None:
+                connection_manager.set_foreground_color(
+                    blender_color
+                )
+
+            brush_state = connection_manager.get_brush_state()
+
+            foreground_color = brush_state.get(
+                "foreground_color"
+            )
+            if foreground_color is not None:
+                _apply_gimp_foreground_to_blender(
+                    context,
+                    foreground_color
+                )
 
         except Exception as exc:
             self.report(
@@ -3887,6 +4352,22 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 "layer_id"
             ]
         )
+
+        if (
+            getattr(
+                scene,
+                "blendgimp_blender_paint_sync_enabled",
+                False
+            )
+            and int(
+                getattr(
+                    scene,
+                    "blendgimp_blender_paint_sync_image_id",
+                    -1
+                )
+            ) == int(self.image_id)
+        ):
+            scene.blendgimp_blender_paint_sync_layer_id = self._layer_id
 
         self._brush_name = str(
             brush_state.get(
@@ -4084,6 +4565,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             "BLENDGIMP: "
             f"Direct GIMP Brush 3D Paint started for image ID "
             f"{self.image_id}, layer ID {self._layer_id}, "
+            f"layer_source={layer_response.get('source', 'selected')}, "
             f"brush={self._brush_name}, size={self._brush_size:.1f}, "
             f"front_faces_only={self._front_faces_only}, "
             f"normal_angle_enabled={self._normal_angle_enabled}, "
@@ -4140,6 +4622,34 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             self._finish(
                 context,
                 "GIMP disconnected"
+            )
+
+            return {"CANCELLED"}
+
+        projection_valid, projection_reason = (
+            self._projection_context_valid(
+                context
+            )
+        )
+
+        if not projection_valid:
+            if self._painting:
+                self._painting = False
+                self._abort_live_stroke()
+
+            self._finish(
+                context,
+                projection_reason
+            )
+
+            print(
+                "BLENDGIMP: "
+                f"Direct paint cancelled safely: {projection_reason}"
+            )
+
+            self.report(
+                {"WARNING"},
+                projection_reason
             )
 
             return {"CANCELLED"}

@@ -85,6 +85,7 @@ GET_IMAGE_PIXELS_TIMEOUT = 30.0
 GET_IMAGE_DIRTY_PIXELS_TIMEOUT = 30.0
 ENGINE_SHUTDOWN_TIMEOUT = 5.0
 CREATE_IMAGE_TIMEOUT = 30.0
+SAVE_IMAGE_TIMEOUT = 60.0
 
 
 class GimpImageNotFoundError(RuntimeError):
@@ -109,6 +110,7 @@ class BlendGimpConnection:
         PING       -> PONG
         STATUS     -> STATUS
         CREATE_IMAGE     -> IMAGE_CREATED
+        SAVE_IMAGE       -> IMAGE_SAVED
         GET_IMAGES       -> IMAGES
         GET_IMAGE_LAYERS    -> IMAGE_LAYERS
         SET_ACTIVE_LAYER    -> ACTIVE_LAYER_SET
@@ -1072,6 +1074,156 @@ class BlendGimpConnection:
 
         return response
 
+    # ========================================================
+    # RESOLVE ACTIVE RASTER LAYER
+    # ========================================================
+
+    @staticmethod
+    def _flatten_layer_tree(layers):
+        for layer in layers or []:
+            if isinstance(layer, dict):
+                yield layer
+                yield from BlendGimpConnection._flatten_layer_tree(
+                    layer.get("children", [])
+                )
+
+    def resolve_active_raster_layer(
+        self,
+        image_id,
+        fallback_name="BlendGimp Paint",
+        create_if_missing=True
+    ):
+        """Resolve the user-selected paintable GIMP raster layer.
+
+        The selected non-group layer is authoritative. A dedicated BlendGimp
+        paint layer is only created as a fallback when GIMP has no selected
+        raster layer. This keeps Direct Paint and Blender Texture Paint aimed
+        at the same layer the artist selected in the BlendGimp layer UI.
+        """
+
+        image_id = int(image_id)
+        response = self.get_image_layers(image_id)
+        flat_layers = list(
+            self._flatten_layer_tree(
+                response.get("layers", [])
+            )
+        )
+
+        selected = [
+            layer
+            for layer in flat_layers
+            if bool(layer.get("selected", False))
+        ]
+
+        selected_raster = [
+            layer
+            for layer in selected
+            if not bool(layer.get("is_group", False))
+        ]
+
+        if selected_raster:
+            layer = selected_raster[0]
+
+            if bool(layer.get("lock_content", False)):
+                raise RuntimeError(
+                    "The selected GIMP layer is content-locked. "
+                    "Unlock it before painting."
+                )
+
+            return {
+                "image_id": image_id,
+                "layer_id": int(layer["id"]),
+                "name": str(layer.get("name", "")),
+                "created": False,
+                "source": "selected",
+                "layer": layer,
+                "layers_response": response,
+            }
+
+        if selected:
+            raise RuntimeError(
+                "The selected GIMP item is a layer group. "
+                "Select a raster layer before painting."
+            )
+
+        if not create_if_missing:
+            raise RuntimeError(
+                "No selected raster GIMP layer is available"
+            )
+
+        fallback = self.ensure_paint_layer(
+            image_id,
+            fallback_name
+        )
+        fallback = dict(fallback)
+        fallback["source"] = "fallback"
+        fallback["layers_response"] = response
+        return fallback
+
+    def consume_dirty_baseline(self, image_id):
+        """Consume pending nonvisual/structural damage before live painting.
+
+        Creating an empty transparent layer can mark the entire image dirty
+        even though the visible composite did not change. Clearing that state
+        before BEGIN_PAINT_STROKE prevents the first live refresh from sending
+        a full 1K/2K/4K composite unnecessarily.
+        """
+
+        image_id = int(image_id)
+
+        try:
+            return self.get_image_dirty_pixels_binary(image_id)
+        except Exception:
+            return self.get_image_dirty_pixels(image_id)
+
+
+    def rebase_image_dirty_baseline(self, image_id):
+        """Rebase GIMP's dirty-region snapshot without downloading pixels.
+
+        This is used for structural states Blender can already represent
+        locally, most importantly deleting the final layer of an image.  It
+        prevents Auto Sync from downloading a full 4K transparent composite
+        merely to acknowledge that structural transition.
+        """
+
+        image_id = int(image_id)
+
+        response = self.request(
+            {
+                "type": "REBASE_IMAGE_DIRTY_BASELINE",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "image_id": image_id,
+                "request_id": self._next_request_id(
+                    "rebase-image-dirty-baseline"
+                ),
+            }
+        )
+
+        if response.get("type") == "ERROR":
+            raise RuntimeError(
+                response.get(
+                    "error",
+                    "GIMP returned an error"
+                )
+            )
+
+        if response.get("type") != "IMAGE_DIRTY_BASELINE_REBASED":
+            raise RuntimeError(
+                "Unexpected REBASE_IMAGE_DIRTY_BASELINE response: "
+                f"{response.get('type')}"
+            )
+
+        if not response.get("ok", False):
+            raise RuntimeError(
+                response.get(
+                    "error",
+                    "REBASE_IMAGE_DIRTY_BASELINE failed"
+                )
+            )
+
+        return response
+
 
     # ========================================================
     # SET ACTIVE LAYER
@@ -1603,6 +1755,45 @@ class BlendGimpConnection:
     # ========================================================
     # DIRECT GIMP BRUSH
     # ========================================================
+
+    def set_foreground_color(
+        self,
+        rgba
+    ):
+        values = list(rgba)
+
+        if len(values) not in {3, 4}:
+            raise ValueError(
+                "rgba must contain 3 or 4 normalized components"
+            )
+
+        normalized = [
+            max(0.0, min(1.0, float(value)))
+            for value in values
+        ]
+
+        if len(normalized) == 3:
+            normalized.append(1.0)
+
+        response = self.request(
+            {
+                "type": "SET_FOREGROUND_COLOR",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "rgba": normalized,
+                "request_id": self._next_request_id(
+                    "set-foreground-color"
+                ),
+            },
+            timeout=5.0
+        )
+
+        self._validate_write_response(
+            response,
+            expected_type="FOREGROUND_COLOR_SET"
+        )
+
+        return response
 
     def get_brush_state(
         self
@@ -2678,6 +2869,53 @@ class BlendGimpConnection:
             raise RuntimeError(
                 "Unexpected SHUTDOWN_ENGINE response: "
                 f"{response.get('type')}"
+            )
+
+        return response
+
+
+    # ========================================================
+    # SAVE GIMP IMAGE AS XCF
+    # ========================================================
+
+    def save_image(
+        self,
+        image_id,
+        path=""
+    ):
+        """Save an open GIMP image as native XCF and return save metadata."""
+
+        image_id = int(image_id)
+
+        response = self.request(
+            {
+                "type": "SAVE_IMAGE",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "image_id": image_id,
+                "path": str(path or ""),
+                "request_id": self._next_request_id(
+                    "save-image"
+                ),
+            },
+            timeout=SAVE_IMAGE_TIMEOUT
+        )
+
+        self._validate_write_response(
+            response,
+            expected_type="IMAGE_SAVED"
+        )
+
+        returned_image_id = int(
+            response.get(
+                "image_id",
+                -1
+            )
+        )
+
+        if returned_image_id != image_id:
+            raise RuntimeError(
+                "GIMP returned a save result for the wrong image"
             )
 
         return response

@@ -3,6 +3,9 @@ import json
 import os
 import time
 import base64
+import tempfile
+import re
+from bpy.app.handlers import persistent
 
 from ..core import gimp_manager
 from ..ipc.connection import (
@@ -14,6 +17,7 @@ from ..ipc.connection import (
 )
 from ..painting.stroke_tool import (
     BLENDGIMP_OT_direct_gimp_brush_paint,
+    cache_blender_texture_paint_color,
 )
 
 
@@ -39,6 +43,8 @@ _ENGINE_LIFECYCLE_RUNTIME = {
     "connect_failures": 0,
     "restart_failures": 0,
 }
+
+_EXIT_PRE_HANDLED = False
 
 
 def reset_engine_lifecycle_runtime():
@@ -498,7 +504,8 @@ def connect_scene_engine(
 
 
 def stop_scene_engine(
-    scene
+    scene,
+    force=False
 ):
     """Disconnect Blender and stop only the GIMP process BlendGimp owns."""
 
@@ -509,7 +516,7 @@ def stop_scene_engine(
     if connection_manager.is_connected():
         try:
             connection_manager.shutdown_engine(
-                force=False
+                force=bool(force)
             )
             graceful_requested = True
 
@@ -804,6 +811,164 @@ def get_stored_images(
     return []
 
 
+def _refresh_gimp_images_snapshot(scene):
+    response = connection_manager.get_images()
+    images = response.get("images", [])
+    scene.blendgimp_images_queried = True
+    scene.blendgimp_image_count = len(images)
+    scene.blendgimp_images_json = json.dumps(
+        images,
+        ensure_ascii=False
+    )
+    return images
+
+
+def _safe_xcf_component(value, fallback="BlendGimp"): 
+    text = str(value or "").strip() or str(fallback)
+    text = re.sub(r'[<>:"/\\|?*]+', "_", text)
+    text = re.sub(r"\s+", " ", text).strip().rstrip(".")
+    return text[:96] or str(fallback)
+
+
+def _default_blendgimp_save_directory():
+    if bpy.data.filepath:
+        return os.path.join(
+            os.path.dirname(bpy.data.filepath),
+            "BlendGimp Textures"
+        )
+
+    documents = os.path.join(
+        os.path.expanduser("~"),
+        "Documents"
+    )
+    base = documents if os.path.isdir(documents) else os.path.expanduser("~")
+    return os.path.join(base, "BlendGimp Textures")
+
+
+def _default_xcf_filename(scene, image):
+    image_id = int(image.get("id", -1))
+    sync_result = get_texture_sync_result(scene, image_id) or {}
+    owner = _safe_xcf_component(
+        sync_result.get("owner_object", ""),
+        fallback="Object"
+    )
+    image_name = _safe_xcf_component(
+        image.get("name", ""),
+        fallback=f"Image-{image_id}"
+    )
+    return f"{owner}__{image_name}.xcf"
+
+
+def _store_saved_xcf_path(scene, image_id, response):
+    image_id = int(image_id)
+    path = str(response.get("path", "") or "")
+    sync_token = str(response.get("sync_token", "") or "")
+
+    result = dict(
+        get_texture_sync_result(scene, image_id)
+        or {}
+    )
+    if path:
+        result["xcf_path"] = path
+    if sync_token:
+        result["sync_token"] = sync_token
+    if result:
+        store_texture_sync_result(scene, image_id, result)
+
+    blender_image = _find_blendgimp_image(
+        image_id,
+        sync_token or result.get("sync_token", "")
+    )
+    if blender_image is not None and path:
+        blender_image["blendgimp_xcf_path"] = path
+        blender_image.update()
+
+
+def save_gimp_image_xcf(scene, image_id, path=""):
+    response = connection_manager.save_image(
+        int(image_id),
+        str(path or "")
+    )
+    _store_saved_xcf_path(scene, image_id, response)
+    try:
+        _refresh_gimp_images_snapshot(scene)
+    except Exception as exc:
+        print(
+            "BLENDGIMP: Saved XCF but could not refresh image list: "
+            f"{exc}"
+        )
+    return response
+
+
+def _recovery_save_directory():
+    if bpy.data.filepath:
+        base = os.path.dirname(bpy.data.filepath)
+        return os.path.join(base, "BlendGimp Recovery")
+
+    documents = os.path.join(os.path.expanduser("~"), "Documents")
+    base = documents if os.path.isdir(documents) else os.path.expanduser("~")
+    return os.path.join(base, "BlendGimp Recovery")
+
+
+def _save_dirty_images_for_exit(scene):
+    """Save dirty headless documents before Blender exits.
+
+    Existing XCF documents save in place. Newly created unsaved documents are
+    written as recovery XCF files so Blender never has to silently abandon an
+    invisible dirty GIMP process.
+    """
+
+    images = _refresh_gimp_images_snapshot(scene)
+    dirty_images = [image for image in images if bool(image.get("dirty", False))]
+    if not dirty_images:
+        return {"saved": 0, "recovery": 0, "failed": []}
+
+    recovery_dir = _recovery_save_directory()
+    os.makedirs(recovery_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    saved = 0
+    recovery = 0
+    failed = []
+    used_paths = set()
+
+    for image in dirty_images:
+        image_id = int(image.get("id", -1))
+        current_path = str(image.get("xcf_path", "") or "")
+        try:
+            if current_path:
+                response = save_gimp_image_xcf(scene, image_id, "")
+            else:
+                base_name = _default_xcf_filename(scene, image)
+                stem = os.path.splitext(base_name)[0]
+                candidate = os.path.join(
+                    recovery_dir,
+                    f"{stem}__recovery-{stamp}.xcf"
+                )
+                suffix = 2
+                while candidate.lower() in used_paths or os.path.exists(candidate):
+                    candidate = os.path.join(
+                        recovery_dir,
+                        f"{stem}__recovery-{stamp}-{suffix}.xcf"
+                    )
+                    suffix += 1
+                used_paths.add(candidate.lower())
+                response = save_gimp_image_xcf(scene, image_id, candidate)
+                recovery += 1
+                print(
+                    "BLENDGIMP: Exit recovery saved image ID "
+                    f"{image_id} -> {response.get('path', candidate)}"
+                )
+            saved += 1
+        except Exception as exc:
+            failed.append((image_id, str(exc)))
+            print(
+                "BLENDGIMP: Exit recovery save failed for image ID "
+                f"{image_id}: {exc}"
+            )
+
+    return {"saved": saved, "recovery": recovery, "failed": failed}
+
+
 def get_stored_layer_results(
     scene
 ):
@@ -957,6 +1122,49 @@ def _find_selected_gimp_layer(
             return selected
 
     return None
+
+
+def resolve_gimp_paint_target(
+    scene,
+    image_id,
+    create_if_missing=True
+):
+    """Resolve the artist-selected raster layer and baseline fallback creation."""
+
+    target = connection_manager.resolve_active_raster_layer(
+        image_id,
+        BLENDER_PAINT_LAYER_NAME,
+        create_if_missing=create_if_missing
+    )
+
+    layers_response = target.get(
+        "layers_response"
+    )
+
+    if isinstance(layers_response, dict):
+        store_layer_result(
+            scene,
+            image_id,
+            layers_response
+        )
+
+    if bool(target.get("created", False)):
+        try:
+            baseline = connection_manager.consume_dirty_baseline(
+                image_id
+            )
+            print(
+                "BLENDGIMP: "
+                f"Paint-layer structural damage baselined for image ID {image_id}; "
+                f"changed={bool(baseline.get('changed', False))}"
+            )
+        except Exception as exc:
+            print(
+                "BLENDGIMP: "
+                f"Paint-layer structural baseline warning for image ID {image_id}: {exc}"
+            )
+
+    return target
 
 
 def _blender_image_to_top_left_rgba8(
@@ -2259,61 +2467,280 @@ def get_or_reload_blender_image(
     return blender_image
 
 
+def _blendgimp_material_uses_image(
+    material,
+    blender_image,
+    image_id
+):
+    if material is None or not getattr(material, "use_nodes", False):
+        return False
+
+    node_tree = getattr(material, "node_tree", None)
+    if node_tree is None:
+        return False
+
+    for node in node_tree.nodes:
+        if node.type != "TEX_IMAGE":
+            continue
+
+        if getattr(node, "image", None) == blender_image:
+            return True
+
+        try:
+            node_image_id = int(
+                node.get("blendgimp_gimp_image_id", -1)
+            )
+        except Exception:
+            node_image_id = -1
+
+        if node_image_id == int(image_id):
+            target_token = str(
+                blender_image.get(
+                    "blendgimp_sync_token",
+                    ""
+                )
+                or ""
+            )
+            node_token = str(
+                node.get(
+                    "blendgimp_sync_token",
+                    ""
+                )
+                or ""
+            )
+
+            if not target_token or node_token == target_token:
+                return True
+
+    return False
+
+
+def find_blendgimp_image_owner(
+    blender_image,
+    image_id
+):
+    """Resolve the Blender object/material that owns a BlendGimp texture."""
+
+    owner_name = str(
+        blender_image.get(
+            "blendgimp_owner_object",
+            ""
+        )
+        or ""
+    )
+
+    material_name = str(
+        blender_image.get(
+            "blendgimp_owner_material",
+            ""
+        )
+        or ""
+    )
+
+    if owner_name:
+        obj = bpy.data.objects.get(owner_name)
+
+        if (
+            obj is not None
+            and getattr(obj, "data", None) is not None
+            and hasattr(obj.data, "materials")
+        ):
+            material = None
+
+            if material_name:
+                material = bpy.data.materials.get(material_name)
+
+                if material not in list(obj.data.materials):
+                    material = None
+
+            if material is None:
+                for candidate in obj.data.materials:
+                    if _blendgimp_material_uses_image(
+                        candidate,
+                        blender_image,
+                        image_id
+                    ):
+                        material = candidate
+                        break
+
+            return obj, material
+
+    # Recover from object/material renames by scanning actual shader usage.
+    for obj in bpy.data.objects:
+        data = getattr(obj, "data", None)
+
+        if data is None or not hasattr(data, "materials"):
+            continue
+
+        for material in data.materials:
+            if _blendgimp_material_uses_image(
+                material,
+                blender_image,
+                image_id
+            ):
+                blender_image["blendgimp_owner_object"] = obj.name
+                blender_image["blendgimp_owner_material"] = material.name
+                return obj, material
+
+    return None, None
+
+
+def activate_blendgimp_image_owner(
+    context,
+    blender_image,
+    image_id,
+    fallback_to_active=True
+):
+    """Activate a texture's owning object instead of reassigning it elsewhere."""
+
+    obj, material = find_blendgimp_image_owner(
+        blender_image,
+        image_id
+    )
+
+    if obj is None and fallback_to_active:
+        obj = context.active_object
+
+    if obj is None:
+        return None, material
+
+    try:
+        current = context.active_object
+        if (
+            current is not None
+            and current != obj
+            and str(getattr(current, "mode", "OBJECT")) != "OBJECT"
+        ):
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+        view_layer = context.view_layer
+
+        if view_layer is not None:
+            for candidate in view_layer.objects:
+                if candidate != obj:
+                    try:
+                        candidate.select_set(False)
+                    except Exception:
+                        pass
+
+            try:
+                obj.select_set(True)
+            except Exception:
+                pass
+
+            try:
+                view_layer.objects.active = obj
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if material is not None:
+        try:
+            slots = list(obj.data.materials)
+            slot_index = slots.index(material)
+            obj.active_material_index = slot_index
+        except Exception:
+            pass
+
+        # Texture Paint uses the active Image Texture node as its paint image.
+        # Keep the owner material pointed at this exact BlendGimp image when
+        # the user switches between textures/models.
+        try:
+            if material.use_nodes and material.node_tree is not None:
+                nodes = material.node_tree.nodes
+                target_node = next(
+                    (
+                        node
+                        for node in nodes
+                        if node.type == "TEX_IMAGE"
+                        and getattr(node, "image", None) == blender_image
+                    ),
+                    None
+                )
+
+                if target_node is not None:
+                    for node in nodes:
+                        node.select = False
+                    target_node.select = True
+                    nodes.active = target_node
+        except Exception:
+            pass
+
+    return obj, material
+
+
 def assign_blendgimp_image_to_active_material(
     context,
     blender_image,
     image_id
 ):
     """
-    Assign the synchronized Blender Image to the active object's active
-    material and connect it to Principled BSDF Base Color.
+    Assign a synchronized BlendGimp Image to its owning Blender object.
 
-    If the object has no material, create a normal node-based material.
-    Existing non-Principled custom materials are left structurally intact.
+    On first assignment the current active object becomes the owner. On later
+    refreshes the stored owner is activated and reused, preventing a texture
+    from being silently applied to whichever unrelated object happens to be
+    selected at the time.
     """
 
-    obj = context.active_object
+    obj, material = activate_blendgimp_image_owner(
+        context,
+        blender_image,
+        image_id,
+        fallback_to_active=True
+    )
 
     if obj is None:
         return {
             "assigned": False,
             "material": "",
-            "reason": "No active Blender object",
+            "owner_object": "",
+            "reason": "No owning or active Blender object",
         }
 
     if (
-        getattr(
-            obj,
-            "data",
-            None
-        ) is None
-        or not hasattr(
-            obj.data,
-            "materials"
-        )
+        getattr(obj, "data", None) is None
+        or not hasattr(obj.data, "materials")
     ):
         return {
             "assigned": False,
             "material": "",
-            "reason": "Active object does not support materials",
+            "owner_object": obj.name,
+            "reason": "Owning object does not support materials",
         }
 
-    material = obj.active_material
     created_material = False
 
     if material is None:
+        material_name = str(
+            blender_image.get(
+                "blendgimp_owner_material",
+                ""
+            )
+            or ""
+        )
 
+        if material_name:
+            candidate = bpy.data.materials.get(material_name)
+            if candidate in list(obj.data.materials):
+                material = candidate
+
+    if material is None:
+        material = obj.active_material
+
+    if material is None:
         material = bpy.data.materials.new(
             name="BlendGimp Material"
         )
-
         material.use_nodes = True
         created_material = True
 
         if len(obj.data.materials) == 0:
-            obj.data.materials.append(
-                material
-            )
+            obj.data.materials.append(material)
         else:
             obj.active_material = material
 
@@ -2333,17 +2760,15 @@ def assign_blendgimp_image_to_active_material(
     )
 
     if principled is None:
-
         if created_material:
-            principled = nodes.new(
-                "ShaderNodeBsdfPrincipled"
-            )
+            principled = nodes.new("ShaderNodeBsdfPrincipled")
         else:
             return {
                 "assigned": False,
                 "material": material.name,
+                "owner_object": obj.name,
                 "reason": (
-                    "Active material has no Principled BSDF; "
+                    "Owning material has no Principled BSDF; "
                     "image was refreshed but shader was not rewired"
                 ),
             }
@@ -2351,79 +2776,103 @@ def assign_blendgimp_image_to_active_material(
     texture_node = None
 
     for node in nodes:
-
         if node.type != "TEX_IMAGE":
             continue
 
         try:
             node_image_id = int(
-                node.get(
-                    "blendgimp_gimp_image_id",
-                    -1
-                )
+                node.get("blendgimp_gimp_image_id", -1)
             )
         except Exception:
             node_image_id = -1
 
+        node_matches_image = (
+            getattr(node, "image", None) == blender_image
+        )
+
+        node_matches_session = False
         if node_image_id == int(image_id):
+            target_token = str(
+                blender_image.get(
+                    "blendgimp_sync_token",
+                    ""
+                )
+                or ""
+            )
+            node_token = str(
+                node.get(
+                    "blendgimp_sync_token",
+                    ""
+                )
+                or ""
+            )
+            node_matches_session = (
+                not target_token
+                or node_token == target_token
+            )
+
+        if node_matches_image or node_matches_session:
             texture_node = node
             break
 
     if texture_node is None:
-
-        texture_node = nodes.new(
-            "ShaderNodeTexImage"
-        )
-
-        texture_node.label = (
-            "BlendGimp Composite"
-        )
-
-        texture_node.name = (
-            f"BlendGimp Composite {image_id}"
-        )
-
+        texture_node = nodes.new("ShaderNodeTexImage")
+        texture_node.label = "BlendGimp Composite"
+        texture_node.name = f"BlendGimp Composite {image_id}"
         texture_node.location = (
             principled.location.x - 360.0,
             principled.location.y + 160.0,
         )
 
-    texture_node[
-        "blendgimp_gimp_image_id"
-    ] = int(image_id)
-
+    texture_node["blendgimp_gimp_image_id"] = int(image_id)
+    texture_node["blendgimp_sync_token"] = str(
+        blender_image.get(
+            "blendgimp_sync_token",
+            ""
+        )
+        or ""
+    )
+    texture_node["blendgimp_owner_object"] = obj.name
+    texture_node["blendgimp_owner_material"] = material.name
     texture_node.image = blender_image
 
-    base_color_input = principled.inputs.get(
-        "Base Color"
-    )
+    try:
+        for node in nodes:
+            node.select = False
+        texture_node.select = True
+        nodes.active = texture_node
+    except Exception:
+        pass
+
+    base_color_input = principled.inputs.get("Base Color")
 
     if base_color_input is None:
         return {
             "assigned": False,
             "material": material.name,
+            "owner_object": obj.name,
             "reason": "Principled BSDF has no Base Color input",
         }
 
-    for link in list(
-        base_color_input.links
-    ):
-        links.remove(
-            link
-        )
+    for link in list(base_color_input.links):
+        links.remove(link)
 
     links.new(
         texture_node.outputs["Color"],
         base_color_input
     )
 
-    material[
-        "blendgimp_gimp_image_id"
-    ] = int(image_id)
+    material["blendgimp_gimp_image_id"] = int(image_id)
+    material["blendgimp_owner_object"] = obj.name
+
+    blender_image["blendgimp_owner_object"] = obj.name
+    blender_image["blendgimp_owner_material"] = material.name
+    blender_image.update()
 
     return {
         "assigned": True,
         "material": material.name,
+        "owner_object": obj.name,
         "reason": "",
     }
 
@@ -2762,6 +3211,16 @@ def synchronize_gimp_composite(
                     ""
                 )
             ),
+            "owner_object": str(
+                previous.get(
+                    "owner_object",
+                    blender_image.get(
+                        "blendgimp_owner_object",
+                        ""
+                    )
+                )
+                or ""
+            ),
             "assigned": bool(
                 previous.get(
                     "assigned",
@@ -2864,6 +3323,16 @@ def synchronize_gimp_composite(
             "material",
             ""
         ),
+        "owner_object": assignment.get(
+            "owner_object",
+            str(
+                blender_image.get(
+                    "blendgimp_owner_object",
+                    ""
+                )
+                or ""
+            )
+        ),
         "assigned": bool(
             assignment.get(
                 "assigned",
@@ -2953,6 +3422,15 @@ def blendgimp_blender_paint_sync_timer():
 
     if scene is None:
         return BLENDER_PAINT_SYNC_POLL_INTERVAL
+
+    # Cache the active Texture Paint color while Blender still exposes the
+    # ImagePaint brush.  Blender 5.2 can drop the active paint brush when the
+    # user returns to Object/Layout mode, so Direct GIMP Paint must not depend
+    # on reading the brush only after the mode switch.
+    try:
+        cache_blender_texture_paint_color(bpy.context)
+    except Exception:
+        pass
 
     if not scene.blendgimp_blender_paint_sync_enabled:
         return BLENDER_PAINT_SYNC_POLL_INTERVAL
@@ -3203,28 +3681,27 @@ def blendgimp_blender_paint_sync_timer():
 
     try:
 
-        layer_id = int(
-            scene.blendgimp_blender_paint_sync_layer_id
+        layer_response = resolve_gimp_paint_target(
+            scene,
+            image_id,
+            create_if_missing=True
         )
 
-        if layer_id < 0:
+        layer_id = int(
+            layer_response["layer_id"]
+        )
 
-            layer_response = (
-                connection_manager.ensure_paint_layer(
-                    image_id,
-                    BLENDER_PAINT_LAYER_NAME
-                )
+        if int(
+            scene.blendgimp_blender_paint_sync_layer_id
+        ) != layer_id:
+            print(
+                "BLENDGIMP: "
+                f"3D Paint Sync target changed to selected GIMP layer "
+                f"ID {layer_id} ({layer_response.get('name', '')})"
             )
 
-            layer_id = int(
-                layer_response[
-                    "layer_id"
-                ]
-            )
-
-            scene.blendgimp_blender_paint_sync_layer_id = (
-                layer_id
-            )
+        scene.blendgimp_blender_paint_sync_layer_id = layer_id
+        _BLENDER_PAINT_SYNC_RUNTIME["layer_id"] = layer_id
 
         try:
 
@@ -3261,17 +3738,14 @@ def blendgimp_blender_paint_sync_timer():
                 "Resolving BlendGimp Paint and retrying."
             )
 
-            layer_response = (
-                connection_manager.ensure_paint_layer(
-                    image_id,
-                    BLENDER_PAINT_LAYER_NAME
-                )
+            layer_response = resolve_gimp_paint_target(
+                scene,
+                image_id,
+                create_if_missing=True
             )
 
             layer_id = int(
-                layer_response[
-                    "layer_id"
-                ]
+                layer_response["layer_id"]
             )
 
             scene.blendgimp_blender_paint_sync_layer_id = (
@@ -3606,6 +4080,119 @@ def blendgimp_auto_sync_timer():
         return 1.0
 
     return AUTO_SYNC_POLL_INTERVAL
+
+
+def _find_current_blendgimp_preview_image(
+    context,
+    image_id
+):
+    """Prefer the image currently bound to the active owner's shader."""
+
+    image_id = int(image_id)
+
+    obj = getattr(context, "active_object", None)
+    material = getattr(obj, "active_material", None) if obj is not None else None
+
+    if material is not None and getattr(material, "use_nodes", False):
+        node_tree = getattr(material, "node_tree", None)
+        if node_tree is not None:
+            for node in node_tree.nodes:
+                if getattr(node, "type", "") != "TEX_IMAGE":
+                    continue
+                try:
+                    node_image_id = int(
+                        node.get("blendgimp_gimp_image_id", -1)
+                    )
+                except Exception:
+                    node_image_id = -1
+                image = getattr(node, "image", None)
+                if node_image_id == image_id and image is not None:
+                    return image
+
+    candidates = []
+    for image in bpy.data.images:
+        try:
+            candidate_id = int(
+                image.get("blendgimp_gimp_image_id", -1)
+            )
+        except Exception:
+            candidate_id = -1
+        if candidate_id == image_id:
+            candidates.append(image)
+
+    # New session images are created after stale datablocks, so prefer the
+    # newest matching image if shader ownership could not resolve it.
+    return candidates[-1] if candidates else None
+
+
+def _clear_blender_preview_for_empty_gimp_image(
+    context,
+    image_id
+):
+    """Clear a zero-layer GIMP preview without uploading a 4K float array.
+
+    Scaling to 1x1, clearing four components, then scaling back delegates the
+    large allocation/fill to Blender's C image code instead of constructing or
+    converting 67 million Python-side pixel components.
+    """
+
+    blender_image = _find_current_blendgimp_preview_image(
+        context,
+        image_id
+    )
+
+    if blender_image is None:
+        return False
+
+    width = int(blender_image.size[0])
+    height = int(blender_image.size[1])
+
+    if width <= 0 or height <= 0:
+        return False
+
+    try:
+        blender_image.scale(1, 1)
+        blender_image.pixels.foreach_set(
+            (0.0, 0.0, 0.0, 0.0)
+        )
+        blender_image.scale(width, height)
+        blender_image.update()
+
+        scene = getattr(context, "scene", None)
+        if (
+            scene is not None
+            and hasattr(scene, "blendgimp_blender_paint_sync_image_id")
+            and int(scene.blendgimp_blender_paint_sync_image_id) == int(image_id)
+        ):
+            # The local preview clear is structural bookkeeping, not a Blender
+            # Texture Paint edit. Rebase the Blender->GIMP paint watcher to the
+            # same transparent image so it does not try to push a full 4K zero
+            # frame back into a newly-created fallback layer.
+            blank_baseline = bytes(width * height * 4)
+            reset_blender_paint_sync_runtime(
+                image_id=image_id,
+                layer_id=-1,
+                baseline=blank_baseline
+            )
+            scene.blendgimp_blender_paint_sync_layer_id = -1
+
+        print(
+            "BLENDGIMP: Cleared Blender preview locally after final "
+            f"GIMP layer deletion for image ID {image_id} "
+            f"({width}x{height}); no full-frame download required"
+        )
+        return True
+    except Exception as exc:
+        print(
+            "BLENDGIMP: Could not clear zero-layer Blender preview "
+            f"for image ID {image_id}: {exc}"
+        )
+        try:
+            if int(blender_image.size[0]) != width or int(blender_image.size[1]) != height:
+                blender_image.scale(width, height)
+        except Exception:
+            pass
+        return False
 
 
 def refresh_layer_result(
@@ -4506,6 +5093,83 @@ class BLENDGIMP_OT_stop_gimp(
 
 
 # ============================================================
+# FORCE STOP GIMP ENGINE
+# ============================================================
+
+class BLENDGIMP_OT_force_stop_gimp(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.force_stop_gimp"
+    bl_label = "Force Stop GIMP Engine"
+
+    bl_description = (
+        "Force GIMP to close even when headless documents have unsaved "
+        "changes. Unsaved GIMP image changes will be discarded."
+    )
+
+    def invoke(
+        self,
+        context,
+        event
+    ):
+        return context.window_manager.invoke_confirm(
+            self,
+            event
+        )
+
+    def execute(
+        self,
+        context
+    ):
+        dirty_count = 0
+        try:
+            if connection_manager.is_connected():
+                images = connection_manager.get_images().get("images", [])
+                dirty_count = sum(
+                    1 for image in images
+                    if bool(image.get("dirty", False))
+                )
+        except Exception:
+            dirty_count = 0
+
+        success, _exit_code, process_forced = stop_scene_engine(
+            context.scene,
+            force=True
+        )
+
+        if not success:
+            self.report(
+                {"ERROR"},
+                (
+                    context.scene.blendgimp_engine_last_error
+                    or "Could not force-stop GIMP engine"
+                )
+            )
+            return {"CANCELLED"}
+
+        if dirty_count > 0:
+            self.report(
+                {"WARNING"},
+                (
+                    f"GIMP engine stopped with discard permission; "
+                    f"{dirty_count} unsaved image(s) discarded"
+                )
+            )
+        elif process_forced:
+            self.report(
+                {"WARNING"},
+                "GIMP process required forced termination after timeout"
+            )
+        else:
+            self.report(
+                {"INFO"},
+                "GIMP engine stopped cleanly; no unsaved image changes"
+            )
+        return {"FINISHED"}
+
+
+# ============================================================
 # RESTART GIMP ENGINE
 # ============================================================
 
@@ -4850,6 +5514,34 @@ class BLENDGIMP_OT_create_image(
             blender_image.name = texture_name
             blender_image.update()
 
+            created_sync_result = (
+                get_texture_sync_result(
+                    scene,
+                    image_id
+                )
+                or {}
+            )
+            created_sync_result["blender_image"] = blender_image.name
+            created_sync_result["owner_object"] = str(
+                blender_image.get(
+                    "blendgimp_owner_object",
+                    ""
+                )
+                or ""
+            )
+            created_sync_result["material"] = str(
+                blender_image.get(
+                    "blendgimp_owner_material",
+                    created_sync_result.get("material", "")
+                )
+                or ""
+            )
+            store_texture_sync_result(
+                scene,
+                image_id,
+                created_sync_result
+            )
+
             state = connection_manager.get_image_state(image_id)
             revision = int(state.get("revision", 0))
 
@@ -5002,8 +5694,296 @@ class BLENDGIMP_OT_get_images(
 
 
 # ============================================================
+# SAVE GIMP IMAGE(S) AS NATIVE XCF
+# ============================================================
+
+class BLENDGIMP_OT_save_image_as(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.save_image_as"
+    bl_label = "Save BlendGimp Image As XCF"
+    bl_description = "Save this GIMP image as native XCF, preserving layers"
+
+    image_id: bpy.props.IntProperty(
+        name="Image ID",
+        default=-1
+    )
+
+    filepath: bpy.props.StringProperty(
+        name="XCF File",
+        subtype="FILE_PATH",
+        default=""
+    )
+
+    filter_glob: bpy.props.StringProperty(
+        default="*.xcf",
+        options={"HIDDEN"}
+    )
+
+    def invoke(self, context, event):
+        scene = context.scene
+        images = get_stored_images(scene)
+        image = next(
+            (item for item in images if int(item.get("id", -1)) == int(self.image_id)),
+            {"id": int(self.image_id), "name": f"Image-{self.image_id}"}
+        )
+
+        current_path = str(image.get("xcf_path", "") or "")
+        if current_path:
+            self.filepath = current_path
+        else:
+            save_dir = _default_blendgimp_save_directory()
+            os.makedirs(save_dir, exist_ok=True)
+            self.filepath = os.path.join(
+                save_dir,
+                _default_xcf_filename(scene, image)
+            )
+
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        if int(self.image_id) < 0:
+            self.report({"ERROR"}, "Invalid GIMP image ID")
+            return {"CANCELLED"}
+
+        path = str(self.filepath or "").strip()
+        if not path:
+            self.report({"ERROR"}, "Choose an XCF save path")
+            return {"CANCELLED"}
+
+        if not path.lower().endswith(".xcf"):
+            path += ".xcf"
+
+        try:
+            response = save_gimp_image_xcf(
+                context.scene,
+                self.image_id,
+                path
+            )
+            saved_path = str(response.get("path", path))
+            print(
+                "BLENDGIMP: Saved GIMP image ID "
+                f"{self.image_id} -> {saved_path}"
+            )
+            self.report({"INFO"}, f"Saved XCF: {os.path.basename(saved_path)}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Save As failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_save_image(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.save_image"
+    bl_label = "Save BlendGimp Image"
+    bl_description = "Save this GIMP image to its existing XCF path"
+
+    image_id: bpy.props.IntProperty(
+        name="Image ID",
+        default=-1
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        image = next(
+            (item for item in get_stored_images(scene)
+             if int(item.get("id", -1)) == int(self.image_id)),
+            None
+        )
+
+        if image is None:
+            try:
+                images = _refresh_gimp_images_snapshot(scene)
+                image = next(
+                    (item for item in images
+                     if int(item.get("id", -1)) == int(self.image_id)),
+                    None
+                )
+            except Exception:
+                image = None
+
+        if not image or not str(image.get("xcf_path", "") or ""):
+            return bpy.ops.blendgimp.save_image_as(
+                "INVOKE_DEFAULT",
+                image_id=int(self.image_id)
+            )
+
+        try:
+            response = save_gimp_image_xcf(scene, self.image_id, "")
+            saved_path = str(response.get("path", image.get("xcf_path", "")))
+            self.report({"INFO"}, f"Saved XCF: {os.path.basename(saved_path)}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Save failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_save_all_images(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.save_all_images"
+    bl_label = "Save All BlendGimp Images"
+    bl_description = (
+        "Save all open GIMP documents as native XCF. Existing XCF files save "
+        "in place; newly created images are saved into the chosen folder."
+    )
+
+    directory: bpy.props.StringProperty(
+        name="Folder for Unsaved XCF Images",
+        subtype="DIR_PATH",
+        default=""
+    )
+
+    def invoke(self, context, event):
+        try:
+            images = _refresh_gimp_images_snapshot(context.scene)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not query GIMP images: {exc}")
+            return {"CANCELLED"}
+
+        unsaved = [item for item in images if not str(item.get("xcf_path", "") or "")]
+        if not unsaved:
+            return self.execute(context)
+
+        self.directory = _default_blendgimp_save_directory()
+        os.makedirs(self.directory, exist_ok=True)
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            images = _refresh_gimp_images_snapshot(scene)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not query GIMP images: {exc}")
+            return {"CANCELLED"}
+
+        if not images:
+            self.report({"INFO"}, "GIMP has no images open")
+            return {"FINISHED"}
+
+        unsaved = [item for item in images if not str(item.get("xcf_path", "") or "")]
+        save_dir = str(self.directory or "").strip()
+        if unsaved and not save_dir:
+            self.report({"ERROR"}, "Choose a folder for newly created XCF images")
+            return {"CANCELLED"}
+
+        if save_dir:
+            save_dir = os.path.abspath(os.path.expanduser(save_dir))
+            os.makedirs(save_dir, exist_ok=True)
+
+        saved = 0
+        failures = []
+        used_paths = set()
+
+        for image in images:
+            image_id = int(image.get("id", -1))
+            current_path = str(image.get("xcf_path", "") or "")
+            try:
+                if current_path:
+                    save_gimp_image_xcf(scene, image_id, "")
+                else:
+                    filename = _default_xcf_filename(scene, image)
+                    candidate = os.path.join(save_dir, filename)
+                    stem, ext = os.path.splitext(candidate)
+                    suffix = 2
+                    while candidate.lower() in used_paths or os.path.exists(candidate):
+                        candidate = f"{stem}-{suffix}{ext}"
+                        suffix += 1
+                    used_paths.add(candidate.lower())
+                    save_gimp_image_xcf(scene, image_id, candidate)
+                saved += 1
+            except Exception as exc:
+                failures.append(f"ID {image_id}: {exc}")
+
+        try:
+            _refresh_gimp_images_snapshot(scene)
+        except Exception:
+            pass
+
+        if failures:
+            self.report(
+                {"WARNING"},
+                f"Saved {saved} image(s); {len(failures)} failed. See console."
+            )
+            for failure in failures:
+                print("BLENDGIMP: Save All failure: " + failure)
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Saved {saved} BlendGimp image(s) as XCF")
+        return {"FINISHED"}
+
+
+# ============================================================
 # REFRESH GIMP COMPOSITE INTO BLENDER
 # ============================================================
+
+class BLENDGIMP_OT_activate_texture_owner(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.activate_texture_owner"
+    bl_label = "Activate Texture Owner"
+
+    bl_description = (
+        "Select the Blender object and material that own this BlendGimp texture"
+    )
+
+    image_id: bpy.props.IntProperty(
+        name="Image ID",
+        default=-1
+    )
+
+    def execute(
+        self,
+        context
+    ):
+        scene = context.scene
+        image_id = int(self.image_id)
+        sync_result = get_texture_sync_result(
+            scene,
+            image_id
+        ) or {}
+        blender_image = _find_blendgimp_image(
+            image_id,
+            sync_result.get("sync_token", "")
+        )
+
+        if blender_image is None:
+            self.report(
+                {"ERROR"},
+                "Refresh this texture from GIMP before activating its owner"
+            )
+            return {"CANCELLED"}
+
+        obj, material = activate_blendgimp_image_owner(
+            context,
+            blender_image,
+            image_id,
+            fallback_to_active=False
+        )
+
+        if obj is None:
+            self.report(
+                {"ERROR"},
+                "This BlendGimp texture does not have a Blender object owner"
+            )
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"Activated {obj.name}"
+                + (f" / {material.name}" if material is not None else "")
+            )
+        )
+        return {"FINISHED"}
+
 
 class BLENDGIMP_OT_refresh_from_gimp(
     bpy.types.Operator
@@ -5497,8 +6477,8 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
     bl_label = "Toggle 3D Paint Sync"
 
     bl_description = (
-        "Automatically push Blender Texture Paint changes into the dedicated "
-        "BlendGimp Paint layer in GIMP"
+        "Automatically push Blender Texture Paint changes into the selected "
+        "paintable GIMP raster layer"
     )
 
     image_id: bpy.props.IntProperty(
@@ -5588,11 +6568,17 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
                     "Refresh From GIMP before enabling 3D Paint Sync"
                 )
 
-            layer_response = (
-                connection_manager.ensure_paint_layer(
-                    image_id,
-                    BLENDER_PAINT_LAYER_NAME
-                )
+            activate_blendgimp_image_owner(
+                context,
+                blender_image,
+                image_id,
+                fallback_to_active=True
+            )
+
+            layer_response = resolve_gimp_paint_target(
+                scene,
+                image_id,
+                create_if_missing=True
             )
 
             layer_id = int(
@@ -5723,11 +6709,17 @@ class BLENDGIMP_OT_push_to_gimp(
                     "Refresh From GIMP first."
                 )
 
-            layer_response = (
-                connection_manager.ensure_paint_layer(
-                    image_id,
-                    BLENDER_PAINT_LAYER_NAME
-                )
+            activate_blendgimp_image_owner(
+                context,
+                blender_image,
+                image_id,
+                fallback_to_active=True
+            )
+
+            layer_response = resolve_gimp_paint_target(
+                scene,
+                image_id,
+                create_if_missing=True
             )
 
             layer_id = int(
@@ -5982,6 +6974,21 @@ class BLENDGIMP_OT_set_active_layer(
                 scene,
                 self.image_id
             )
+
+            if (
+                scene.blendgimp_blender_paint_sync_enabled
+                and int(scene.blendgimp_blender_paint_sync_image_id)
+                == int(self.image_id)
+            ):
+                scene.blendgimp_blender_paint_sync_layer_id = int(
+                    self.layer_id
+                )
+                _BLENDER_PAINT_SYNC_RUNTIME["layer_id"] = int(
+                    self.layer_id
+                )
+                scene.blendgimp_blender_paint_sync_status = (
+                    f"Target layer {self.layer_id}"
+                )
 
             scene.blendgimp_connected = True
 
@@ -6304,6 +7311,23 @@ class BLENDGIMP_OT_add_layer(
                 self.image_id
             )
 
+            # A new empty transparent layer is structurally dirty in GIMP but
+            # does not change the visible composite. Consume that no-op state
+            # immediately so the first paint stroke cannot inherit a full-image
+            # dirty rectangle (especially expensive at 4K).
+            try:
+                synchronize_gimp_composite(
+                    context,
+                    self.image_id,
+                    assign_material=False,
+                    dirty_only=True
+                )
+            except Exception as baseline_exc:
+                print(
+                    "BLENDGIMP: "
+                    f"ADD_LAYER structural baseline warning: {baseline_exc}"
+                )
+
             new_layer_id = int(
                 response.get(
                     "layer_id",
@@ -6397,10 +7421,36 @@ class BLENDGIMP_OT_delete_layer(
                 self.layer_id
             )
 
-            refresh_layer_result(
+            layer_response = refresh_layer_result(
                 scene,
                 self.image_id
             )
+
+            remaining_layers = layer_response.get(
+                "layers",
+                []
+            )
+
+            if isinstance(remaining_layers, list) and len(remaining_layers) == 0:
+                baseline_response = (
+                    connection_manager.rebase_image_dirty_baseline(
+                        self.image_id
+                    )
+                )
+
+                preview_cleared = (
+                    _clear_blender_preview_for_empty_gimp_image(
+                        context,
+                        self.image_id
+                    )
+                )
+
+                print(
+                    "BLENDGIMP: Last GIMP layer removed; dirty baseline "
+                    f"rebased without pixel transfer for image ID {self.image_id}; "
+                    f"source={baseline_response.get('source', 'unknown')} "
+                    f"preview_cleared={preview_cleared}"
+                )
 
             print(
                 "BLENDGIMP: "
@@ -7432,6 +8482,13 @@ class BLENDGIMP_PT_main_panel(
                     text="Restart",
                     icon="FILE_REFRESH"
                 )
+                force_row = gimp_box.row()
+                force_row.alert = True
+                force_row.operator(
+                    "blendgimp.force_stop_gimp",
+                    text="Force Stop (Discard Unsaved)",
+                    icon="ERROR"
+                )
 
             else:
                 gimp_box.operator(
@@ -7619,6 +8676,12 @@ class BLENDGIMP_PT_main_panel(
                 icon="IMAGE_DATA"
             )
 
+            connection_box.operator(
+                "blendgimp.save_all_images",
+                text="Save All XCF",
+                icon="FILE_TICK"
+            )
+
             # ================================================
             # LAST GET_IMAGES RESULT
             # ================================================
@@ -7687,6 +8750,109 @@ class BLENDGIMP_PT_main_panel(
                             image_id = -1
 
                         if image_id >= 0:
+
+                            xcf_path = str(
+                                image.get(
+                                    "xcf_path",
+                                    ""
+                                )
+                                or ""
+                            )
+                            is_dirty = bool(
+                                image.get(
+                                    "dirty",
+                                    False
+                                )
+                            )
+
+                            if xcf_path:
+                                image_box.label(
+                                    text=(
+                                        "XCF: "
+                                        + os.path.basename(xcf_path)
+                                    ),
+                                    icon="FILE_TICK"
+                                )
+                            else:
+                                image_box.label(
+                                    text="Not saved as XCF yet",
+                                    icon="INFO"
+                                )
+
+                            if is_dirty:
+                                image_box.label(
+                                    text="Unsaved changes",
+                                    icon="ERROR"
+                                )
+                            elif xcf_path:
+                                image_box.label(
+                                    text="Saved",
+                                    icon="CHECKMARK"
+                                )
+
+                            save_row = image_box.row(align=True)
+                            save_operator = save_row.operator(
+                                "blendgimp.save_image",
+                                text=(
+                                    "Save"
+                                    if xcf_path
+                                    else "Save XCF..."
+                                ),
+                                icon="FILE_TICK"
+                            )
+                            save_operator.image_id = image_id
+
+                            save_as_operator = save_row.operator(
+                                "blendgimp.save_image_as",
+                                text="Save As...",
+                                icon="FILE"
+                            )
+                            save_as_operator.image_id = image_id
+
+                            card_sync_result = (
+                                get_texture_sync_result(
+                                    scene,
+                                    image_id
+                                )
+                                or {}
+                            )
+
+                            owner_object = str(
+                                card_sync_result.get(
+                                    "owner_object",
+                                    ""
+                                )
+                                or ""
+                            )
+                            owner_material = str(
+                                card_sync_result.get(
+                                    "material",
+                                    ""
+                                )
+                                or ""
+                            )
+
+                            if owner_object:
+                                image_box.label(
+                                    text=f"Object: {owner_object}",
+                                    icon="OBJECT_DATA"
+                                )
+
+                            if owner_material:
+                                image_box.label(
+                                    text=f"Material: {owner_material}",
+                                    icon="MATERIAL"
+                                )
+
+                            if owner_object:
+                                activate_owner_operator = (
+                                    image_box.operator(
+                                        "blendgimp.activate_texture_owner",
+                                        text="Activate Owner",
+                                        icon="RESTRICT_SELECT_OFF"
+                                    )
+                                )
+                                activate_owner_operator.image_id = image_id
 
                             refresh_operator = (
                                 image_box.operator(
@@ -7929,8 +9095,8 @@ class BLENDGIMP_PT_main_panel(
 
                                 image_box.label(
                                     text=(
-                                        "GIMP Target: "
-                                        f"{BLENDER_PAINT_LAYER_NAME}"
+                                        "GIMP Target Layer ID: "
+                                        f"{scene.blendgimp_blender_paint_sync_layer_id}"
                                     )
                                 )
 
@@ -8232,6 +9398,8 @@ classes = (
 
     BLENDGIMP_OT_stop_gimp,
 
+    BLENDGIMP_OT_force_stop_gimp,
+
     BLENDGIMP_OT_restart_gimp,
 
     BLENDGIMP_OT_check_gimp,
@@ -8243,6 +9411,14 @@ classes = (
     BLENDGIMP_OT_create_image,
 
     BLENDGIMP_OT_get_images,
+
+    BLENDGIMP_OT_save_image,
+
+    BLENDGIMP_OT_save_image_as,
+
+    BLENDGIMP_OT_save_all_images,
+
+    BLENDGIMP_OT_activate_texture_owner,
 
     BLENDGIMP_OT_refresh_from_gimp,
 
@@ -8297,7 +9473,98 @@ classes = (
 # REGISTER
 # ============================================================
 
+@persistent
+def blendgimp_exit_pre(_is_user_exit):
+    """Protect dirty headless GIMP documents while Blender exits.
+
+    Blender 5.2 calls exit_pre while application data is still valid. Save
+    existing XCF documents in place and write never-saved documents to a
+    recovery folder before requesting a clean GIMP shutdown.
+    """
+
+    global _EXIT_PRE_HANDLED
+    _EXIT_PRE_HANDLED = True
+    print(
+        "BLENDGIMP: exit_pre lifecycle handler entered; "
+        f"user_exit={bool(_is_user_exit)}",
+        flush=True,
+    )
+
+    snapshot = gimp_manager.get_engine_snapshot()
+    if not (
+        snapshot.get("running", False)
+        and snapshot.get("mode") == gimp_manager.ENGINE_MODE_HEADLESS
+    ):
+        return
+
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None and bpy.data.scenes:
+        scene = bpy.data.scenes[0]
+
+    if scene is None:
+        print(
+            "BLENDGIMP: Blender exit could not resolve a Scene; "
+            "leaving headless GIMP running to avoid data loss"
+        )
+        connection_manager.disconnect()
+        gimp_manager.clear_process_reference()
+        return
+
+    save_result = {"saved": 0, "recovery": 0, "failed": []}
+
+    if connection_manager.is_connected():
+        try:
+            save_result = _save_dirty_images_for_exit(scene)
+        except Exception as exc:
+            save_result = {
+                "saved": 0,
+                "recovery": 0,
+                "failed": [(-1, str(exc))],
+            }
+
+    failures = list(save_result.get("failed", []))
+    if failures:
+        print(
+            "BLENDGIMP: Blender exit recovery could not save all dirty "
+            "documents; leaving headless GIMP running to protect them"
+        )
+        for image_id, error in failures:
+            print(
+                "BLENDGIMP: Exit recovery failure "
+                f"image ID {image_id}: {error}"
+            )
+        connection_manager.disconnect()
+        gimp_manager.clear_process_reference()
+        return
+
+    if int(save_result.get("recovery", 0)) > 0:
+        print(
+            "BLENDGIMP: Blender exit recovery saved "
+            f"{save_result.get('recovery', 0)} new XCF document(s) to "
+            f"{_recovery_save_directory()}"
+        )
+
+    graceful_requested = False
+    if connection_manager.is_connected():
+        try:
+            connection_manager.shutdown_engine(force=False)
+            graceful_requested = True
+        except Exception as exc:
+            print(
+                "BLENDGIMP: Exit clean shutdown request failed; "
+                f"using process fallback: {exc}"
+            )
+
+    connection_manager.disconnect()
+    gimp_manager.stop_gimp(
+        graceful_requested=graceful_requested
+    )
+
+
 def register():
+
+    global _EXIT_PRE_HANDLED
+    _EXIT_PRE_HANDLED = False
 
     for cls in classes:
 
@@ -8311,6 +9578,9 @@ def register():
                 "BLENDGIMP: "
                 "Direct GIMP Brush 3D Paint operator registered"
             )
+
+    if blendgimp_exit_pre not in bpy.app.handlers.exit_pre:
+        bpy.app.handlers.exit_pre.append(blendgimp_exit_pre)
 
     bpy.types.Scene.blendgimp_engine_mode = (
         bpy.props.EnumProperty(
@@ -8901,56 +10171,132 @@ def unregister():
     except Exception:
         pass
 
-    engine_snapshot = (
-        gimp_manager.get_engine_snapshot()
-    )
+    global _EXIT_PRE_HANDLED
 
-    # A normal headless session belongs to BlendGimp and should not be left
-    # orphaned after the extension is disabled. A visible debug session may
-    # contain manual work, so preserve the original behavior and leave it open.
-    if (
-        engine_snapshot.get(
-            "running",
-            False
-        )
-        and engine_snapshot.get(
-            "mode"
-        ) == gimp_manager.ENGINE_MODE_HEADLESS
-    ):
-        graceful_requested = False
-        shutdown_refused = False
+    try:
+        if blendgimp_exit_pre in bpy.app.handlers.exit_pre:
+            bpy.app.handlers.exit_pre.remove(blendgimp_exit_pre)
+    except Exception:
+        pass
 
-        if connection_manager.is_connected():
-            try:
-                connection_manager.shutdown_engine(
-                    force=False
-                )
-                graceful_requested = True
-            except GimpEngineShutdownRefusedError as exc:
-                shutdown_refused = True
-                print(
-                    "BLENDGIMP: "
-                    "Headless engine kept alive to protect unsaved "
-                    f"image changes: {exc}"
-                )
-            except Exception as exc:
-                print(
-                    "BLENDGIMP: "
-                    "Extension shutdown request failed; "
-                    f"using process fallback: {exc}"
-                )
-
-        connection_manager.disconnect()
-
-        if shutdown_refused:
-            gimp_manager.clear_process_reference()
-        else:
-            gimp_manager.stop_gimp(
-                graceful_requested=graceful_requested
-            )
-    else:
+    if _EXIT_PRE_HANDLED:
+        # exit_pre already protected/saved documents and handled the engine.
         connection_manager.disconnect()
         gimp_manager.clear_process_reference()
+    else:
+        engine_snapshot = (
+            gimp_manager.get_engine_snapshot()
+        )
+
+        # A normal headless session belongs to BlendGimp and should not be left
+        # orphaned after the extension is disabled. A visible debug session may
+        # contain manual work, so preserve the original behavior and leave it open.
+        if (
+            engine_snapshot.get(
+                "running",
+                False
+            )
+            and engine_snapshot.get(
+                "mode"
+            ) == gimp_manager.ENGINE_MODE_HEADLESS
+        ):
+            # Blender may tear down an extension before exit_pre is delivered.
+            # Treat unregister itself as a second recovery boundary so dirty
+            # headless documents are never dependent on handler ordering.
+            print(
+                "BLENDGIMP: unregister lifecycle fallback entered for "
+                "headless engine",
+                flush=True,
+            )
+
+            scene = getattr(bpy.context, "scene", None)
+            if scene is None and bpy.data.scenes:
+                scene = bpy.data.scenes[0]
+
+            recovery_failed = False
+            if connection_manager.is_connected() and scene is not None:
+                try:
+                    save_result = _save_dirty_images_for_exit(scene)
+                except Exception as exc:
+                    save_result = {
+                        "saved": 0,
+                        "recovery": 0,
+                        "failed": [(-1, str(exc))],
+                    }
+
+                failures = list(save_result.get("failed", []))
+                if failures:
+                    recovery_failed = True
+                    print(
+                        "BLENDGIMP: unregister recovery could not save all "
+                        "dirty documents; leaving headless GIMP running",
+                        flush=True,
+                    )
+                    for image_id, error in failures:
+                        print(
+                            "BLENDGIMP: unregister recovery failure "
+                            f"image ID {image_id}: {error}",
+                            flush=True,
+                        )
+                else:
+                    recovery_count = int(save_result.get("recovery", 0))
+                    if recovery_count > 0:
+                        print(
+                            "BLENDGIMP: unregister recovery saved "
+                            f"{recovery_count} new XCF document(s) to "
+                            f"{_recovery_save_directory()}",
+                            flush=True,
+                        )
+                    elif int(save_result.get("saved", 0)) > 0:
+                        print(
+                            "BLENDGIMP: unregister recovery saved dirty "
+                            "XCF document(s) in place",
+                            flush=True,
+                        )
+            elif connection_manager.is_connected() and scene is None:
+                recovery_failed = True
+                print(
+                    "BLENDGIMP: unregister recovery could not resolve a "
+                    "Scene; leaving headless GIMP running to avoid data loss",
+                    flush=True,
+                )
+
+            graceful_requested = False
+            shutdown_refused = False
+
+            if recovery_failed:
+                shutdown_refused = True
+            elif connection_manager.is_connected():
+                try:
+                    connection_manager.shutdown_engine(
+                        force=False
+                    )
+                    graceful_requested = True
+                except GimpEngineShutdownRefusedError as exc:
+                    shutdown_refused = True
+                    print(
+                        "BLENDGIMP: "
+                        "Headless engine kept alive to protect unsaved "
+                        f"image changes: {exc}"
+                    )
+                except Exception as exc:
+                    print(
+                        "BLENDGIMP: "
+                        "Extension shutdown request failed; "
+                        f"using process fallback: {exc}"
+                    )
+
+            connection_manager.disconnect()
+
+            if shutdown_refused:
+                gimp_manager.clear_process_reference()
+            else:
+                gimp_manager.stop_gimp(
+                    graceful_requested=graceful_requested
+                )
+        else:
+            connection_manager.disconnect()
+            gimp_manager.clear_process_reference()
 
     try:
         if bpy.app.timers.is_registered(

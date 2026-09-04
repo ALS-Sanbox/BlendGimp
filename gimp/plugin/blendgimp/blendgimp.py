@@ -172,6 +172,26 @@ class GimpMainThreadDispatcher:
 # Read-only GIMP commands
 # -----------------------------------------------------------------------------
 
+def _blendgimp_gfile_path(gfile):
+    if gfile is None:
+        return ""
+
+    try:
+        path = gfile.get_path()
+    except Exception:
+        path = None
+
+    if path:
+        return os.path.abspath(str(path))
+
+    try:
+        uri = gfile.get_uri()
+    except Exception:
+        uri = None
+
+    return "" if not uri else str(uri)
+
+
 def gimp_get_images_snapshot():
     """
     MAIN THREAD ONLY.
@@ -184,6 +204,9 @@ def gimp_get_images_snapshot():
 
     for image in Gimp.get_images():
         name = _blendgimp_image_name(image)
+        xcf_path = _blendgimp_gfile_path(
+            image.get_xcf_file()
+        )
 
         images_snapshot.append(
             {
@@ -191,6 +214,9 @@ def gimp_get_images_snapshot():
                 "name": name,
                 "width": int(image.get_width()),
                 "height": int(image.get_height()),
+                "dirty": bool(image.is_dirty()),
+                "xcf_path": xcf_path,
+                "saved": bool(xcf_path) and not bool(image.is_dirty()),
             }
         )
 
@@ -1937,6 +1963,68 @@ def _blendgimp_filter_self_originated_state_change(
 # Direct Blender 3D stroke -> GIMP brush engine
 # -----------------------------------------------------------------------------
 
+def _gimp_foreground_rgba():
+    """MAIN THREAD ONLY. Return GIMP foreground as normalized RGBA."""
+
+    foreground = Gimp.context_get_foreground()
+
+    if foreground is None:
+        return None
+
+    try:
+        values = list(foreground.get_rgba())
+    except Exception:
+        return None
+
+    # PyGObject normally exposes Gegl.Color.get_rgba() as four out values.
+    # Accept a leading success boolean as well for binding-version tolerance.
+    if len(values) == 5 and isinstance(values[0], bool):
+        values = values[1:]
+
+    if len(values) != 4:
+        return None
+
+    return [
+        max(0.0, min(1.0, float(value)))
+        for value in values
+    ]
+
+
+def gimp_set_foreground_color(rgba):
+    """MAIN THREAD ONLY. Set the GIMP foreground from normalized RGBA."""
+
+    values = list(rgba)
+
+    if len(values) not in {3, 4}:
+        raise ValueError("rgba must contain 3 or 4 components")
+
+    values = [
+        max(0.0, min(1.0, float(value)))
+        for value in values
+    ]
+
+    if len(values) == 3:
+        values.append(1.0)
+
+    foreground = Gegl.Color.new(
+        "rgba("
+        f"{values[0]:.9f},"
+        f"{values[1]:.9f},"
+        f"{values[2]:.9f},"
+        f"{values[3]:.9f})"
+    )
+
+    if foreground is None:
+        raise RuntimeError("GIMP could not construct the foreground color")
+
+    if not Gimp.context_set_foreground(foreground):
+        raise RuntimeError("GIMP could not set the foreground color")
+
+    return {
+        "foreground_color": values,
+    }
+
+
 def gimp_get_brush_state():
     """
     MAIN THREAD ONLY.
@@ -1991,6 +2079,7 @@ def gimp_get_brush_state():
         ),
         "dynamics_name": dynamics_name,
         "emulate_dynamics": emulate_dynamics,
+        "foreground_color": _gimp_foreground_rgba(),
     }
 
 
@@ -4032,6 +4121,65 @@ def gimp_get_image_pixels_binary(
     }
 
 
+def gimp_rebase_image_dirty_baseline(
+    image_id
+):
+    """
+    MAIN THREAD ONLY.
+
+    Reset BlendGimp's visible-composite dirty baseline without returning the
+    pixel payload to Blender.  The zero-layer case uses a synthetic transparent
+    RGBA8 buffer, avoiding an unnecessary 4K GEGL render and 67 MB socket
+    transfer after the final layer is deleted.
+    """
+
+    image_id = int(image_id)
+
+    image = Gimp.Image.get_by_id(image_id)
+
+    if image is None or not image.is_valid():
+        raise ValueError(
+            f"Image ID {image_id} is not a valid open GIMP image"
+        )
+
+    width = int(image.get_width())
+    height = int(image.get_height())
+
+    try:
+        layers = list(image.get_layers() or [])
+    except Exception:
+        layers = []
+
+    if len(layers) == 0:
+        raw_pixels = bytes(width * height * 4)
+        source = "zero-layer-transparent"
+    else:
+        width, height, raw_pixels = _gimp_get_raw_composite_rgba(image)
+        source = "rendered-composite"
+
+    _blendgimp_store_pixel_snapshot(
+        image_id,
+        width,
+        height,
+        raw_pixels
+    )
+
+    _blendgimp_clear_pending_damage(image_id)
+
+    return {
+        "image_id": image_id,
+        "sync_token": _blendgimp_composite_token(image_id),
+        "width": width,
+        "height": height,
+        "channels": 4,
+        "layer_count": len(layers),
+        "rebased": True,
+        "changed": False,
+        "source": source,
+        "byte_length": 0,
+    }
+
+
 def gimp_get_image_pixels(
     image_id
 ):
@@ -4895,6 +5043,83 @@ def gimp_get_image_state(image_id):
 
 
 # -----------------------------------------------------------------------------
+# Native XCF save transport
+# -----------------------------------------------------------------------------
+
+def gimp_save_image(image_id, output_path=None):
+    """
+    MAIN THREAD ONLY.
+
+    Save one open GIMP image as native XCF so BlendGimp layers and all GIMP
+    editability are preserved. If ``output_path`` is empty, save back to the
+    image's existing XCF file.
+    """
+
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+
+    if image is None or not image.is_valid():
+        raise ValueError(
+            f"Image ID {image_id} is not a valid open GIMP image"
+        )
+
+    requested_path = str(output_path or "").strip()
+
+    if requested_path:
+        requested_path = os.path.abspath(
+            os.path.expanduser(requested_path)
+        )
+        if not requested_path.lower().endswith(".xcf"):
+            requested_path += ".xcf"
+
+        parent_dir = os.path.dirname(requested_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
+        output_file = Gio.File.new_for_path(requested_path)
+    else:
+        output_file = image.get_xcf_file()
+        if output_file is None:
+            raise ValueError(
+                "Image has no XCF save path; use Save As first"
+            )
+
+    success = Gimp.file_save(
+        Gimp.RunMode.NONINTERACTIVE,
+        image,
+        output_file,
+        None,
+    )
+
+    if not success:
+        raise RuntimeError(
+            f"GIMP could not save image ID {image_id} as XCF"
+        )
+
+    # GIMP normally associates the XCF path after file_save(). Keep an
+    # explicit fallback so future Save operations have a stable destination.
+    if image.get_xcf_file() is None:
+        try:
+            image.set_file(output_file)
+        except Exception:
+            pass
+
+    saved_path = _blendgimp_gfile_path(
+        image.get_xcf_file() or output_file
+    )
+
+    return {
+        "image_id": image_id,
+        "sync_token": _blendgimp_composite_token(image_id),
+        "image_name": str(_blendgimp_image_name(image) or ""),
+        "path": saved_path,
+        "dirty": bool(image.is_dirty()),
+        "width": int(image.get_width()),
+        "height": int(image.get_height()),
+    }
+
+
+# -----------------------------------------------------------------------------
 # Composite export transport
 # -----------------------------------------------------------------------------
 
@@ -5345,11 +5570,21 @@ class BlendGimpIPCServer:
                     "type": "ENGINE_SHUTDOWN_ACCEPTED",
                     "ok": True,
                     **shutdown_state,
+                    "force": force,
+                    "discarded_dirty_image_count": (
+                        dirty_image_count if force else 0
+                    ),
                     "_shutdown_after_response": True,
                     "_shutdown_force": force,
                 }
                 self._copy_request_id(message, response)
-                log("Graceful GIMP shutdown accepted")
+                if force:
+                    log(
+                        "Forced GIMP shutdown accepted; "
+                        f"discarding {dirty_image_count} dirty image(s)"
+                    )
+                else:
+                    log("Graceful GIMP shutdown accepted")
                 return response
 
             except Exception as exc:
@@ -5400,6 +5635,47 @@ class BlendGimpIPCServer:
                 return self._error_response(
                     message,
                     command="CREATE_IMAGE",
+                    error=str(exc),
+                )
+
+        if message_type == "SAVE_IMAGE":
+            log("SAVE_IMAGE received")
+
+            if "image_id" not in message:
+                return self._error_response(
+                    message,
+                    command="SAVE_IMAGE",
+                    error="SAVE_IMAGE requires image_id",
+                )
+
+            try:
+                image_id = int(message["image_id"])
+                result = self.dispatcher.call(
+                    gimp_save_image,
+                    image_id,
+                    message.get("path", ""),
+                    timeout=60.0,
+                )
+
+                response = {
+                    "type": "IMAGE_SAVED",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+
+                log(
+                    f"SAVE_IMAGE image ID {image_id} -> "
+                    f"{result.get('path', '')} "
+                    f"dirty={result.get('dirty', False)}"
+                )
+                return response
+
+            except Exception as exc:
+                log(f"SAVE_IMAGE failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="SAVE_IMAGE",
                     error=str(exc),
                 )
 
@@ -6133,6 +6409,50 @@ class BlendGimpIPCServer:
                 )
 
 
+        if message_type == "SET_FOREGROUND_COLOR":
+            log("SET_FOREGROUND_COLOR received")
+
+            try:
+                rgba = message.get(
+                    "rgba",
+                    [0.0, 0.0, 0.0, 1.0]
+                )
+
+                result = self.dispatcher.call(
+                    gimp_set_foreground_color,
+                    rgba,
+                    timeout=5.0,
+                )
+
+                response = {
+                    "type": "FOREGROUND_COLOR_SET",
+                    "ok": True,
+                    **result,
+                }
+
+                self._copy_request_id(
+                    message,
+                    response,
+                )
+
+                log(
+                    "SET_FOREGROUND_COLOR "
+                    f"rgba={result['foreground_color']}"
+                )
+
+                return response
+
+            except Exception as exc:
+                log(
+                    f"SET_FOREGROUND_COLOR failed: {exc}"
+                )
+
+                return self._error_response(
+                    message,
+                    command="SET_FOREGROUND_COLOR",
+                    error=str(exc),
+                )
+
         if message_type == "GET_BRUSH_STATE":
             log("GET_BRUSH_STATE received")
 
@@ -6509,6 +6829,48 @@ class BlendGimpIPCServer:
                 return self._error_response(
                     message,
                     command="SET_LAYER_PIXELS_BINARY",
+                    error=str(exc),
+                )
+
+
+        if message_type == "REBASE_IMAGE_DIRTY_BASELINE":
+            log("REBASE_IMAGE_DIRTY_BASELINE received")
+
+            try:
+                image_id = int(message["image_id"])
+
+                result = self.dispatcher.call(
+                    gimp_rebase_image_dirty_baseline,
+                    image_id,
+                    timeout=30.0,
+                )
+
+                response = {
+                    "type": "IMAGE_DIRTY_BASELINE_REBASED",
+                    "ok": True,
+                    **result,
+                }
+
+                self._copy_request_id(message, response)
+
+                log(
+                    "REBASE_IMAGE_DIRTY_BASELINE "
+                    f"image ID {image_id} -> "
+                    f"{result['width']}x{result['height']} "
+                    f"layers={result['layer_count']} "
+                    f"source={result['source']}"
+                )
+
+                return response
+
+            except Exception as exc:
+                log(
+                    f"REBASE_IMAGE_DIRTY_BASELINE failed: {exc}"
+                )
+
+                return self._error_response(
+                    message,
+                    command="REBASE_IMAGE_DIRTY_BASELINE",
                     error=str(exc),
                 )
 
