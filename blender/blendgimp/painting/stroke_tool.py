@@ -4046,7 +4046,14 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             connection_manager.begin_paint_stroke(
                 self.image_id,
                 self._layer_id,
-                self._stroke_id
+                self._stroke_id,
+                tool=str(
+                    getattr(
+                        context.scene,
+                        "blendgimp_paint_tool",
+                        "PAINTBRUSH"
+                    )
+                )
             )
         )
 
@@ -4320,8 +4327,17 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                     f"changed={bool(baseline.get('changed', False))}"
                 )
 
-            blender_color = _blender_texture_paint_color(
-                context
+            # Phase 6 shared brush state is authoritative when available.
+            # Fall back to Blender Texture Paint color for older files/builds.
+            shared_color = getattr(
+                scene,
+                "blendgimp_foreground_color",
+                None
+            )
+            blender_color = (
+                list(shared_color)
+                if shared_color is not None
+                else _blender_texture_paint_color(context)
             )
 
             if blender_color is not None:

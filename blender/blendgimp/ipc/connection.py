@@ -1795,6 +1795,67 @@ class BlendGimpConnection:
 
         return response
 
+    def set_background_color(
+        self,
+        rgba
+    ):
+        values = list(rgba)
+        if len(values) not in {3, 4}:
+            raise ValueError("rgba must contain 3 or 4 normalized components")
+        normalized = [max(0.0, min(1.0, float(value))) for value in values]
+        if len(normalized) == 3:
+            normalized.append(1.0)
+
+        response = self.request(
+            {
+                "type": "SET_BACKGROUND_COLOR",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "rgba": normalized,
+                "request_id": self._next_request_id("set-background-color"),
+            },
+            timeout=5.0,
+        )
+        self._validate_write_response(response, expected_type="BACKGROUND_COLOR_SET")
+        return response
+
+    def set_brush_state(self, **state):
+        payload = {
+            key: value
+            for key, value in state.items()
+            if value is not None
+        }
+        response = self.request(
+            {
+                "type": "SET_BRUSH_STATE",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "state": payload,
+                "request_id": self._next_request_id("set-brush-state"),
+            },
+            timeout=5.0,
+        )
+        self._validate_write_response(response, expected_type="BRUSH_STATE_SET")
+        return response
+
+    def get_brushes(self):
+        response = self.request(
+            {
+                "type": "GET_BRUSHES",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": self._next_request_id("get-brushes"),
+            },
+            timeout=5.0,
+        )
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+        if response.get("type") != "BRUSHES":
+            raise RuntimeError(f"Unexpected GET_BRUSHES response: {response.get('type')}")
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "GET_BRUSHES failed"))
+        return response
+
     def get_brush_state(
         self
     ):
@@ -1845,7 +1906,8 @@ class BlendGimpConnection:
         self,
         image_id,
         layer_id,
-        stroke_id
+        stroke_id,
+        tool="PAINTBRUSH"
     ):
         response = self.request(
             {
@@ -1861,6 +1923,7 @@ class BlendGimpConnection:
                 "stroke_id": str(
                     stroke_id
                 ),
+                "tool": str(tool or "PAINTBRUSH").upper(),
                 "request_id": self._next_request_id(
                     "begin-paint-stroke"
                 ),
@@ -2072,7 +2135,8 @@ class BlendGimpConnection:
         self,
         image_id,
         layer_id,
-        strokes
+        strokes,
+        tool="PAINTBRUSH"
     ):
         coordinates = [
             float(
@@ -2111,6 +2175,7 @@ class BlendGimpConnection:
                     layer_id
                 ),
                 "strokes": coordinates,
+                "tool": str(tool or "PAINTBRUSH").upper(),
                 "request_id": self._next_request_id(
                     "paint-stroke"
                 ),
