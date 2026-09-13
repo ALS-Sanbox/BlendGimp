@@ -1,7 +1,7 @@
 # ============================================================
 # BlendGimp
 # Blender Extension Entry Point
-# Version: 0.2.0 development
+# Version: 0.4.0 development
 # ============================================================
 
 from .ui import main_panel
@@ -17,7 +17,7 @@ def register():
     # Phase 6.1 is a Blender-side artist UI layer over that existing state.
     texture_editor.register()
 
-    # Phase 6.2 real GIMP-backed 2D tools + shared 2D/3D brush state.
+    # Phase 6.4.2 applies transported tablet pressure in GIMP while preserving the frozen 6.3.7 routing architecture.
     paint_tools.register()
 
     print("BLENDGIMP: Extension registered successfully")

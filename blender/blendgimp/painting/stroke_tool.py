@@ -56,6 +56,50 @@ FOOTPRINT_MAX_SCREEN_RADIUS = 96.0
 FOOTPRINT_UV_DISTANCE_FACTOR = 2.5
 FOOTPRINT_MAX_UV_FACE_HOPS = 12
 
+# Object Paint performance: local UV scale changes slowly while the pointer
+# remains on the same face. Reuse the derivative-derived screen radius for a
+# short distance/time window instead of spending four extra BVH rays at every
+# interpolated sample. Boundary protection still performs its ring probes.
+FOOTPRINT_RADIUS_CACHE_SCREEN_DISTANCE = 14.0
+FOOTPRINT_RADIUS_CACHE_MAX_AGE = 0.18
+
+# A fully-safe 8/8 footprint is allowed to carry forward to one nearby sample
+# on the same face/depth. Any partial-safe, rejected, face-change, or larger
+# movement immediately falls back to the complete ring test.
+FOOTPRINT_FULL_SAFE_REUSE_MAX_DISTANCE = 12.0
+
+
+def _tablet_input_from_event(event):
+    """Capture one Blender tablet sample without altering mouse behavior."""
+    try:
+        pressure = max(0.0, min(1.0, float(getattr(event, "pressure", 1.0))))
+    except Exception:
+        pressure = 1.0
+    try:
+        tilt = getattr(event, "tilt", (0.0, 0.0))
+        tilt_x = float(tilt[0])
+        tilt_y = float(tilt[1])
+    except Exception:
+        tilt_x = 0.0
+        tilt_y = 0.0
+    try:
+        is_tablet = bool(getattr(event, "is_tablet", False))
+    except Exception:
+        is_tablet = False
+    return [pressure, tilt_x, tilt_y, 1 if is_tablet else 0]
+
+
+def _interpolate_tablet_input(previous, current, t):
+    previous = list(previous or [1.0, 0.0, 0.0, 0])
+    current = list(current or [1.0, 0.0, 0.0, 0])
+    t = max(0.0, min(1.0, float(t)))
+    return [
+        float(previous[0]) + (float(current[0]) - float(previous[0])) * t,
+        float(previous[1]) + (float(current[1]) - float(previous[1])) * t,
+        float(previous[2]) + (float(current[2]) - float(previous[2])) * t,
+        1 if bool(previous[3]) or bool(current[3]) else 0,
+    ]
+
 
 def _window_region_for_area(
     area
@@ -68,6 +112,46 @@ def _window_region_for_area(
             return region
 
     return None
+
+
+def _event_region_type(area, event):
+    """Return the Blender region under the absolute mouse position.
+
+    Overlay regions such as the N-panel can geometrically overlap the VIEW_3D
+    WINDOW region.  Give every non-WINDOW region priority so the persistent
+    Object Paint modal never mistakes a sidebar/header click for a paint click.
+    """
+    if area is None or event is None:
+        return ""
+
+    try:
+        mouse_x = int(event.mouse_x)
+        mouse_y = int(event.mouse_y)
+    except Exception:
+        return ""
+
+    containing = []
+    try:
+        for region in area.regions:
+            if (
+                int(region.x) <= mouse_x < int(region.x + region.width)
+                and int(region.y) <= mouse_y < int(region.y + region.height)
+            ):
+                containing.append(region)
+    except Exception:
+        return ""
+
+    # UI/HEADER/TOOL_HEADER/etc. must win over WINDOW when Blender draws an
+    # overlay region on top of the viewport.
+    for region in containing:
+        if str(getattr(region, "type", "")) != "WINDOW":
+            return str(getattr(region, "type", ""))
+
+    for region in containing:
+        if str(getattr(region, "type", "")) == "WINDOW":
+            return "WINDOW"
+
+    return ""
 
 
 def _mesh_uv_layer(
@@ -415,7 +499,23 @@ def _polygon_uv_by_vertex(
 ):
     result = {}
 
+    try:
+        mesh_loop_count = len(mesh.loops)
+        uv_loop_count = len(uv_layer)
+    except Exception:
+        return result
+
     for loop_index in polygon.loop_indices:
+        loop_index = int(loop_index)
+        if (
+            loop_index < 0
+            or loop_index >= mesh_loop_count
+            or loop_index >= uv_loop_count
+        ):
+            # Evaluated meshes can briefly expose polygons before their UV
+            # loop data is repopulated during a Blender mode/depsgraph change.
+            # Treat that transient state as non-continuous instead of raising.
+            return {}
 
         vertex_index = int(
             mesh.loops[
@@ -1661,11 +1761,15 @@ def _normalize_paint_color(color):
         return None
 
     try:
+        try:
+            alpha = float(color[3])
+        except Exception:
+            alpha = 1.0
         values = [
             float(color[0]),
             float(color[1]),
             float(color[2]),
-            1.0,
+            alpha,
         ]
     except Exception:
         return None
@@ -1887,9 +1991,16 @@ def _apply_gimp_foreground_to_blender(context, rgba):
         if unified is not None and hasattr(unified, "color"):
             unified.color = rgb
 
+        scene = getattr(context, "scene", None)
+        try:
+            local_alpha = float(scene.blendgimp_foreground_color[3])
+        except Exception:
+            cached = _cached_texture_paint_color(scene)
+            local_alpha = float(cached[3]) if cached is not None else 1.0
+
         _cache_texture_paint_color(
-            getattr(context, "scene", None),
-            [rgb[0], rgb[1], rgb[2], 1.0]
+            scene,
+            [rgb[0], rgb[1], rgb[2], max(0.0, min(1.0, local_alpha))]
         )
     except Exception:
         pass
@@ -1974,6 +2085,28 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         if context.area is not None:
             context.area.tag_redraw()
 
+    def _acquire_refresh_owner(self):
+        if not getattr(self, "_owns_refresh", False):
+            set_direct_paint_refresh_owner(
+                True,
+                self.image_id,
+                owner=self._refresh_owner_token,
+            )
+            self._owns_refresh = True
+            print(
+                "BLENDGIMP: Object Paint acquired Auto Sync refresh ownership "
+                f"for image ID {self.image_id}"
+            )
+
+    def _release_refresh_owner(self):
+        if getattr(self, "_owns_refresh", False):
+            set_direct_paint_refresh_owner(
+                False,
+                owner=self._refresh_owner_token,
+            )
+            self._owns_refresh = False
+            print("BLENDGIMP: Normal GIMP Auto Sync resumed after Object Paint operation")
+
     def _finish(
         self,
         context,
@@ -2002,24 +2135,9 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             message
         )
 
-        # Release shared ownership directly first. The internal operator below
-        # handles user-visible Auto Sync resume logging but is not required for
-        # correctness.
-        set_direct_paint_refresh_owner(
-            False
-        )
-
-        try:
-            bpy.ops.blendgimp.direct_paint_resume_auto_sync(
-                image_id=int(
-                    self.image_id
-                )
-            )
-        except Exception as exc:
-            print(
-                "BLENDGIMP: "
-                f"Direct paint Auto Sync resume hook failed: {exc}"
-            )
+        # 6.3.7 modal owners stay armed while idle; release only this owner's
+        # operation lock. Do not clear another armed Texture Paint owner's lock.
+        self._release_refresh_owner()
 
         try:
             context.window.cursor_modal_restore()
@@ -2084,8 +2202,14 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         self._segments.append(
             []
         )
+        self._segment_inputs.append(
+            []
+        )
 
         self._segment_overlap.append(
+            None
+        )
+        self._segment_input_overlap.append(
             None
         )
 
@@ -2411,6 +2535,27 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
     ):
         """Estimate the GIMP brush radius in viewport pixels at the hit."""
 
+        current_mouse = self._event_window_position(event)
+        current_face = int(center_sample[2])
+        current_depth = int(center_sample[3])
+        now = time.monotonic()
+        radius_cache = getattr(self, "_footprint_radius_cache", None)
+        if radius_cache is not None:
+            cached_mouse = radius_cache.get("mouse")
+            if (
+                cached_mouse is not None
+                and int(radius_cache.get("face", -1)) == current_face
+                and int(radius_cache.get("depth", -1)) == current_depth
+                and abs(float(radius_cache.get("brush_size", -1.0)) - float(self._brush_size)) < 1.0e-6
+                and (now - float(radius_cache.get("time", 0.0))) <= FOOTPRINT_RADIUS_CACHE_MAX_AGE
+                and math.hypot(
+                    float(current_mouse[0]) - float(cached_mouse[0]),
+                    float(current_mouse[1]) - float(cached_mouse[1]),
+                ) <= FOOTPRINT_RADIUS_CACHE_SCREEN_DISTANCE
+            ):
+                self._footprint_radius_cache_hit_count += 1
+                return float(radius_cache["radius"])
+
         texture_scales = []
         maximum_probe_distance = max(
             4.0,
@@ -2545,13 +2690,23 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
         )
 
-        return max(
+        radius = max(
             FOOTPRINT_MIN_SCREEN_RADIUS,
             min(
                 FOOTPRINT_MAX_SCREEN_RADIUS,
                 raw_radius
             )
         )
+
+        self._footprint_radius_cache = {
+            "mouse": current_mouse,
+            "face": current_face,
+            "depth": current_depth,
+            "brush_size": float(self._brush_size),
+            "time": now,
+            "radius": float(radius),
+        }
+        return radius
 
     def _filter_footprint_assignments(
         self,
@@ -2583,6 +2738,38 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
         self._footprint_radius_total += screen_radius
         self._footprint_radius_sample_count += 1
+
+        current_mouse = self._event_window_position(event)
+        reuse_limit = min(
+            FOOTPRINT_FULL_SAFE_REUSE_MAX_DISTANCE,
+            max(4.0, float(screen_radius) * 0.25),
+        )
+        reuse_cache = getattr(self, "_footprint_full_safe_cache", {})
+        reusable_tracks = set()
+        all_reusable = True
+        for track_key, center_sample in assignments:
+            cached = reuse_cache.get(track_key)
+            cached_mouse = None if cached is None else cached.get("mouse")
+            reusable = bool(
+                cached is not None
+                and cached.get("full_safe", False)
+                and cached_mouse is not None
+                and int(cached.get("face", -1)) == int(center_sample[2])
+                and int(cached.get("depth", -1)) == int(center_sample[3])
+                and abs(float(cached.get("brush_size", -1.0)) - float(self._brush_size)) < 1.0e-6
+                and math.hypot(
+                    float(current_mouse[0]) - float(cached_mouse[0]),
+                    float(current_mouse[1]) - float(cached_mouse[1]),
+                ) <= reuse_limit
+            )
+            if reusable:
+                reusable_tracks.add(track_key)
+            else:
+                all_reusable = False
+
+        if all_reusable and len(reusable_tracks) == len(assignments):
+            self._footprint_full_safe_reuse_count += len(reusable_tracks)
+            return reusable_tracks
 
         ring_sample_sets = []
 
@@ -2730,8 +2917,25 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 if footprint_blocked:
                     self._footprint_hysteresis_resumed_count += 1
 
+                self._footprint_full_safe_cache[track_key] = {
+                    "mouse": current_mouse,
+                    "face": int(center_sample[2]),
+                    "depth": int(center_sample[3]),
+                    "brush_size": float(self._brush_size),
+                    "full_safe": bool(
+                        missing_rays == 0
+                        and safe_rays == self._footprint_sample_count
+                    ),
+                }
                 continue
 
+            self._footprint_full_safe_cache[track_key] = {
+                "mouse": current_mouse,
+                "face": int(center_sample[2]),
+                "depth": int(center_sample[3]),
+                "brush_size": float(self._brush_size),
+                "full_safe": False,
+            }
             self._footprint_rejected_count += 1
 
             if (
@@ -2761,6 +2965,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         current_mouse = self._event_window_position(
             event
         )
+        input_sample = _tablet_input_from_event(event)
 
         now = time.monotonic()
 
@@ -2833,7 +3038,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                     depth_index
                 ),
                 current_mouse,
-                now
+                now,
+                input_sample=input_sample
             ):
                 added_count += 1
 
@@ -3258,7 +3464,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         face_index,
         raw_depth,
         current_mouse,
-        now
+        now,
+        input_sample=None
     ):
         state = self._surface_tracks.get(
             track_key
@@ -3436,12 +3643,20 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                         "segment_index"
                     ] = self._begin_segment()
 
-        self._segments[
-            state[
-                "segment_index"
-            ]
-        ].append(
-            point
+        segment_index = int(state["segment_index"])
+        self._segments[segment_index].append(point)
+        normalized_input = list(input_sample or [1.0, 0.0, 0.0, 0])
+        self._segment_inputs[segment_index].append(normalized_input)
+        pressure = max(0.0, min(1.0, float(normalized_input[0])))
+        self._input_sample_count += 1
+        if bool(normalized_input[3]):
+            self._tablet_sample_count += 1
+        self._pressure_sum += pressure
+        self._pressure_min = min(self._pressure_min, pressure)
+        self._pressure_max = max(self._pressure_max, pressure)
+        self._tilt_max = max(
+            self._tilt_max,
+            math.hypot(float(normalized_input[1]), float(normalized_input[2])),
         )
 
         state[
@@ -3550,12 +3765,14 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         current_mouse = self._event_window_position(
             event
         )
+        current_input = _tablet_input_from_event(event)
 
         if self._last_mouse_position is None:
 
             self._last_mouse_position = (
                 current_mouse
             )
+            self._last_input_state = list(current_input)
 
             return (
                 1
@@ -3569,6 +3786,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         previous_mouse = (
             self._last_mouse_position
         )
+        previous_input = list(getattr(self, "_last_input_state", None) or current_input)
 
         endpoint_sample = _raycast_uv_point(
             context,
@@ -3593,6 +3811,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             self._last_mouse_position = (
                 current_mouse
             )
+            self._last_input_state = list(current_input)
 
             return (
                 1
@@ -3704,6 +3923,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 )
             )
 
+            tablet_input = _interpolate_tablet_input(previous_input, current_input, t)
             sample_event = SimpleNamespace(
                 mouse_x=(
                     previous_mouse[
@@ -3733,6 +3953,9 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                     )
                     * t
                 ),
+                pressure=float(tablet_input[0]),
+                tilt=(float(tablet_input[1]), float(tablet_input[2])),
+                is_tablet=bool(tablet_input[3]),
             )
 
             if self._sample(
@@ -3744,6 +3967,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         self._last_mouse_position = (
             current_mouse
         )
+        self._last_input_state = list(current_input)
 
         inserted = max(
             0,
@@ -3797,6 +4021,14 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
         return coordinates
 
+    def _chunk_input_samples(self, segment_index, samples):
+        payload = []
+        overlap = self._segment_input_overlap[segment_index]
+        if overlap is not None:
+            payload.append(list(overlap))
+        payload.extend(list(sample) for sample in samples)
+        return payload
+
     def _flush_live_chunks(
         self,
         context,
@@ -3837,6 +4069,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         }
 
         segment_payloads = []
+        input_segment_payloads = []
         transmitted_segments = []
 
         for segment_index, segment in enumerate(
@@ -3863,10 +4096,15 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             points = list(
                 segment
             )
+            inputs = list(self._segment_inputs[segment_index])
 
             coordinates = self._chunk_coordinates(
                 segment_index,
                 points
+            )
+            input_samples = self._chunk_input_samples(
+                segment_index,
+                inputs
             )
 
             if not coordinates:
@@ -3875,26 +4113,33 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             segment_payloads.append(
                 coordinates
             )
+            input_segment_payloads.append(
+                input_samples
+            )
 
             transmitted_segments.append(
                 (
                     segment_index,
                     segment,
                     points,
+                    inputs,
                 )
             )
 
         if not segment_payloads:
             return 0
 
+        chunk_started = time.perf_counter()
         response = (
             connection_manager.paint_stroke_segments_chunk(
                 self.image_id,
                 self._layer_id,
                 self._stroke_id,
-                segment_payloads
+                segment_payloads,
+                input_segments=input_segment_payloads
             )
         )
+        chunk_ipc_ms = (time.perf_counter() - chunk_started) * 1000.0
 
         transmitted = int(
             response.get(
@@ -3943,16 +4188,16 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
         )
 
-        for segment_index, segment, points in transmitted_segments:
-            # Keep exactly one point of overlap so successive GIMP paintbrush
-            # calls join visually instead of leaving a chunk-boundary gap.
-            self._segment_overlap[
-                segment_index
-            ] = points[
-                -1
-            ]
+        for segment_index, segment, points, inputs in transmitted_segments:
+            # Keep exactly one point/input sample of overlap so successive GIMP
+            # chunks join visually and retain tablet continuity.
+            self._segment_overlap[segment_index] = points[-1]
+            self._segment_input_overlap[segment_index] = (
+                list(inputs[-1]) if inputs else [1.0, 0.0, 0.0, 0]
+            )
 
             segment.clear()
+            self._segment_inputs[segment_index].clear()
 
         if transmitted:
 
@@ -3978,7 +4223,13 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 f"total={self._streamed_points}; "
                 f"chunks={self._streamed_chunks}; "
                 f"segments={transmitted_segment_count} "
-                f"(total={self._streamed_segments})"
+                f"(total={self._streamed_segments}); "
+                f"tablet_samples={int(response.get('tablet_sample_count', 0))}; "
+                f"pressure={float(response.get('pressure_min', 1.0)):.3f}-"
+                f"{float(response.get('pressure_max', 1.0)):.3f}; "
+                f"apply={str(response.get('pressure_application', 'metadata-only'))}; "
+                f"pressure_calls={int(response.get('pressure_subsegments', 0))}; "
+                f"ipc_ms={chunk_ipc_ms:.1f}"
             )
 
             self._refresh_live_viewport(
@@ -4033,6 +4284,255 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
         return False
 
+    def _fill_at_event(
+        self,
+        context,
+        event
+    ):
+        """Project one viewport click to UV space and run one GIMP bucket fill."""
+
+        sample = _raycast_uv_point(
+            context,
+            self._window_region,
+            event,
+            self.image_width,
+            self.image_height,
+            self._front_faces_only,
+            self._normal_angle_enabled,
+            self._normal_angle_limit,
+            rejection_stats=self._geometry_rejections,
+            raycast_object=self._raycast_object,
+            raycast_mesh=self._raycast_mesh,
+            raycast_bvh=self._raycast_bvh,
+            uv_layer_name=self._raycast_uv_layer_name,
+        )
+
+        if sample is None:
+            self._set_status(context, "Fill click missed the active paint surface")
+            return False
+
+        x, y, face_index = sample
+        fill_type = str(
+            getattr(
+                context.scene,
+                "blendgimp_fill_source",
+                "FOREGROUND"
+            )
+        ).upper()
+
+        self._acquire_refresh_owner()
+        started = time.perf_counter()
+        response = connection_manager.bucket_fill(
+            self.image_id,
+            self._layer_id,
+            float(x),
+            float(y),
+            fill_type=fill_type,
+        )
+        ipc_ms = (time.perf_counter() - started) * 1000.0
+
+        refresh_started = time.perf_counter()
+        refresh_result = bpy.ops.blendgimp.direct_live_refresh(
+            image_id=int(self.image_id)
+        )
+        refresh_ms = (time.perf_counter() - refresh_started) * 1000.0
+
+        if context.area is not None:
+            context.area.tag_redraw()
+
+        self._set_status(
+            context,
+            f"GIMP Fill complete — {fill_type.title()} at UV-projected pixel "
+            f"({float(x):.0f}, {float(y):.0f})"
+        )
+
+        print(
+            "BLENDGIMP: Direct GIMP projected fill completed "
+            f"image ID {self.image_id} layer ID {self._layer_id} "
+            f"face={int(face_index)} x={float(x):.1f} y={float(y):.1f} "
+            f"fill={str(response.get('fill_type', fill_type))} "
+            f"projection_mesh={self._projection_mesh_kind} "
+            f"projection_fallbacks={self._projection_fallback_count} "
+            f"topology_changed={str(self._evaluated_topology_changed).lower()} "
+            f"ipc_ms={ipc_ms:.1f} refresh_ms={refresh_ms:.1f} "
+            f"refresh_finished={'FINISHED' in refresh_result}"
+        )
+        self._release_refresh_owner()
+        return True
+
+    def _gradient_sample_at_event(
+        self,
+        context,
+        event
+    ):
+        """Project one viewport event to image-space UV coordinates for Gradient."""
+
+        return _raycast_uv_point(
+            context,
+            self._window_region,
+            event,
+            self.image_width,
+            self.image_height,
+            self._front_faces_only,
+            self._normal_angle_enabled,
+            self._normal_angle_limit,
+            rejection_stats=self._geometry_rejections,
+            raycast_object=self._raycast_object,
+            raycast_mesh=self._raycast_mesh,
+            raycast_bvh=self._raycast_bvh,
+            uv_layer_name=self._raycast_uv_layer_name,
+        )
+
+    def _gradient_apply_samples(
+        self,
+        context,
+        start_sample,
+        end_sample
+    ):
+        """Run one projected GIMP Gradient between two UV-projected points."""
+
+        if start_sample is None or end_sample is None:
+            return False
+
+        x1, y1, face1 = start_sample
+        x2, y2, face2 = end_sample
+        if math.hypot(float(x2) - float(x1), float(y2) - float(y1)) < 1.0:
+            self._set_status(context, "Gradient cancelled — drag farther before release")
+            return False
+
+        scene = context.scene
+        self._acquire_refresh_owner()
+        started = time.perf_counter()
+        response = connection_manager.gradient_fill(
+            self.image_id,
+            self._layer_id,
+            float(x1),
+            float(y1),
+            float(x2),
+            float(y2),
+            gradient_source=str(getattr(scene, "blendgimp_gradient_source", "FG_BG")),
+            gradient_name=str(getattr(scene, "blendgimp_gradient_name", "") or ""),
+            gradient_type=str(getattr(scene, "blendgimp_gradient_type", "LINEAR")),
+            reverse=bool(getattr(scene, "blendgimp_gradient_reverse", False)),
+            repeat_mode=str(getattr(scene, "blendgimp_gradient_repeat_mode", "NONE")),
+        )
+        ipc_ms = (time.perf_counter() - started) * 1000.0
+
+        refresh_started = time.perf_counter()
+        refresh_result = bpy.ops.blendgimp.direct_live_refresh(
+            image_id=int(self.image_id)
+        )
+        refresh_ms = (time.perf_counter() - refresh_started) * 1000.0
+
+        if context.area is not None:
+            context.area.tag_redraw()
+
+        self._set_status(
+            context,
+            f"GIMP Gradient complete — {response.get('gradient_type', 'LINEAR').title()} "
+            f"from face {int(face1)} to {int(face2)}"
+        )
+
+        print(
+            "BLENDGIMP: Direct GIMP projected gradient completed "
+            f"image ID {self.image_id} layer ID {self._layer_id} "
+            f"start_face={int(face1)} end_face={int(face2)} "
+            f"start=({float(x1):.1f},{float(y1):.1f}) "
+            f"end=({float(x2):.1f},{float(y2):.1f}) "
+            f"type={response.get('gradient_type', 'LINEAR')} "
+            f"source={response.get('gradient_source', 'FG_BG')} "
+            f"gradient={response.get('gradient_name', '')} "
+            f"reverse={bool(response.get('reverse', False))} "
+            f"repeat={response.get('repeat_mode', 'NONE')} "
+            f"projection_mesh={self._projection_mesh_kind} "
+            f"projection_fallbacks={self._projection_fallback_count} "
+            f"topology_changed={str(self._evaluated_topology_changed).lower()} "
+            f"ipc_ms={ipc_ms:.1f} refresh_ms={refresh_ms:.1f} "
+            f"refresh_finished={'FINISHED' in refresh_result}"
+        )
+        self._release_refresh_owner()
+        return True
+
+    def _clone_source_at_event(self, context, event):
+        """Store a persistent Clone source from one projected viewport click."""
+        sample = self._gradient_sample_at_event(context, event)
+        if sample is None:
+            self._set_status(context, "Clone source missed the active paint surface")
+            return False
+        x, y, face_index = sample
+        scene = context.scene
+        scene.blendgimp_clone_source_set = True
+        scene.blendgimp_clone_source_image_id = int(self.image_id)
+        scene.blendgimp_clone_source_layer_id = int(self._layer_id)
+        scene.blendgimp_clone_source_x = float(x)
+        scene.blendgimp_clone_source_y = float(y)
+        self._set_status(
+            context,
+            f"Clone source set on face {int(face_index)} at ({float(x):.0f}, {float(y):.0f}) — LMB clone",
+        )
+        print(
+            "BLENDGIMP: Direct GIMP projected Clone source set "
+            f"image ID {self.image_id} layer ID {self._layer_id} "
+            f"face={int(face_index)} x={float(x):.1f} y={float(y):.1f} "
+            f"projection_mesh={self._projection_mesh_kind}"
+        )
+        return True
+
+    def _clone_source_payload(self, context):
+        scene = context.scene
+        if not bool(getattr(scene, "blendgimp_clone_source_set", False)):
+            return None
+        source_image_id = int(getattr(scene, "blendgimp_clone_source_image_id", -1))
+        source_layer_id = int(getattr(scene, "blendgimp_clone_source_layer_id", -1))
+        if source_image_id < 0 or source_layer_id < 0:
+            return None
+        return {
+            "source_image_id": source_image_id,
+            "source_layer_id": source_layer_id,
+            "source_x": float(getattr(scene, "blendgimp_clone_source_x", 0.0)),
+            "source_y": float(getattr(scene, "blendgimp_clone_source_y", 0.0)),
+        }
+
+    def _heal_source_at_event(self, context, event):
+        """Store a persistent Heal source from one projected viewport click."""
+        sample = self._gradient_sample_at_event(context, event)
+        if sample is None:
+            self._set_status(context, "Heal source missed the active paint surface")
+            return False
+        x, y, face_index = sample
+        scene = context.scene
+        scene.blendgimp_heal_source_set = True
+        scene.blendgimp_heal_source_image_id = int(self.image_id)
+        scene.blendgimp_heal_source_layer_id = int(self._layer_id)
+        scene.blendgimp_heal_source_x = float(x)
+        scene.blendgimp_heal_source_y = float(y)
+        self._set_status(
+            context,
+            f"Heal source set on face {int(face_index)} at ({float(x):.0f}, {float(y):.0f}) — LMB heal",
+        )
+        print(
+            "BLENDGIMP: Direct GIMP projected Heal source set "
+            f"image ID {self.image_id} layer ID {self._layer_id} "
+            f"face={int(face_index)} x={float(x):.1f} y={float(y):.1f} "
+            f"projection_mesh={self._projection_mesh_kind}"
+        )
+        return True
+
+    def _heal_source_payload(self, context):
+        scene = context.scene
+        if not bool(getattr(scene, "blendgimp_heal_source_set", False)):
+            return None
+        source_image_id = int(getattr(scene, "blendgimp_heal_source_image_id", -1))
+        source_layer_id = int(getattr(scene, "blendgimp_heal_source_layer_id", -1))
+        if source_image_id < 0 or source_layer_id < 0:
+            return None
+        return {
+            "source_image_id": source_image_id,
+            "source_layer_id": source_layer_id,
+            "source_x": float(getattr(scene, "blendgimp_heal_source_x", 0.0)),
+            "source_y": float(getattr(scene, "blendgimp_heal_source_y", 0.0)),
+        }
+
     def _begin_live_stroke(
         self,
         context
@@ -4042,19 +4542,34 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
         self._stroke_id = uuid.uuid4().hex
 
-        response = (
-            connection_manager.begin_paint_stroke(
-                self.image_id,
-                self._layer_id,
-                self._stroke_id,
-                tool=str(
-                    getattr(
-                        context.scene,
-                        "blendgimp_paint_tool",
-                        "PAINTBRUSH"
-                    )
-                )
+        tool = str(
+            getattr(
+                context.scene,
+                "blendgimp_paint_tool",
+                "PAINTBRUSH"
             )
+        ).upper()
+        source_payload = None
+        if tool == "CLONE":
+            source_payload = self._clone_source_payload(context)
+            if source_payload is None:
+                self._stroke_id = None
+                raise RuntimeError("Clone needs a source — Ctrl+LMB on the model to set one")
+        elif tool == "HEAL":
+            source_payload = self._heal_source_payload(context)
+            if source_payload is None:
+                self._stroke_id = None
+                raise RuntimeError("Heal needs a source — Ctrl+LMB on the model to set one")
+
+        self._acquire_refresh_owner()
+        begin_kwargs = dict(tool=tool)
+        if source_payload is not None:
+            begin_kwargs.update(source_payload)
+        response = connection_manager.begin_paint_stroke(
+            self.image_id,
+            self._layer_id,
+            self._stroke_id,
+            **begin_kwargs,
         )
 
         self._brush_name = str(
@@ -4130,6 +4645,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
         except Exception:
             pass
+        self._release_refresh_owner()
 
     def invoke(
         self,
@@ -4137,6 +4653,13 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         event
     ):
         scene = context.scene
+        self._active_tool = str(
+            getattr(
+                scene,
+                "blendgimp_paint_tool",
+                "PAINTBRUSH"
+            )
+        ).upper()
 
         if (
             context.area is None
@@ -4203,6 +4726,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
             return {"CANCELLED"}
 
+        self._blendgimp_area = context.area
         self._window_region = (
             _window_region_for_area(
                 context.area
@@ -4269,6 +4793,23 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                     "projection mesh has no ray-castable polygons"
                 )
 
+            projection_uv = _mesh_uv_layer(
+                self._raycast_mesh,
+                self._raycast_uv_layer_name
+            )
+            if projection_uv is None:
+                raise RuntimeError("projection mesh has no usable UV layer")
+            try:
+                projection_uv_count = len(projection_uv.data)
+                projection_loop_count = len(self._raycast_mesh.loops)
+            except Exception:
+                projection_uv_count = 0
+                projection_loop_count = 1
+            if projection_uv_count < projection_loop_count:
+                raise RuntimeError(
+                    "projection mesh UV data is temporarily unavailable; retrying after depsgraph update"
+                )
+
         except Exception as exc:
             self.report(
                 {"ERROR"},
@@ -4310,6 +4851,12 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
 
         try:
+            from ..ui import main_panel as _blendgimp_main_panel
+            _blendgimp_main_panel.flush_blender_paint_changes(
+                scene,
+                reason="before Object Paint GIMP tool",
+                fail_if_unsent=True,
+            )
             layer_response = connection_manager.resolve_active_raster_layer(
                 self.image_id,
                 BLENDGIMP_DIRECT_PAINT_LAYER_NAME,
@@ -4327,6 +4874,16 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                     f"changed={bool(baseline.get('changed', False))}"
                 )
 
+            resolved_layer_id = int(layer_response["layer_id"])
+            if (
+                int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) == int(self.image_id)
+                and int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)) != resolved_layer_id
+            ):
+                _blendgimp_main_panel.load_active_layer_buffer_from_gimp(
+                    scene, self.image_id, resolved_layer_id,
+                    clear_first=True, activate_target=False
+                )
+
             # Phase 6 shared brush state is authoritative when available.
             # Fall back to Blender Texture Paint color for older files/builds.
             shared_color = getattr(
@@ -4340,7 +4897,22 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 else _blender_texture_paint_color(context)
             )
 
-            if blender_color is not None:
+            if self._active_tool in {"FILL", "GRADIENT"}:
+                fill_state = {}
+                if blender_color is not None:
+                    fill_state["foreground_color"] = list(blender_color)
+                shared_background = getattr(
+                    scene,
+                    "blendgimp_background_color",
+                    None
+                )
+                if shared_background is not None:
+                    fill_state["background_color"] = list(shared_background)
+                if hasattr(scene, "blendgimp_brush_opacity"):
+                    fill_state["brush_opacity"] = float(scene.blendgimp_brush_opacity)
+                if fill_state:
+                    connection_manager.set_brush_state(**fill_state)
+            elif blender_color is not None:
                 connection_manager.set_foreground_color(
                     blender_color
                 )
@@ -4512,13 +5084,26 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         self._footprint_hysteresis_resumed_count = 0
         self._footprint_radius_total = 0.0
         self._footprint_radius_sample_count = 0
+        self._footprint_radius_cache = None
+        self._footprint_radius_cache_hit_count = 0
+        self._footprint_full_safe_cache = {}
+        self._footprint_full_safe_reuse_count = 0
 
         self._painting = False
         self._segments = []
+        self._segment_inputs = []
         self._segment_overlap = []
+        self._segment_input_overlap = []
         self._last_point = None
         self._last_face_index = None
         self._last_mouse_position = None
+        self._last_input_state = None
+        self._input_sample_count = 0
+        self._tablet_sample_count = 0
+        self._pressure_sum = 0.0
+        self._pressure_min = 1.0
+        self._pressure_max = 0.0
+        self._tilt_max = 0.0
         self._interpolated_sample_count = 0
         self._topology_split_count = 0
         self._last_topology_split_reason = ""
@@ -4532,21 +5117,36 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         self._streamed_chunks = 0
         self._streamed_segments = 0
         self._streamed_points = 0
+        self._gradient_start_sample = None
+
+        self._blendgimp_cancel_serial = int(scene.get("blendgimp_paint_cancel_serial", 0))
+        try:
+            from ..ui import texture_editor as _blendgimp_texture_editor
+            self._blendgimp_area_owned_at_start = bool(
+                _blendgimp_texture_editor._context_is_blendgimp_area(
+                    context, _blendgimp_texture_editor.MODE_OBJECT
+                )
+            )
+            self._blendgimp_area_release_serial = _blendgimp_texture_editor._area_release_serial(
+                context.screen, context.area
+            )
+            self._blendgimp_route_slot, self._blendgimp_route_generation, _route_mode = (
+                _blendgimp_texture_editor._routing_token(
+                    context.screen, context.area, _blendgimp_texture_editor.MODE_OBJECT
+                )
+            )
+        except Exception:
+            self._blendgimp_area_owned_at_start = False
+            self._blendgimp_area_release_serial = 0
+            self._blendgimp_route_slot = -1
+            self._blendgimp_route_generation = -1
 
         scene.blendgimp_direct_paint_active = (
             True
         )
 
-        set_direct_paint_refresh_owner(
-            True,
-            self.image_id
-        )
-
-        print(
-            "BLENDGIMP: "
-            f"Direct paint acquired Auto Sync refresh ownership "
-            f"for image ID {self.image_id}"
-        )
+        self._refresh_owner_token = f"3d:{id(self)}"
+        self._owns_refresh = False
 
         scene.blendgimp_direct_paint_image_id = (
             int(
@@ -4561,8 +5161,15 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         self._set_status(
             context,
             (
-                "Direct GIMP brush active — "
-                "LMB paint, Esc/RMB exit"
+                "Auto Object Fill — LMB fill"
+                if self._active_tool == "FILL"
+                else "Auto Object Gradient — LMB drag start/end"
+                if self._active_tool == "GRADIENT"
+                else "Auto Object Clone — Ctrl+LMB source, LMB clone"
+                if self._active_tool == "CLONE"
+                else "Auto Object Heal — Ctrl+LMB source, LMB heal"
+                if self._active_tool == "HEAL"
+                else "Auto Object Paint — LMB paint"
             )
         )
 
@@ -4570,17 +5177,19 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             self
         )
 
+        # 6.3.7: keep the normal Blender cursor over panels/UI. The modal
+        # owner changes cursor only while hovering the 3D paint region or while
+        # a stroke is locked to this owner.
         try:
-            context.window.cursor_modal_set(
-                "PAINT_BRUSH"
-            )
+            context.window.cursor_modal_set("DEFAULT")
         except Exception:
             pass
 
         print(
             "BLENDGIMP: "
-            f"Direct GIMP Brush 3D Paint started for image ID "
+            f"Direct GIMP 3D Paint started for image ID "
             f"{self.image_id}, layer ID {self._layer_id}, "
+            f"tool={self._active_tool}, "
             f"layer_source={layer_response.get('source', 'selected')}, "
             f"brush={self._brush_name}, size={self._brush_size:.1f}, "
             f"front_faces_only={self._front_faces_only}, "
@@ -4608,27 +5217,155 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         context,
         event
     ):
-        if event.type in {
-            "ESC",
-            "RIGHTMOUSE",
-        }:
+        scene = context.scene
+        try:
+            from ..ui import texture_editor as _blendgimp_texture_editor
+            route_current = _blendgimp_texture_editor._routing_token_current(
+                context.screen,
+                getattr(self, "_blendgimp_route_slot", -1),
+                getattr(self, "_blendgimp_route_generation", -1),
+                _blendgimp_texture_editor.MODE_OBJECT,
+            )
+            if not route_current:
+                if self._painting:
+                    self._painting = False
+                    self._abort_live_stroke()
+                self._finish(context, "Object Paint ended — routing generation retired")
+                print("BLENDGIMP: Phase 6.3.7 stale Object Paint owner retired before event")
+                return {"FINISHED"}
+            live_area = _blendgimp_texture_editor._area_from_slot(
+                context.screen, getattr(self, "_blendgimp_route_slot", -1)
+            )
+            if live_area is not None:
+                self._blendgimp_area = live_area
+        except Exception:
+            pass
 
+        current_cancel_serial = int(scene.get("blendgimp_paint_cancel_serial", 0))
+        stored_area = getattr(self, "_blendgimp_area", None)
+        area_owned = False
+        current_area_release_serial = 0
+        try:
+            from ..ui import texture_editor as _blendgimp_texture_editor
+            area_owned = bool(
+                stored_area is not None
+                and _blendgimp_texture_editor._is_blendgimp_area(context.screen, stored_area)
+                and _blendgimp_texture_editor._area_mode(context.screen, stored_area)
+                == _blendgimp_texture_editor.MODE_OBJECT
+            )
+            current_area_release_serial = _blendgimp_texture_editor._area_release_serial(
+                context.screen, stored_area
+            )
+        except Exception:
+            area_owned = False
+
+        area_released = (
+            bool(getattr(self, "_blendgimp_area_owned_at_start", False)) and not area_owned
+        ) or (
+            current_area_release_serial
+            != int(getattr(self, "_blendgimp_area_release_serial", -1))
+        )
+        if (
+            current_cancel_serial != int(getattr(self, "_blendgimp_cancel_serial", -1))
+            or area_released
+        ):
             if self._painting:
-
                 self._painting = False
                 self._abort_live_stroke()
+            self._finish(context, "Direct GIMP paint released")
+            print("BLENDGIMP: Direct GIMP 3D Paint ownership released")
+            return {"FINISHED"}
 
-            self._finish(
+        # 6.3.7 Fix1: Object Paint is a persistent hover owner. Tool changes
+        # must update this already-armed modal in place instead of retiring it
+        # and waiting for the timer to create a replacement. The old restart
+        # gap allowed Blender's native Texture Paint to receive viewport clicks
+        # between owners and made Object Paint feel like it switched modes.
+        requested_tool = str(getattr(scene, "blendgimp_paint_tool", self._active_tool)).upper()
+        if not self._painting and requested_tool != self._active_tool:
+            previous_tool = self._active_tool
+            self._active_tool = requested_tool
+            self._gradient_start_sample = None
+            action_hint = (
+                "LMB fill"
+                if requested_tool == "FILL"
+                else "LMB drag start/end"
+                if requested_tool == "GRADIENT"
+                else "Ctrl+LMB source, LMB clone"
+                if requested_tool == "CLONE"
+                else "Ctrl+LMB source, LMB heal"
+                if requested_tool == "HEAL"
+                else "LMB paint"
+            )
+            self._set_status(
                 context,
-                "Direct GIMP brush stopped"
+                f"Auto Object Paint — {requested_tool.title()} — {action_hint}",
             )
-
             print(
-                "BLENDGIMP: "
-                "Direct GIMP Brush 3D Paint stopped"
+                "BLENDGIMP: Phase 6.3.7 Object Paint live tool switch "
+                f"{previous_tool}->{requested_tool}; owner preserved"
             )
 
-            return {"CANCELLED"}
+        region = getattr(self, "_window_region", None)
+        event_region_type = _event_region_type(stored_area, event)
+        inside_window = event_region_type == "WINDOW"
+        interaction_active = bool(
+            self._painting
+            or getattr(self, "_gradient_start_sample", None) is not None
+        )
+
+        # 6.3.7 Fix2: when idle and the pointer is over any non-WINDOW
+        # Blender region (N-panel, toolbar, header, tool header, popover edge,
+        # etc.), become completely transparent to the event stream.  Do not
+        # validate projection state, update tool state, alter cursor ownership,
+        # or consume the matching release.  This is what lets every normal
+        # Blender button remain clickable while Object Paint stays armed.
+        if not interaction_active and not inside_window:
+            try:
+                context.window.cursor_modal_set("DEFAULT")
+            except Exception:
+                pass
+            return {"PASS_THROUGH"}
+
+        if event.type == "MOUSEMOVE":
+            try:
+                area = stored_area
+                over_area = bool(
+                    area is not None
+                    and area.x <= event.mouse_x < area.x + area.width
+                    and area.y <= event.mouse_y < area.y + area.height
+                )
+                if over_area or self._painting:
+                    cursor = (
+                        "CROSSHAIR"
+                        if self._active_tool in {"FILL", "GRADIENT"}
+                        else "PAINT_BRUSH"
+                    ) if (inside_window or self._painting) else "DEFAULT"
+                    context.window.cursor_modal_set(cursor)
+            except Exception:
+                pass
+
+        # ESC cancels/ends the current operation but does not exit automatic
+        # Object Paint. RMB is passed through when idle so Blender keeps its
+        # normal context/navigation behavior.
+        if event.type == "ESC" and event.value == "PRESS":
+            if getattr(self, "_gradient_start_sample", None) is not None:
+                self._gradient_start_sample = None
+            if self._painting:
+                self._painting = False
+                self._abort_live_stroke()
+            self._set_status(context, "Current operation ended — auto Object Paint ready")
+            return {"RUNNING_MODAL"}
+
+        if event.type == "RIGHTMOUSE" and event.value == "PRESS":
+            if self._painting or getattr(self, "_gradient_start_sample", None) is not None:
+                self._gradient_start_sample = None
+                if self._painting:
+                    self._painting = False
+                    self._abort_live_stroke()
+                self._set_status(context, "Current operation ended — auto Object Paint ready")
+                return {"RUNNING_MODAL"}
+            return {"PASS_THROUGH"}
 
         if not connection_manager.is_connected():
 
@@ -4670,18 +5407,113 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
             return {"CANCELLED"}
 
+        if self._active_tool == "FILL":
+            if event.type == "LEFTMOUSE" and event.value == "PRESS":
+                try:
+                    self._fill_at_event(context, event)
+                except Exception as exc:
+                    self._release_refresh_owner()
+                    self._set_status(context, f"Fill failed: {exc}")
+                    print(f"BLENDGIMP: Direct GIMP projected fill failed: {exc}")
+                    self.report({"ERROR"}, f"GIMP Fill failed: {exc}")
+                return {"RUNNING_MODAL"}
+
+            # Fill is command-style: mouse movement and release never enter
+            # the streamed brush path. Normal viewport navigation/UI events
+            # continue to pass through while the modal tool is active.
+            return {"PASS_THROUGH"}
+
+        if self._active_tool == "GRADIENT":
+            if event.type == "LEFTMOUSE" and event.value == "PRESS":
+                sample = self._gradient_sample_at_event(context, event)
+                if sample is None:
+                    self._set_status(context, "Gradient start missed the active paint surface")
+                else:
+                    self._gradient_start_sample = sample
+                    self._set_status(context, "Gradient start set — drag and release on the model")
+                return {"RUNNING_MODAL"}
+
+            if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+                start_sample = getattr(self, "_gradient_start_sample", None)
+                self._gradient_start_sample = None
+                if start_sample is None:
+                    return {"RUNNING_MODAL"}
+                end_sample = self._gradient_sample_at_event(context, event)
+                if end_sample is None:
+                    self._set_status(context, "Gradient cancelled — release missed the active paint surface")
+                    return {"RUNNING_MODAL"}
+                try:
+                    self._gradient_apply_samples(context, start_sample, end_sample)
+                except Exception as exc:
+                    self._release_refresh_owner()
+                    self._set_status(context, f"Gradient failed: {exc}")
+                    print(f"BLENDGIMP: Direct GIMP projected gradient failed: {exc}")
+                    self.report({"ERROR"}, f"GIMP Gradient failed: {exc}")
+                return {"RUNNING_MODAL"}
+
+            # Gradient is command-style: motion is local interaction only and
+            # never performs GIMP IPC. Viewport navigation/UI remains usable.
+            return {"PASS_THROUGH"}
+
+        if self._active_tool == "CLONE" and event.type == "LEFTMOUSE" and event.value == "PRESS" and bool(getattr(event, "ctrl", False)):
+            try:
+                self._clone_source_at_event(context, event)
+            except Exception as exc:
+                self._set_status(context, f"Clone source failed: {exc}")
+                print(f"BLENDGIMP: Direct GIMP projected Clone source failed: {exc}")
+                self.report({"ERROR"}, f"GIMP Clone source failed: {exc}")
+            return {"RUNNING_MODAL"}
+
+        if self._active_tool == "CLONE" and not bool(getattr(context.scene, "blendgimp_clone_source_set", False)):
+            if event.type == "LEFTMOUSE" and event.value == "PRESS":
+                self._set_status(context, "Clone needs a source — Ctrl+LMB on the model to set one")
+                return {"RUNNING_MODAL"}
+
+        if self._active_tool == "HEAL" and event.type == "LEFTMOUSE" and event.value == "PRESS" and bool(getattr(event, "ctrl", False)):
+            try:
+                self._heal_source_at_event(context, event)
+            except Exception as exc:
+                self._set_status(context, f"Heal source failed: {exc}")
+                print(f"BLENDGIMP: Direct GIMP projected Heal source failed: {exc}")
+                self.report({"ERROR"}, f"GIMP Heal source failed: {exc}")
+            return {"RUNNING_MODAL"}
+
+        if self._active_tool == "HEAL" and not bool(getattr(context.scene, "blendgimp_heal_source_set", False)):
+            if event.type == "LEFTMOUSE" and event.value == "PRESS":
+                self._set_status(context, "Heal needs a source — Ctrl+LMB on the model to set one")
+                return {"RUNNING_MODAL"}
+
         if event.type == "LEFTMOUSE":
 
             if event.value == "PRESS":
+
+                # Brush changes are live while the auto-routed owner remains
+                # armed. Refresh projection footprint/log state from the shared
+                # artist controls before each new stroke.
+                try:
+                    self._brush_name = str(getattr(scene, "blendgimp_brush_name", self._brush_name) or self._brush_name)
+                    self._brush_size = float(getattr(scene, "blendgimp_brush_size", self._brush_size))
+                    self._brush_spacing = float(getattr(scene, "blendgimp_brush_spacing_percent", self._brush_spacing * 100.0)) / 100.0
+                except Exception:
+                    pass
 
                 # Start collecting locally first. Do not open a GIMP undo
                 # group until the mouse actually hits the mesh.
                 self._painting = True
                 self._segments = []
+                self._segment_inputs = []
                 self._segment_overlap = []
+                self._segment_input_overlap = []
                 self._last_point = None
                 self._last_face_index = None
                 self._last_mouse_position = None
+                self._last_input_state = None
+                self._input_sample_count = 0
+                self._tablet_sample_count = 0
+                self._pressure_sum = 0.0
+                self._pressure_min = 1.0
+                self._pressure_max = 0.0
+                self._tilt_max = 0.0
                 self._interpolated_sample_count = 0
                 self._topology_split_count = 0
                 self._last_topology_split_reason = ""
@@ -4712,6 +5544,10 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 self._footprint_hysteresis_resumed_count = 0
                 self._footprint_radius_total = 0.0
                 self._footprint_radius_sample_count = 0
+                self._footprint_radius_cache = None
+                self._footprint_radius_cache_hit_count = 0
+                self._footprint_full_safe_cache = {}
+                self._footprint_full_safe_reuse_count = 0
                 self._stroke_id = None
                 self._last_chunk_time = 0.0
                 self._last_viewport_refresh_time = 0.0
@@ -4818,6 +5654,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                         context,
                         force=True
                     )
+                    self._release_refresh_owner()
 
                 except Exception as exc:
 
@@ -4902,6 +5739,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                         f"footprint_safe_ratio={self._footprint_safe_ratio:.3f}, "
                         f"footprint_checks={self._footprint_check_count}, "
                         f"footprint_rays={self._footprint_ray_count}, "
+                        f"footprint_radius_cache_hits={self._footprint_radius_cache_hit_count}, "
+                        f"footprint_full_safe_reuse={self._footprint_full_safe_reuse_count}, "
                         f"footprint_rejected={self._footprint_rejected_count}, "
                         f"footprint_adaptive_accepted={self._footprint_adaptive_accepted_count}, "
                         f"silhouette_rejected={self._footprint_silhouette_rejected_count}, "
@@ -4921,7 +5760,12 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                         f"topology_changed={str(self._evaluated_topology_changed).lower()}, "
                         "projection_index_space=mesh-bvh, "
                         f"brush={self._brush_name}, "
-                        f"spacing={self._brush_spacing:.3f}"
+                        f"spacing={self._brush_spacing:.3f}, "
+                        f"tablet_samples={self._tablet_sample_count}, "
+                        f"pressure_min={self._pressure_min:.3f}, "
+                        f"pressure_max={self._pressure_max:.3f}, "
+                        f"pressure_avg={(self._pressure_sum / max(1, self._input_sample_count)):.3f}, "
+                        f"tilt_max={self._tilt_max:.3f}"
                     )
 
                 else:

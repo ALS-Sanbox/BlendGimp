@@ -24,8 +24,14 @@ VALID_ENGINE_MODES = {
     ENGINE_MODE_VISIBLE_DEBUG,
 }
 
-HEADLESS_ARGUMENTS = (
+HEADLESS_GUI_ARGUMENTS = (
     "--no-interface",
+    "--no-splash",
+    "--console-messages",
+    "--new-instance",
+)
+
+HEADLESS_CONSOLE_ARGUMENTS = (
     "--no-splash",
     "--console-messages",
     "--new-instance",
@@ -41,6 +47,8 @@ _engine_runtime = {
     "last_exit_code": None,
     "last_error": "",
     "launched_by_blendgimp": False,
+    "executable": "",
+    "headless_backend": "",
 }
 
 
@@ -304,6 +312,32 @@ def normalize_engine_mode(engine_mode):
     return mode
 
 
+def resolve_headless_executable(gimp_path):
+    """Prefer GIMP's console binary for Windows headless operation.
+
+    GIMP ships a dedicated console executable that behaves as if
+    ``--no-interface`` were supplied. Using it avoids initializing the normal
+    GUI executable solely to suppress its UI, which is especially important
+    for the portable Windows runtime.
+    """
+
+    path = os.path.abspath(str(gimp_path))
+    directory = os.path.dirname(path)
+
+    if os.name == "nt":
+        candidates = (
+            "gimp-console-3.2.exe",
+            "gimp-console-3.exe",
+            "gimp-console.exe",
+        )
+        for name in candidates:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                return candidate, "console"
+
+    return path, "gui-no-interface"
+
+
 def build_launch_command(
     gimp_path,
     engine_mode=ENGINE_MODE_VISIBLE_DEBUG
@@ -314,13 +348,19 @@ def build_launch_command(
         engine_mode
     )
 
-    command = [
-        str(gimp_path)
-    ]
+    executable = str(gimp_path)
+    backend = "visible-gui"
+
+    if mode == ENGINE_MODE_HEADLESS:
+        executable, backend = resolve_headless_executable(gimp_path)
+
+    command = [executable]
 
     if mode == ENGINE_MODE_HEADLESS:
         command.extend(
-            HEADLESS_ARGUMENTS
+            HEADLESS_CONSOLE_ARGUMENTS
+            if backend == "console"
+            else HEADLESS_GUI_ARGUMENTS
         )
 
     return command
@@ -538,6 +578,13 @@ def launch_gimp(
         mode
     )
 
+    launch_executable = command[0]
+    headless_backend = (
+        resolve_headless_executable(gimp_path)[1]
+        if mode == ENGINE_MODE_HEADLESS
+        else "visible-gui"
+    )
+
     popen_options = {
         "cwd": os.path.dirname(
             gimp_path
@@ -563,7 +610,7 @@ def launch_gimp(
         print(
             "BLENDGIMP: "
             f"Launching GIMP engine mode={mode} "
-            f"from {gimp_path}"
+            f"backend={headless_backend} from {launch_executable}"
         )
 
         print(
@@ -586,6 +633,8 @@ def launch_gimp(
                 "last_exit_code": None,
                 "last_error": "",
                 "launched_by_blendgimp": True,
+                "executable": str(launch_executable),
+                "headless_backend": str(headless_backend),
             }
         )
 

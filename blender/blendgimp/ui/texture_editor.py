@@ -19,16 +19,27 @@ region, projection, or stroke-streaming ownership lives in this module.
 """
 
 import bpy
+import time
+
+from ..ipc.connection import connection_manager
 
 
 MODE_TEXTURE = "TEXTURE"
 MODE_OBJECT = "OBJECT"
 TEXTURE_EDITOR_POLL_INTERVAL = 0.35
+AUTO_ROUTER_RETRY_INTERVAL = 2.0
+AUTO_ROUTER_FAILURE_INTERVAL = 5.0
+_AUTO_ROUTER_COOLDOWNS = {}
+_RUNTIME_AREA_MODES = {}
+_RUNTIME_AREA_ENABLED = set()
+_AREA_RELEASE_SERIALS = {}
+_ROUTING_GENERATIONS = {}
 
 _SCREEN_AREAS_KEY = "blendgimp_area_indices"
 _SCREEN_MODE_PREFIX = "blendgimp_area_mode_"
 _SCREEN_PREV_TYPE_PREFIX = "blendgimp_area_prev_type_"
 _SCREEN_PREV_UI_TYPE_PREFIX = "blendgimp_area_prev_ui_type_"
+_SCREEN_ROUTING_GENERATION_PREFIX = "blendgimp_area_route_generation_"
 
 
 # -----------------------------------------------------------------------------
@@ -44,6 +55,21 @@ def _set_if_present(target, property_name, value):
         return True
     except (AttributeError, TypeError, ValueError):
         return False
+
+
+
+def _runtime_area_key(screen, area):
+    if screen is None or area is None:
+        return None
+    try:
+        screen_ptr = int(screen.as_pointer())
+    except Exception:
+        screen_ptr = id(screen)
+    try:
+        area_ptr = int(area.as_pointer())
+    except Exception:
+        area_ptr = id(area)
+    return (screen_ptr, area_ptr)
 
 
 def _screen_area_index(screen, area):
@@ -65,6 +91,99 @@ def _screen_area_index(screen, area):
             except Exception:
                 pass
     return -1
+
+
+def _area_from_slot(screen, index):
+    if screen is None:
+        return None
+    try:
+        index = int(index)
+        if index < 0 or index >= len(screen.areas):
+            return None
+        return screen.areas[index]
+    except Exception:
+        return None
+
+
+def _routing_generation(screen, area=None, index=None):
+    if screen is None:
+        return 0
+    if index is None:
+        index = _screen_area_index(screen, area)
+    try:
+        index = int(index)
+    except Exception:
+        return 0
+    if index < 0:
+        return 0
+    try:
+        value = int(screen.get(f"{_SCREEN_ROUTING_GENERATION_PREFIX}{index}", 0))
+    except Exception:
+        value = 0
+    if value <= 0:
+        value = int(_ROUTING_GENERATIONS.get((int(screen.as_pointer()) if hasattr(screen, "as_pointer") else id(screen), index), 0))
+    return max(0, value)
+
+
+def _bump_routing_generation(screen, area=None, index=None):
+    if screen is None:
+        return 0
+    if index is None:
+        index = _screen_area_index(screen, area)
+    try:
+        index = int(index)
+    except Exception:
+        return 0
+    if index < 0:
+        return 0
+    value = _routing_generation(screen, index=index) + 1
+    try:
+        screen[f"{_SCREEN_ROUTING_GENERATION_PREFIX}{index}"] = int(value)
+    except Exception:
+        pass
+    try:
+        screen_ptr = int(screen.as_pointer())
+    except Exception:
+        screen_ptr = id(screen)
+    _ROUTING_GENERATIONS[(screen_ptr, index)] = int(value)
+    return int(value)
+
+
+def _ensure_routing_generation(screen, area=None, index=None):
+    value = _routing_generation(screen, area=area, index=index)
+    if value > 0:
+        return value
+    return _bump_routing_generation(screen, area=area, index=index)
+
+
+def _routing_token(screen, area, mode):
+    index = _screen_area_index(screen, area)
+    if index < 0:
+        return (-1, 0, str(mode))
+    return (index, _ensure_routing_generation(screen, index=index), str(mode))
+
+
+def _routing_token_current(screen, slot_index, generation, mode):
+    try:
+        slot_index = int(slot_index)
+        generation = int(generation)
+    except Exception:
+        return False
+    area = _area_from_slot(screen, slot_index)
+    if area is None:
+        return False
+    if slot_index not in _screen_area_indices(screen):
+        return False
+    if _routing_generation(screen, index=slot_index) != generation:
+        return False
+    current_mode = _area_mode(screen, area)
+    if current_mode != mode:
+        return False
+    if mode == MODE_TEXTURE and getattr(area, "type", "") != "IMAGE_EDITOR":
+        return False
+    if mode == MODE_OBJECT and getattr(area, "type", "") != "VIEW_3D":
+        return False
+    return True
 
 
 def _screen_area_indices(screen):
@@ -91,20 +210,39 @@ def _write_screen_area_indices(screen, indices):
 
 
 def _area_mode(screen, area):
+    # Fix4: the Screen slot is authoritative. Blender may replace the Area RNA
+    # pointer when an editor changes type (IMAGE_EDITOR <-> VIEW_3D). A stale
+    # modal can still hold the old Area wrapper, so never trust runtime pointer
+    # metadata unless that exact Area is still present in the current Screen.
     index = _screen_area_index(screen, area)
     if index < 0:
         return ""
+
     try:
         mode = str(screen.get(f"{_SCREEN_MODE_PREFIX}{index}", ""))
     except Exception:
         mode = ""
-    return mode if mode in {MODE_TEXTURE, MODE_OBJECT} else ""
+
+    key = _runtime_area_key(screen, area)
+    if mode in {MODE_TEXTURE, MODE_OBJECT} and key is not None:
+        _RUNTIME_AREA_MODES[key] = mode
+        _RUNTIME_AREA_ENABLED.add(key)
+        return mode
+
+    # Runtime state is only a cache for a live area, never an authority for a
+    # detached/stale Area pointer.
+    runtime_mode = _RUNTIME_AREA_MODES.get(key, "") if key is not None else ""
+    return runtime_mode if runtime_mode in {MODE_TEXTURE, MODE_OBJECT} else ""
 
 
 def _set_area_mode(screen, area, mode):
     index = _screen_area_index(screen, area)
     if index < 0 or mode not in {MODE_TEXTURE, MODE_OBJECT}:
         return
+    key = _runtime_area_key(screen, area)
+    if key is not None:
+        _RUNTIME_AREA_MODES[key] = mode
+        _RUNTIME_AREA_ENABLED.add(key)
     try:
         screen[f"{_SCREEN_MODE_PREFIX}{index}"] = mode
     except Exception:
@@ -112,8 +250,18 @@ def _set_area_mode(screen, area, mode):
 
 
 def _is_blendgimp_area(screen, area):
+    # Fix4: reject stale Area wrappers first. This prevents a retired 2D/3D
+    # modal from remaining active after Blender swaps the editor Area pointer
+    # during a Texture/Object mode change.
     index = _screen_area_index(screen, area)
-    return index >= 0 and index in _screen_area_indices(screen)
+    if index < 0:
+        return False
+
+    enabled = index in _screen_area_indices(screen)
+    key = _runtime_area_key(screen, area)
+    if enabled and key is not None:
+        _RUNTIME_AREA_ENABLED.add(key)
+    return enabled
 
 
 def _remember_area_host(screen, area):
@@ -137,6 +285,11 @@ def _enable_blendgimp_area(screen, area, mode):
         return False
 
     _remember_area_host(screen, area)
+    _ensure_routing_generation(screen, area=area)
+    key = _runtime_area_key(screen, area)
+    if key is not None:
+        _RUNTIME_AREA_ENABLED.add(key)
+        _RUNTIME_AREA_MODES[key] = mode
     indices = _screen_area_indices(screen)
     indices.add(index)
     _write_screen_area_indices(screen, indices)
@@ -148,6 +301,13 @@ def _disable_blendgimp_area(screen, area, restore=True):
     index = _screen_area_index(screen, area)
     if index < 0:
         return
+
+    _bump_routing_generation(screen, area=area)
+    key = _runtime_area_key(screen, area)
+    if key is not None:
+        _RUNTIME_AREA_ENABLED.discard(key)
+        _RUNTIME_AREA_MODES.pop(key, None)
+        _AREA_RELEASE_SERIALS.pop(key, None)
 
     indices = _screen_area_indices(screen)
     indices.discard(index)
@@ -186,6 +346,54 @@ def _disable_blendgimp_area(screen, area, restore=True):
         except (AttributeError, TypeError, ValueError):
             pass
 
+
+
+
+def _paint_cancel_serial(scene):
+    try:
+        return int(scene.get("blendgimp_paint_cancel_serial", 0))
+    except Exception:
+        return 0
+
+
+def _area_release_serial(screen, area):
+    key = _runtime_area_key(screen, area)
+    if key is None:
+        return 0
+    try:
+        return int(_AREA_RELEASE_SERIALS.get(key, 0))
+    except Exception:
+        return 0
+
+
+def request_blendgimp_paint_release(scene, reason="mode change", screen=None, area=None):
+    """Invalidate a BlendGimp modal owner.
+
+    Phase 6.3.7 Fix4 keeps normal editor-mode changes area-scoped so switching
+    one BlendGimp area does not tear down routers in other BlendGimp areas.
+    Calls without an area remain global for shutdown/undo/emergency release.
+    """
+    key = _runtime_area_key(screen, area)
+    if key is not None:
+        _bump_routing_generation(screen, area=area)
+        serial = int(_AREA_RELEASE_SERIALS.get(key, 0)) + 1
+        _AREA_RELEASE_SERIALS[key] = serial
+        print(
+            "BLENDGIMP: Phase 6.3.7 area-scoped paint release "
+            f"serial={serial} reason={reason}"
+        )
+        return serial
+
+    serial = _paint_cancel_serial(scene) + 1
+    try:
+        scene["blendgimp_paint_cancel_serial"] = int(serial)
+    except Exception:
+        pass
+    if hasattr(scene, "blendgimp_2d_paint_status"):
+        scene.blendgimp_2d_paint_status = f"Released — {reason}"
+    if hasattr(scene, "blendgimp_direct_paint_status"):
+        scene.blendgimp_direct_paint_status = f"Released — {reason}"
+    return serial
 
 def _context_is_blendgimp_area(context, mode=None):
     screen = getattr(context, "screen", None)
@@ -317,8 +525,33 @@ def _set_active_texture(scene, image_id):
     if image is None:
         image_id = -1
 
+    previous_id = int(getattr(scene, "blendgimp_texture_editor_image_id", -1))
+    if previous_id != image_id:
+        try:
+            from . import main_panel
+            main_panel.flush_blender_paint_changes(
+                scene, reason="before BlendGimp texture switch", fail_if_unsent=True
+            )
+        except Exception as exc:
+            print(f"BLENDGIMP: Texture switch blocked by Unified Paint Sync: {exc}")
+            return _find_blendgimp_image(previous_id)
+
     scene.blendgimp_texture_editor_image_id = image_id
     scene.blendgimp_texture_editor_image_name = image.name if image else ""
+
+    if image is not None and previous_id != image_id:
+        try:
+            from . import main_panel
+            target = main_panel.resolve_gimp_paint_target(
+                scene, image_id, create_if_missing=True
+            )
+            main_panel.load_active_layer_buffer_from_gimp(
+                scene, image_id, int(target["layer_id"]),
+                clear_first=True, activate_target=True
+            )
+        except Exception as exc:
+            print(f"BLENDGIMP: Active Layer Buffer texture bind warning: {exc}")
+
     return image
 
 
@@ -401,6 +634,17 @@ def _switch_area_mode(context, mode):
     if area is None or screen is None:
         return False
 
+    logical_index = _screen_area_index(screen, area)
+    if logical_index < 0:
+        return False
+    old_key = _runtime_area_key(screen, area)
+
+    previous_mode = _area_mode(screen, area) if _is_blendgimp_area(screen, area) else ""
+    if previous_mode and previous_mode != mode:
+        request_blendgimp_paint_release(
+            scene, "BlendGimp area mode changed", screen=screen, area=area
+        )
+
     if not _is_blendgimp_area(screen, area):
         if not _enable_blendgimp_area(screen, area, mode):
             return False
@@ -421,6 +665,21 @@ def _switch_area_mode(context, mode):
         scene.blendgimp_texture_editor_status = (
             f"Object Paint — {image.name}" if image else "Object Paint — no active texture"
         )
+
+    # Blender can replace the Area RNA pointer when its editor type changes.
+    # Rebind runtime metadata to the live Area now occupying the same logical
+    # Screen slot and retire the pre-switch pointer cache.
+    try:
+        live_area = screen.areas[logical_index]
+    except Exception:
+        live_area = area
+    live_key = _runtime_area_key(screen, live_area)
+    if old_key is not None and old_key != live_key:
+        _RUNTIME_AREA_ENABLED.discard(old_key)
+        _RUNTIME_AREA_MODES.pop(old_key, None)
+        _AREA_RELEASE_SERIALS.pop(old_key, None)
+    if live_area is not None:
+        _set_area_mode(screen, live_area, mode)
 
     scene.blendgimp_area_last_mode = mode
     return True
@@ -444,9 +703,8 @@ def _iter_enabled_texture_areas():
             continue
         seen_screens.add(screen_ptr)
 
-        enabled = _screen_area_indices(screen)
-        for index, area in enumerate(screen.areas):
-            if index not in enabled:
+        for area in screen.areas:
+            if not _is_blendgimp_area(screen, area):
                 continue
             if _area_mode(screen, area) != MODE_TEXTURE:
                 continue
@@ -461,6 +719,147 @@ def _sync_texture_areas(context):
     for area in _iter_enabled_texture_areas():
         _configure_texture_area(area, scene, image=image)
     return image
+
+
+def _iter_enabled_blendgimp_areas():
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        return
+    for window in wm.windows:
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if not _is_blendgimp_area(screen, area):
+                continue
+            mode = _area_mode(screen, area)
+            if mode == MODE_TEXTURE and area.type == "IMAGE_EDITOR":
+                yield window, screen, area, mode
+            elif mode == MODE_OBJECT and area.type == "VIEW_3D":
+                yield window, screen, area, mode
+
+
+def _area_window_region(area):
+    if area is None:
+        return None
+    return next((region for region in area.regions if region.type == "WINDOW"), None)
+
+
+def _router_key(window, area, mode):
+    try:
+        window_ptr = int(window.as_pointer())
+    except Exception:
+        window_ptr = id(window)
+    try:
+        area_ptr = int(area.as_pointer())
+    except Exception:
+        area_ptr = id(area)
+    return (window_ptr, area_ptr, str(mode))
+
+
+def _auto_pointer_routing_update(_self, context):
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    scene = context.scene
+    if not bool(getattr(scene, "blendgimp_auto_pointer_routing", True)):
+        request_blendgimp_paint_release(scene, "Automatic pointer routing disabled")
+        scene.blendgimp_texture_editor_status = "Automatic paint routing disabled"
+    else:
+        scene.blendgimp_texture_editor_status = "Automatic paint routing enabled"
+        _AUTO_ROUTER_COOLDOWNS.clear()
+
+
+def _ensure_auto_pointer_routing(context):
+    scene = getattr(context, "scene", None)
+    if scene is None or not bool(getattr(scene, "blendgimp_auto_pointer_routing", True)):
+        return
+    if not connection_manager.is_connected():
+        return
+
+    image_id = int(getattr(scene, "blendgimp_texture_editor_image_id", -1))
+    image = _find_blendgimp_image(image_id)
+    if image is None or image_id < 0:
+        return
+
+    now = time.monotonic()
+    for window, screen, area, mode in _iter_enabled_blendgimp_areas():
+        key = _router_key(window, area, mode)
+        if now < float(_AUTO_ROUTER_COOLDOWNS.get(key, 0.0)):
+            continue
+        region = _area_window_region(area)
+        if region is None:
+            _AUTO_ROUTER_COOLDOWNS[key] = now + AUTO_ROUTER_FAILURE_INTERVAL
+            continue
+
+        if mode == MODE_TEXTURE:
+            if bool(getattr(scene, "blendgimp_2d_paint_active", False)):
+                continue
+            operator_id = "Texture Paint"
+        else:
+            if bool(getattr(scene, "blendgimp_direct_paint_active", False)):
+                continue
+            operator_id = "Object Paint"
+
+            # 6.3.7 Fix2: normalize Blender's underlying object mode only when
+            # no Object Paint modal is active, then wait one routing tick before
+            # creating projection data.  Changing object mode under a live
+            # projection owner invalidates evaluated mesh/UV data.
+            try:
+                with bpy.context.temp_override(
+                    window=window,
+                    screen=screen,
+                    area=area,
+                    region=region,
+                ):
+                    obj = getattr(bpy.context, "active_object", None)
+                    if obj is not None and getattr(obj, "type", "") == "MESH":
+                        previous_object_mode = str(getattr(obj, "mode", "OBJECT"))
+                        if previous_object_mode != "OBJECT":
+                            bpy.ops.object.mode_set(mode="OBJECT")
+                            _AUTO_ROUTER_COOLDOWNS[key] = now + AUTO_ROUTER_RETRY_INTERVAL
+                            print(
+                                "BLENDGIMP: Phase 6.3.7 Object Paint native mode guard "
+                                f"{previous_object_mode}->OBJECT; projection arm deferred one tick"
+                            )
+                            continue
+            except Exception as exc:
+                _AUTO_ROUTER_COOLDOWNS[key] = now + AUTO_ROUTER_FAILURE_INTERVAL
+                print(
+                    "BLENDGIMP: Object Paint native mode guard deferred: "
+                    f"{exc}"
+                )
+                continue
+
+        try:
+            with bpy.context.temp_override(
+                window=window,
+                screen=screen,
+                area=area,
+                region=region,
+            ):
+                if mode == MODE_TEXTURE:
+                    result = bpy.ops.blendgimp.gimp_2d_paint("INVOKE_DEFAULT")
+                else:
+                    result = bpy.ops.blendgimp.direct_gimp_brush_paint(
+                        "INVOKE_DEFAULT",
+                        image_id=image_id,
+                        image_width=int(image.size[0]),
+                        image_height=int(image.size[1]),
+                    )
+            if "RUNNING_MODAL" in result:
+                _AUTO_ROUTER_COOLDOWNS[key] = now + AUTO_ROUTER_RETRY_INTERVAL
+                print(
+                    "BLENDGIMP: Phase 6.3.7 automatic pointer routing armed "
+                    f"mode={mode} image ID {image_id}"
+                )
+            else:
+                _AUTO_ROUTER_COOLDOWNS[key] = now + AUTO_ROUTER_FAILURE_INTERVAL
+        except Exception as exc:
+            _AUTO_ROUTER_COOLDOWNS[key] = now + AUTO_ROUTER_FAILURE_INTERVAL
+            print(
+                "BLENDGIMP: Phase 6.3.7 auto routing start deferred "
+                f"mode={operator_id}: {exc}"
+            )
 
 
 def _texture_editor_property_update(_self, context):
@@ -491,6 +890,7 @@ def blendgimp_texture_editor_timer():
                 _set_active_texture(scene, image_id)
 
         _sync_texture_areas(context)
+        _ensure_auto_pointer_routing(context)
     except Exception as exc:
         print(f"BLENDGIMP: Phase 6.1 area timer recovered from error: {exc}")
     return TEXTURE_EDITOR_POLL_INTERVAL
@@ -563,8 +963,103 @@ class BLENDGIMP_OT_disable_area(bpy.types.Operator):
         return _context_is_blendgimp_area(context)
 
     def execute(self, context):
+        request_blendgimp_paint_release(context.scene, "BlendGimp Area disabled", screen=context.screen, area=context.area)
         _disable_blendgimp_area(context.screen, context.area, restore=True)
         self.report({"INFO"}, "BlendGimp Area disabled")
+        return {"FINISHED"}
+
+
+class BLENDGIMP_OT_use_blender_brushes(bpy.types.Operator):
+    bl_idname = "blendgimp.use_blender_brushes"
+    bl_label = "Use Blender Brushes"
+    bl_description = (
+        "Release BlendGimp mouse ownership and use Blender's built-in Texture Paint "
+        "on the active GIMP layer buffer while Unified Paint Sync remains active"
+    )
+
+    target: bpy.props.EnumProperty(
+        items=(
+            ("2D", "2D Image Paint", "Use Blender's built-in 2D image painting"),
+            ("3D", "3D Texture Paint", "Use Blender's built-in Texture Paint on the mesh"),
+        ),
+        default="3D",
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and getattr(context, "scene", None) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        request_blendgimp_paint_release(scene, "Use Blender Brushes", screen=context.screen, area=context.area)
+
+        try:
+            from . import main_panel as _main_panel
+            image_id = int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1))
+            layer_id = int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1))
+            if image_id >= 0 and layer_id >= 0:
+                buffer_image = _main_panel._active_layer_buffer_for_sync(scene, image_id)  # noqa: SLF001
+                if buffer_image is None:
+                    buffer_image = _main_panel.load_active_layer_buffer_from_gimp(
+                        scene, image_id, layer_id, clear_first=True, activate_target=True
+                    )
+                else:
+                    sync_result = _main_panel.get_texture_sync_result(scene, image_id) or {}
+                    composite = _main_panel._find_blendgimp_image(  # noqa: SLF001
+                        image_id, sync_result.get("sync_token", "")
+                    )
+                    if composite is not None:
+                        _main_panel._ensure_active_layer_paint_node(  # noqa: SLF001
+                            context, composite, buffer_image, image_id
+                        )
+            else:
+                buffer_image = None
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not prepare Blender paint target: {exc}")
+            return {"CANCELLED"}
+
+        if _context_is_blendgimp_area(context):
+            _disable_blendgimp_area(context.screen, context.area, restore=False)
+
+        obj = getattr(context, "active_object", None)
+        if obj is not None and obj.type == "MESH":
+            try:
+                if str(obj.mode) != "TEXTURE_PAINT":
+                    bpy.ops.object.mode_set(mode="TEXTURE_PAINT")
+            except Exception as exc:
+                print(f"BLENDGIMP: Blender Texture Paint mode warning: {exc}")
+
+        if self.target == "2D":
+            try:
+                context.area.type = "IMAGE_EDITOR"
+                space = context.area.spaces.active
+                if buffer_image is not None:
+                    space.image = buffer_image
+                _set_if_present(space, "mode", "PAINT")
+                _set_if_present(space, "show_region_toolbar", True)
+                _set_if_present(space, "show_region_asset_shelf", True)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Could not enter Blender 2D Paint: {exc}")
+                return {"CANCELLED"}
+        else:
+            try:
+                context.area.type = "VIEW_3D"
+                space = context.area.spaces.active
+                _set_if_present(space, "show_region_toolbar", True)
+                _set_if_present(space, "show_region_asset_shelf", True)
+            except Exception:
+                pass
+
+        try:
+            context.window.cursor_modal_restore()
+        except Exception:
+            pass
+
+        self.report({"INFO"}, "Blender Texture Paint ready — Unified Paint Sync remains active")
+        print(
+            "BLENDGIMP: Blender brush ownership active "
+            f"target={self.target} unified_sync=True"
+        )
         return {"FINISHED"}
 
 
@@ -893,11 +1388,10 @@ class BLENDGIMP_PT_texture_area(bpy.types.Panel):
         _draw_uv_controls(layout, context)
 
         info = layout.box()
-        info.label(text="Phase 6.1 Canvas Foundation", icon="CHECKMARK")
-        info.label(text="GIMP paint tools are available in the panel below")
+        info.label(text="Automatic pointer routing", icon="MOUSE_LMB")
+        info.label(text="Move over canvas to paint • move over UI to edit controls")
         if scene.blendgimp_texture_editor_status:
             info.label(text=scene.blendgimp_texture_editor_status)
-
         layout.operator("blendgimp.disable_area", text="Return Area to Previous Editor", icon="BACK")
 
 
@@ -921,14 +1415,12 @@ class BLENDGIMP_PT_object_area(bpy.types.Panel):
         layout = self.layout
         _draw_mode_switch(layout, context)
         layout.separator()
-        image = _draw_active_texture(layout, context)
-        _draw_object_paint_controls(layout, context, image)
+        _draw_active_texture(layout, context)
 
         info = layout.box()
-        info.label(text="Shared BlendGimp Area", icon="LINKED")
-        info.label(text="Switch to Texture Paint without changing workspace")
-        info.label(text="Active texture is shared between both modes")
-
+        info.label(text="Automatic pointer routing", icon="MOUSE_LMB")
+        info.label(text="Move over model to paint • move over UI to edit controls")
+        info.label(text="Texture/Object Paint share the same GIMP tool state", icon="LINKED")
         layout.operator("blendgimp.disable_area", text="Return Area to Previous Editor", icon="BACK")
 
 
@@ -936,6 +1428,7 @@ classes = (
     BLENDGIMP_OT_use_area,
     BLENDGIMP_OT_switch_area_mode,
     BLENDGIMP_OT_disable_area,
+    BLENDGIMP_OT_use_blender_brushes,
     BLENDGIMP_OT_texture_editor_refresh,
     BLENDGIMP_OT_texture_editor_set_image,
     BLENDGIMP_OT_texture_view_fit,
@@ -953,6 +1446,11 @@ classes = (
 
 
 def register():
+    _AUTO_ROUTER_COOLDOWNS.clear()
+    _RUNTIME_AREA_MODES.clear()
+    _RUNTIME_AREA_ENABLED.clear()
+    _AREA_RELEASE_SERIALS.clear()
+
     for cls in classes:
         bpy.utils.register_class(cls)
 
@@ -1019,6 +1517,15 @@ def register():
         description="Show a compact BlendGimp activation button in Image Editor and 3D View headers",
         default=True,
     )
+    bpy.types.Scene.blendgimp_auto_pointer_routing = bpy.props.BoolProperty(
+        name="Automatic Paint Routing",
+        description=(
+            "Automatically arm BlendGimp Texture/Object Paint and route input by pointer region; "
+            "Blender UI regions keep normal input"
+        ),
+        default=True,
+        update=_auto_pointer_routing_update,
+    )
 
     try:
         bpy.types.IMAGE_HT_header.append(_draw_blendgimp_header)
@@ -1036,10 +1543,15 @@ def register():
             persistent=True,
         )
 
-    print("BLENDGIMP: Phase 6.1 BlendGimp Area registered")
+    print("BLENDGIMP: Phase 6.3.7 BlendGimp Area + automatic pointer routing registered")
 
 
 def unregister():
+    _AUTO_ROUTER_COOLDOWNS.clear()
+    _RUNTIME_AREA_MODES.clear()
+    _RUNTIME_AREA_ENABLED.clear()
+    _AREA_RELEASE_SERIALS.clear()
+
     try:
         bpy.types.IMAGE_HT_header.remove(_draw_blendgimp_header)
     except Exception:
@@ -1056,6 +1568,7 @@ def unregister():
         pass
 
     property_names = (
+        "blendgimp_auto_pointer_routing",
         "blendgimp_show_area_header_launcher",
         "blendgimp_area_last_mode",
         "blendgimp_texture_editor_status",
@@ -1077,4 +1590,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.1 BlendGimp Area unregistered")
+    print("BLENDGIMP: Phase 6.3.7 BlendGimp Area + automatic pointer routing unregistered")

@@ -27,6 +27,30 @@ except Exception:
     np = None
 
 
+# Fast full-image float mirrors used by dirty-region updates.
+# Object Paint and Auto Sync share this path so a tight GIMP rectangle can be
+# patched in CPU memory and published through one bpy_prop_array.foreach_set()
+# call instead of hundreds of slow RNA slice assignments.
+_DIRTY_PIXEL_CACHE = {}
+
+
+def _dirty_cache_key(blender_image, image_id, sync_token, width, height):
+    return (
+        int(image_id),
+        str(sync_token or ""),
+        int(width),
+        int(height),
+        int(blender_image.as_pointer()),
+    )
+
+
+def _drop_dirty_pixel_cache_for_image(image_id):
+    image_id = int(image_id)
+    for key in list(_DIRTY_PIXEL_CACHE.keys()):
+        if int(key[0]) == image_id:
+            _DIRTY_PIXEL_CACHE.pop(key, None)
+
+
 # ============================================================
 # GIMP ENGINE LIFECYCLE RUNTIME
 # ============================================================
@@ -73,7 +97,7 @@ _AUTO_SYNC_RUNTIME = {
     "pending_since": 0.0,
 }
 
-BLENDER_PAINT_SYNC_POLL_INTERVAL = 0.5
+BLENDER_PAINT_SYNC_POLL_INTERVAL = 0.10
 BLENDER_PAINT_LAYER_NAME = "BlendGimp Paint"
 
 _BLENDER_PAINT_SYNC_RUNTIME = {
@@ -83,6 +107,7 @@ _BLENDER_PAINT_SYNC_RUNTIME = {
     "pending_pixels": None,
     "pending_bbox": None,
     "pending_since": 0.0,
+    "buffer_image_name": "",
 }
 
 
@@ -118,6 +143,9 @@ def reset_blender_paint_sync_runtime(
     _BLENDER_PAINT_SYNC_RUNTIME[
         "pending_since"
     ] = 0.0
+
+    if baseline is None and int(image_id) < 0:
+        _BLENDER_PAINT_SYNC_RUNTIME["buffer_image_name"] = ""
 
 
 def reset_auto_sync_runtime(
@@ -610,7 +638,16 @@ def blendgimp_engine_lifecycle_timer():
 
     # A socket can look connected until the next read. Use a quiet, infrequent
     # PING so disappearance is detected even when painting and Auto Sync are
-    # idle.
+    # idle. During live 2D/3D painting the paint path itself continuously proves
+    # the connection is healthy, and a main-thread PING could wait behind the
+    # asynchronous paint worker's serialized socket lock. Skip that healthcheck
+    # until paint releases refresh ownership so Blender's UI never stalls for a
+    # heartbeat while the artist is drawing.
+    if connection_manager.is_connected() and direct_paint_owns_refresh():
+        scene.blendgimp_connected = True
+        scene.blendgimp_engine_state = gimp_manager.ENGINE_STATE_CONNECTED
+        return ENGINE_LIFECYCLE_POLL_INTERVAL
+
     if connection_manager.is_connected():
         if now >= float(
             _ENGINE_LIFECYCLE_RUNTIME.get(
@@ -1588,6 +1625,309 @@ def _blendgimp_extract_top_left_rgba_region(
     )
 
 
+def _find_blendgimp_active_layer_buffer(image_id):
+    image_id = int(image_id)
+    for candidate in bpy.data.images:
+        try:
+            if (
+                str(candidate.get("blendgimp_role", "")) == "active-layer-buffer"
+                and int(candidate.get("blendgimp_parent_gimp_image_id", -1)) == image_id
+            ):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _get_or_create_blendgimp_active_layer_buffer(image_id, width, height, sync_token=""):
+    image_id = int(image_id)
+    width = int(width)
+    height = int(height)
+    blender_image = _find_blendgimp_active_layer_buffer(image_id)
+    desired_name = f"BlendGimp::ActiveLayer-{str(sync_token or image_id)[:12]}"
+    if blender_image is None:
+        blender_image = bpy.data.images.new(
+            name=desired_name, width=width, height=height, alpha=True, float_buffer=False
+        )
+    elif int(blender_image.size[0]) != width or int(blender_image.size[1]) != height:
+        blender_image.scale(width, height)
+    blender_image.name = desired_name
+    blender_image["blendgimp_role"] = "active-layer-buffer"
+    blender_image["blendgimp_parent_gimp_image_id"] = image_id
+    blender_image["blendgimp_parent_sync_token"] = str(sync_token or "")
+    try:
+        blender_image.colorspace_settings.name = "sRGB"
+        blender_image.alpha_mode = "STRAIGHT"
+    except Exception:
+        pass
+    _BLENDER_PAINT_SYNC_RUNTIME["buffer_image_name"] = blender_image.name
+    return blender_image
+
+
+def _clear_blendgimp_rgba_image(blender_image):
+    total = int(blender_image.size[0]) * int(blender_image.size[1]) * 4
+    if np is not None:
+        blender_image.pixels.foreach_set(np.zeros(total, dtype=np.float32))
+    else:
+        from array import array
+        blender_image.pixels.foreach_set(array("f", [0.0]) * total)
+    blender_image.update()
+
+
+def _patch_blendgimp_layer_buffer(blender_image, response, clear_first=False):
+    image_width = int(response.get("image_width", blender_image.size[0]))
+    image_height = int(response.get("image_height", blender_image.size[1]))
+    if int(blender_image.size[0]) != image_width or int(blender_image.size[1]) != image_height:
+        blender_image.scale(image_width, image_height)
+        clear_first = True
+    if clear_first:
+        _clear_blendgimp_rgba_image(blender_image)
+    region_width = int(response.get("width", 0))
+    region_height = int(response.get("height", 0))
+    if region_width <= 0 or region_height <= 0:
+        return blender_image
+    x = int(response.get("x", 0))
+    y = int(response.get("y", 0))
+    raw = response.get("pixels_raw", b"")
+    if not isinstance(raw, bytes):
+        raw = bytes(raw)
+    expected = region_width * region_height * 4
+    if len(raw) != expected:
+        raise RuntimeError(f"Active-layer payload mismatch: expected {expected}, got {len(raw)}")
+    total = image_width * image_height * 4
+    if np is not None:
+        pixels = np.empty(total, dtype=np.float32)
+        blender_image.pixels.foreach_get(pixels)
+        full = pixels.reshape((image_height, image_width, 4))
+        region = np.frombuffer(raw, dtype=np.uint8).reshape((region_height, region_width, 4))
+        row_start = image_height - (y + region_height)
+        row_end = image_height - y
+        full[row_start:row_end, x:x + region_width, :] = region[::-1].astype(np.float32) * (1.0 / 255.0)
+        blender_image.pixels.foreach_set(pixels)
+    else:
+        # Compatibility fallback: rebuild from top-left bytes through the existing converter logic.
+        width, height, current = _blender_image_to_top_left_rgba8(blender_image)
+        mutable = bytearray(current)
+        row_bytes = width * 4
+        region_row_bytes = region_width * 4
+        for row in range(region_height):
+            dst = (y + row) * row_bytes + x * 4
+            src = row * region_row_bytes
+            mutable[dst:dst + region_row_bytes] = raw[src:src + region_row_bytes]
+        from array import array
+        floats = array("f")
+        for row in range(height - 1, -1, -1):
+            base = row * row_bytes
+            floats.extend(v / 255.0 for v in mutable[base:base + row_bytes])
+        blender_image.pixels.foreach_set(floats)
+    blender_image.update()
+    return blender_image
+
+
+def _ensure_active_layer_paint_node(context, composite_image, layer_buffer, image_id):
+    obj, material = find_blendgimp_image_owner(composite_image, image_id)
+    if obj is None:
+        obj = getattr(context, "active_object", None)
+        material = getattr(obj, "active_material", None) if obj is not None else material
+    if material is None or not material.use_nodes or material.node_tree is None:
+        return None
+    nodes = material.node_tree.nodes
+    node = next((n for n in nodes if bool(n.get("blendgimp_active_layer_paint_target", False))), None)
+    if node is None:
+        node = nodes.new("ShaderNodeTexImage")
+        node.name = "BlendGimp Active Layer Paint Target"
+        node.label = "BlendGimp Active Layer Paint Target (unconnected)"
+        node["blendgimp_active_layer_paint_target"] = True
+    node.image = layer_buffer
+    node["blendgimp_gimp_image_id"] = int(image_id)
+    node["blendgimp_gimp_layer_id"] = int(layer_buffer.get("blendgimp_gimp_layer_id", -1))
+    for candidate in nodes:
+        candidate.select = False
+    node.select = True
+    nodes.active = node
+
+    # Blender 5.2 Material Texture Paint exposes every Image Texture node as a
+    # paint slot. Select the slot that corresponds to the reusable layer
+    # buffer while leaving the connected composite node untouched.
+    try:
+        paint_images = list(material.texture_paint_images)
+        for index, paint_image in enumerate(paint_images):
+            if paint_image == layer_buffer:
+                material.paint_active_slot = int(index)
+                break
+    except Exception as exc:
+        print(f"BLENDGIMP: Active texture paint slot selection warning: {exc}")
+
+    return node
+
+
+def load_active_layer_buffer_from_gimp(scene, image_id, layer_id, *, region=None, clear_first=True, activate_target=True):
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    sync_result = get_texture_sync_result(scene, image_id) or {}
+    composite = _find_blendgimp_image(image_id, sync_result.get("sync_token", ""))
+    if composite is None:
+        raise RuntimeError("No synchronized BlendGimp composite image is available")
+    if region is None:
+        response = connection_manager.get_layer_pixels_binary(image_id, layer_id)
+    else:
+        x, y, width, height = [int(v) for v in region]
+        response = connection_manager.get_layer_pixels_binary(image_id, layer_id, x, y, width, height)
+    buffer_image = _get_or_create_blendgimp_active_layer_buffer(
+        image_id, int(composite.size[0]), int(composite.size[1]), sync_result.get("sync_token", "")
+    )
+    _patch_blendgimp_layer_buffer(buffer_image, response, clear_first=clear_first)
+    buffer_image["blendgimp_gimp_layer_id"] = layer_id
+    buffer_image["blendgimp_layer_offset_x"] = int(response.get("layer_offset_x", 0))
+    buffer_image["blendgimp_layer_offset_y"] = int(response.get("layer_offset_y", 0))
+    scene.blendgimp_blender_paint_sync_image_id = image_id
+    scene.blendgimp_blender_paint_sync_layer_id = layer_id
+    scene.blendgimp_blender_paint_sync_enabled = True
+    width, height, baseline = _blender_image_to_top_left_rgba8(buffer_image)
+    reset_blender_paint_sync_runtime(image_id=image_id, layer_id=layer_id, baseline=baseline)
+    _BLENDER_PAINT_SYNC_RUNTIME["buffer_image_name"] = buffer_image.name
+    scene.blendgimp_blender_paint_sync_status = f"Synced layer {layer_id}"
+    if activate_target:
+        _ensure_active_layer_paint_node(bpy.context, composite, buffer_image, image_id)
+    print(
+        "BLENDGIMP: Active Layer Buffer loaded "
+        f"image ID {image_id} layer ID {layer_id} "
+        f"canvas={width}x{height} source={int(response.get('width',0))}x{int(response.get('height',0))}"
+    )
+    return buffer_image
+
+
+def _active_layer_buffer_for_sync(scene, image_id):
+    buffer_image = _find_blendgimp_active_layer_buffer(image_id)
+    if buffer_image is not None:
+        return buffer_image
+    return None
+
+
+def flush_blender_paint_changes(scene, *, reason="manual", fail_if_unsent=False):
+    """Synchronously commit Blender's active-layer working buffer to GIMP."""
+    if scene is None or not bool(getattr(scene, "blendgimp_blender_paint_sync_enabled", False)):
+        return False
+    image_id = int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1))
+    layer_id = int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1))
+    if image_id < 0 or layer_id < 0:
+        return False
+    buffer_image = _active_layer_buffer_for_sync(scene, image_id)
+    if buffer_image is None:
+        return False
+    try:
+        width, height, current_pixels = _blender_image_to_top_left_rgba8(buffer_image)
+        baseline = _BLENDER_PAINT_SYNC_RUNTIME.get("baseline")
+        runtime_image = int(_BLENDER_PAINT_SYNC_RUNTIME.get("image_id", -1))
+        runtime_layer = int(_BLENDER_PAINT_SYNC_RUNTIME.get("layer_id", -1))
+        if baseline is None or runtime_image != image_id or runtime_layer != layer_id:
+            reset_blender_paint_sync_runtime(image_id=image_id, layer_id=layer_id, baseline=current_pixels)
+            _BLENDER_PAINT_SYNC_RUNTIME["buffer_image_name"] = buffer_image.name
+            return False
+        bbox = _blendgimp_rgba_dirty_bbox(baseline, current_pixels, width, height)
+        if bbox is None:
+            scene.blendgimp_blender_paint_sync_status = "Synced"
+            return False
+        x, y, region_width, region_height = bbox
+        region_pixels = _blendgimp_extract_top_left_rgba_region(
+            current_pixels, width, x, y, region_width, region_height
+        )
+        scene.blendgimp_blender_paint_sync_status = "Sending Blender changes to GIMP"
+        response = connection_manager.set_layer_pixels_binary(
+            image_id, layer_id, x, y, region_width, region_height, region_pixels
+        )
+        # GIMP already recomposited and rebased its echo detector while
+        # accepting the write. Apply only that returned composite rectangle to
+        # the material image; no second full-image render/pull is necessary.
+        composite_raw = response.get("pixels_raw", b"")
+        if composite_raw:
+            dirty_response = {
+                "image_id": image_id,
+                "sync_token": str(response.get("sync_token", "")),
+                "width": int(response.get("image_width", width)),
+                "height": int(response.get("image_height", height)),
+                "changed": True,
+                "x": int(response.get("composite_x", x)),
+                "y": int(response.get("composite_y", y)),
+                "region_width": int(response.get("composite_width", region_width)),
+                "region_height": int(response.get("composite_height", region_height)),
+                "pixels_raw": composite_raw,
+                "transport": "blender-layer-write-composite-patch",
+            }
+            composite_image = apply_blender_image_dirty_pixels(dirty_response)
+            _force_object_paint_texture_redraw(composite_image)
+            tag_texture_views_for_redraw(bpy.context)
+        _BLENDER_PAINT_SYNC_RUNTIME["baseline"] = current_pixels
+        _BLENDER_PAINT_SYNC_RUNTIME["pending_pixels"] = None
+        _BLENDER_PAINT_SYNC_RUNTIME["pending_bbox"] = None
+        _BLENDER_PAINT_SYNC_RUNTIME["pending_since"] = 0.0
+        scene.blendgimp_blender_paint_sync_status = "Synced"
+        print(
+            "BLENDGIMP: Unified Paint Sync flush "
+            f"reason={reason} image ID {image_id} layer ID {layer_id} "
+            f"x={x} y={y} {region_width}x{region_height}"
+        )
+        return True
+    except Exception as exc:
+        scene.blendgimp_blender_paint_sync_status = f"Sync error: {exc}"
+        print(f"BLENDGIMP: Unified Paint Sync flush failed ({reason}): {exc}")
+        if fail_if_unsent:
+            raise RuntimeError(
+                "Blender Texture Paint changes could not be committed to GIMP; "
+                "the GIMP operation was blocked to protect the artwork. "
+                f"{exc}"
+            ) from exc
+        return False
+
+
+def apply_active_layer_buffer_response(scene, image_id, layer_id, response, *, clear_first=False, activate_target=False):
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    if not bool(getattr(scene, "blendgimp_blender_paint_sync_enabled", False)):
+        return None
+    if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) != image_id:
+        return None
+    if int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)) != layer_id:
+        return None
+    sync_result = get_texture_sync_result(scene, image_id) or {}
+    composite = _find_blendgimp_image(image_id, sync_result.get("sync_token", ""))
+    if composite is None:
+        return None
+    buffer_image = _get_or_create_blendgimp_active_layer_buffer(
+        image_id, int(composite.size[0]), int(composite.size[1]), sync_result.get("sync_token", "")
+    )
+    _patch_blendgimp_layer_buffer(buffer_image, response, clear_first=clear_first)
+    buffer_image["blendgimp_gimp_layer_id"] = layer_id
+    width, height, baseline = _blender_image_to_top_left_rgba8(buffer_image)
+    reset_blender_paint_sync_runtime(image_id=image_id, layer_id=layer_id, baseline=baseline)
+    _BLENDER_PAINT_SYNC_RUNTIME["buffer_image_name"] = buffer_image.name
+    scene.blendgimp_blender_paint_sync_status = "Synced"
+    if activate_target:
+        _ensure_active_layer_paint_node(bpy.context, composite, buffer_image, image_id)
+    return buffer_image
+
+
+def refresh_active_layer_buffer_region(scene, image_id, layer_id, dirty_response):
+    """Patch the reusable working image from the actual GIMP layer after a GIMP edit."""
+    if not bool(getattr(scene, "blendgimp_blender_paint_sync_enabled", False)):
+        return None
+    if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) != int(image_id):
+        return None
+    if int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)) != int(layer_id):
+        return None
+    if not dirty_response or not bool(dirty_response.get("changed", False)):
+        return None
+    region = (
+        int(dirty_response.get("x", 0)), int(dirty_response.get("y", 0)),
+        int(dirty_response.get("region_width", 0)), int(dirty_response.get("region_height", 0)),
+    )
+    if region[2] <= 0 or region[3] <= 0:
+        return None
+    return load_active_layer_buffer_from_gimp(
+        scene, image_id, layer_id, region=region, clear_first=False, activate_target=False
+    )
+
+
 def update_blender_paint_sync_baseline(
     image_id,
     blender_image=None
@@ -1626,6 +1966,10 @@ def update_blender_paint_sync_baseline(
 
     try:
 
+        active_layer_buffer = _active_layer_buffer_for_sync(scene, image_id)
+        if active_layer_buffer is not None:
+            blender_image = active_layer_buffer
+
         if blender_image is None:
 
             sync_result = (
@@ -1636,13 +1980,15 @@ def update_blender_paint_sync_baseline(
                 or {}
             )
 
-            blender_image = _find_blendgimp_image(
-                image_id,
-                sync_result.get(
-                    "sync_token",
-                    ""
+            blender_image = _active_layer_buffer_for_sync(scene, image_id)
+            if blender_image is None:
+                blender_image = _find_blendgimp_image(
+                    image_id,
+                    sync_result.get(
+                        "sync_token",
+                        ""
+                    )
                 )
-            )
 
         if blender_image is None:
             return
@@ -1953,9 +2299,12 @@ def get_or_update_blender_image_from_pixels(
             * (1.0 / 255.0)
         )
 
-        blender_image.pixels.foreach_set(
-            rgba_float.reshape(-1)
-        )
+        flat_rgba = np.ascontiguousarray(rgba_float.reshape(-1), dtype=np.float32)
+        blender_image.pixels.foreach_set(flat_rgba)
+        _drop_dirty_pixel_cache_for_image(image_id)
+        _DIRTY_PIXEL_CACHE[_dirty_cache_key(
+            blender_image, image_id, sync_token, width, height
+        )] = flat_rgba.copy()
 
     else:
         from array import array
@@ -1984,6 +2333,7 @@ def get_or_update_blender_image_from_pixels(
         blender_image.pixels.foreach_set(
             float_pixels
         )
+        _drop_dirty_pixel_cache_for_image(image_id)
 
     blender_image[
         "blendgimp_gimp_image_id"
@@ -2027,297 +2377,156 @@ def get_or_update_blender_image_from_pixels(
 def apply_blender_image_dirty_pixels(
     dirty_response
 ):
+    """Apply a GIMP RGBA8 dirty rectangle using Blender's fast bulk array API.
+
+    Phase 6.2.10: Object Paint now uses the same strategy that made Texture
+    Paint responsive in 6.2.9. A full float32 mirror of the Blender Image is
+    cached, the tight GIMP dirty rectangle is patched into that CPU mirror,
+    then Image.pixels.foreach_set() publishes the complete buffer in one fast
+    transfer. The legacy slice writer remains only as a compatibility fallback.
     """
-    Apply a GIMP top-left-origin RGBA8 dirty rectangle directly to the
-    existing Blender Image without replacing the image datablock.
-    """
 
-    image_id = int(
-        dirty_response[
-            "image_id"
-        ]
-    )
+    image_id = int(dirty_response["image_id"])
+    image_width = int(dirty_response["width"])
+    image_height = int(dirty_response["height"])
+    sync_token = str(dirty_response.get("sync_token", "")).strip()
 
-    image_width = int(
-        dirty_response[
-            "width"
-        ]
-    )
-
-    image_height = int(
-        dirty_response[
-            "height"
-        ]
-    )
-
-    sync_token = str(
-        dirty_response.get(
-            "sync_token",
-            ""
-        )
-    ).strip()
-
-    blender_image = _find_blendgimp_image(
-        image_id,
-        sync_token
-    )
-
+    blender_image = _find_blendgimp_image(image_id, sync_token)
     if blender_image is None:
-        raise RuntimeError(
-            "No existing Blender Image is available for a dirty update"
-        )
+        raise RuntimeError("No existing Blender Image is available for a dirty update")
 
-    if (
-        int(
-            blender_image.size[0]
-        ) != image_width
-        or int(
-            blender_image.size[1]
-        ) != image_height
-    ):
-        raise RuntimeError(
-            "Blender Image dimensions changed; a full refresh is required"
-        )
+    if int(blender_image.size[0]) != image_width or int(blender_image.size[1]) != image_height:
+        _drop_dirty_pixel_cache_for_image(image_id)
+        raise RuntimeError("Blender Image dimensions changed; a full refresh is required")
 
-    if not dirty_response.get(
-        "changed",
-        False
-    ):
+    if not dirty_response.get("changed", False):
         return blender_image
 
-    x = int(
-        dirty_response[
-            "x"
-        ]
-    )
-
-    y = int(
-        dirty_response[
-            "y"
-        ]
-    )
-
-    region_width = int(
-        dirty_response[
-            "region_width"
-        ]
-    )
-
-    region_height = int(
-        dirty_response[
-            "region_height"
-        ]
-    )
+    x = int(dirty_response["x"])
+    y = int(dirty_response["y"])
+    region_width = int(dirty_response["region_width"])
+    region_height = int(dirty_response["region_height"])
 
     if (
-        x < 0
-        or y < 0
-        or region_width <= 0
-        or region_height <= 0
-        or x + region_width > image_width
-        or y + region_height > image_height
+        x < 0 or y < 0 or region_width <= 0 or region_height <= 0
+        or x + region_width > image_width or y + region_height > image_height
     ):
-        raise RuntimeError(
-            "Dirty rectangle falls outside the Blender Image"
-        )
+        raise RuntimeError("Dirty rectangle falls outside the Blender Image")
 
-    raw_pixels = dirty_response.get(
-        "pixels_raw",
-        None
-    )
-
+    raw_pixels = dirty_response.get("pixels_raw", None)
     if raw_pixels is not None:
-
-        if not isinstance(
-            raw_pixels,
-            bytes
-        ):
-            raw_pixels = bytes(
-                raw_pixels
-            )
-
+        if not isinstance(raw_pixels, bytes):
+            raw_pixels = bytes(raw_pixels)
     else:
-
-        encoded = str(
-            dirty_response.get(
-                "pixels_b64",
-                ""
-            )
-        )
-
+        encoded = str(dirty_response.get("pixels_b64", ""))
         try:
-            raw_pixels = base64.b64decode(
-                encoded,
-                validate=True
-            )
+            raw_pixels = base64.b64decode(encoded, validate=True)
         except Exception as exc:
-            raise RuntimeError(
-                f"Could not decode dirty RGBA payload: {exc}"
-            )
+            raise RuntimeError(f"Could not decode dirty RGBA payload: {exc}")
 
-    expected_length = (
-        region_width
-        * region_height
-        * 4
-    )
-
-    if len(
-        raw_pixels
-    ) != expected_length:
+    expected_length = region_width * region_height * 4
+    if len(raw_pixels) != expected_length:
         raise RuntimeError(
             "Dirty RGBA byte count mismatch. "
             f"Expected {expected_length}, got {len(raw_pixels)}"
         )
 
+    # Fast path used by Blender 5.2 builds with NumPy available.
+    if (
+        np is not None
+        and hasattr(blender_image.pixels, "foreach_get")
+        and hasattr(blender_image.pixels, "foreach_set")
+    ):
+        started = time.perf_counter()
+        cache_key = _dirty_cache_key(
+            blender_image, image_id, sync_token, image_width, image_height
+        )
+        total_values = image_width * image_height * 4
+        cache = _DIRTY_PIXEL_CACHE.get(cache_key)
+
+        read_started = time.perf_counter()
+        if cache is None or int(getattr(cache, "size", 0)) != total_values:
+            # Discard stale runtime/token caches for this GIMP image ID.
+            _drop_dirty_pixel_cache_for_image(image_id)
+            cache = np.empty(total_values, dtype=np.float32)
+            blender_image.pixels.foreach_get(cache)
+            _DIRTY_PIXEL_CACHE[cache_key] = cache
+            cache_hit = False
+        else:
+            cache_hit = True
+        read_ms = (time.perf_counter() - read_started) * 1000.0
+
+        patch_started = time.perf_counter()
+        full = cache.reshape((image_height, image_width, 4))
+        region = np.frombuffer(raw_pixels, dtype=np.uint8).reshape(
+            (region_height, region_width, 4)
+        )
+        # GIMP is top-left origin; Blender's image pixel buffer is bottom-up.
+        blender_row_start = image_height - (y + region_height)
+        blender_row_end = image_height - y
+        full[
+            blender_row_start:blender_row_end,
+            x:x + region_width,
+            :,
+        ] = region[::-1].astype(np.float32) * (1.0 / 255.0)
+        patch_ms = (time.perf_counter() - patch_started) * 1000.0
+
+        write_started = time.perf_counter()
+        blender_image.pixels.foreach_set(cache)
+        write_ms = (time.perf_counter() - write_started) * 1000.0
+
+        update_started = time.perf_counter()
+        blender_image["blendgimp_transport"] = str(
+            dirty_response.get("transport", "dirty-rgba-binary")
+        )
+        blender_image["blendgimp_last_dirty_x"] = x
+        blender_image["blendgimp_last_dirty_y"] = y
+        blender_image["blendgimp_last_dirty_width"] = region_width
+        blender_image["blendgimp_last_dirty_height"] = region_height
+        blender_image.update()
+        update_ms = (time.perf_counter() - update_started) * 1000.0
+        total_ms = (time.perf_counter() - started) * 1000.0
+
+        print(
+            "BLENDGIMP: Fast dirty RGBA publish "
+            f"x={x} y={y} {region_width}x{region_height} "
+            f"cache_hit={cache_hit} read_ms={read_ms:.1f} "
+            f"patch_ms={patch_ms:.1f} foreach_set_ms={write_ms:.1f} "
+            f"image_update_ms={update_ms:.1f} total_ms={total_ms:.1f}"
+        )
+        return blender_image
+
+    # Compatibility fallback for environments without NumPy/foreach_set.
     if np is not None:
-        region_u8 = np.frombuffer(
-            raw_pixels,
-            dtype=np.uint8
-        ).reshape(
-            (
-                region_height,
-                region_width,
-                4,
-            )
+        region_u8 = np.frombuffer(raw_pixels, dtype=np.uint8).reshape(
+            (region_height, region_width, 4)
         )
-
-        region_float = (
-            region_u8.astype(
-                np.float32
-            )
-            * (
-                1.0
-                / 255.0
-            )
-        )
-
-        for source_row in range(
-            region_height
-        ):
-            gimp_y = (
-                y
-                + source_row
-            )
-
-            blender_y = (
-                image_height
-                - 1
-                - gimp_y
-            )
-
-            pixel_start = (
-                (
-                    blender_y
-                    * image_width
-                    + x
-                )
-                * 4
-            )
-
-            pixel_end = (
-                pixel_start
-                + region_width
-                * 4
-            )
-
-            blender_image.pixels[
-                pixel_start:
-                pixel_end
-            ] = region_float[
-                source_row
-            ].reshape(
-                -1
-            )
-
+        region_float = region_u8.astype(np.float32) * (1.0 / 255.0)
+        for source_row in range(region_height):
+            blender_y = image_height - 1 - (y + source_row)
+            pixel_start = ((blender_y * image_width + x) * 4)
+            pixel_end = pixel_start + region_width * 4
+            blender_image.pixels[pixel_start:pixel_end] = region_float[source_row].reshape(-1)
     else:
-        row_bytes = (
-            region_width
-            * 4
-        )
+        row_bytes = region_width * 4
+        for source_row in range(region_height):
+            source_start = source_row * row_bytes
+            source_end = source_start + row_bytes
+            row_float = [value / 255.0 for value in raw_pixels[source_start:source_end]]
+            blender_y = image_height - 1 - (y + source_row)
+            pixel_start = ((blender_y * image_width + x) * 4)
+            pixel_end = pixel_start + region_width * 4
+            blender_image.pixels[pixel_start:pixel_end] = row_float
 
-        for source_row in range(
-            region_height
-        ):
-            source_start = (
-                source_row
-                * row_bytes
-            )
-
-            source_end = (
-                source_start
-                + row_bytes
-            )
-
-            row = raw_pixels[
-                source_start:
-                source_end
-            ]
-
-            row_float = [
-                value / 255.0
-                for value in row
-            ]
-
-            gimp_y = (
-                y
-                + source_row
-            )
-
-            blender_y = (
-                image_height
-                - 1
-                - gimp_y
-            )
-
-            pixel_start = (
-                (
-                    blender_y
-                    * image_width
-                    + x
-                )
-                * 4
-            )
-
-            pixel_end = (
-                pixel_start
-                + region_width
-                * 4
-            )
-
-            blender_image.pixels[
-                pixel_start:
-                pixel_end
-            ] = row_float
-
-    blender_image[
-        "blendgimp_transport"
-    ] = str(
-        dirty_response.get(
-            "transport",
-            "dirty-rgba-json"
-        )
+    blender_image["blendgimp_transport"] = str(
+        dirty_response.get("transport", "dirty-rgba-json")
     )
-
-    blender_image[
-        "blendgimp_last_dirty_x"
-    ] = x
-
-    blender_image[
-        "blendgimp_last_dirty_y"
-    ] = y
-
-    blender_image[
-        "blendgimp_last_dirty_width"
-    ] = region_width
-
-    blender_image[
-        "blendgimp_last_dirty_height"
-    ] = region_height
-
+    blender_image["blendgimp_last_dirty_x"] = x
+    blender_image["blendgimp_last_dirty_y"] = y
+    blender_image["blendgimp_last_dirty_width"] = region_width
+    blender_image["blendgimp_last_dirty_height"] = region_height
     blender_image.update()
-
     return blender_image
-
 
 def get_or_reload_blender_image(
     export_response
@@ -3383,6 +3592,26 @@ def synchronize_gimp_composite(
             f"Assigned to material = {assignment.get('material')}"
         )
 
+    # First full/material synchronization also prepares the reusable raw-layer
+    # Blender paint target. Dirty-only refreshes keep using rectangle patches.
+    if assign_material and (
+        not bool(getattr(scene, "blendgimp_blender_paint_sync_enabled", False))
+        or int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) != int(image_id)
+        or _find_blendgimp_active_layer_buffer(image_id) is None
+    ):
+        try:
+            target = resolve_gimp_paint_target(scene, image_id, create_if_missing=True)
+            load_active_layer_buffer_from_gimp(
+                scene, image_id, int(target["layer_id"]),
+                clear_first=True, activate_target=True
+            )
+            print(
+                "BLENDGIMP: Unified Paint Sync initialized automatically "
+                f"for image ID {image_id} layer ID {int(target['layer_id'])}"
+            )
+        except Exception as sync_exc:
+            print(f"BLENDGIMP: Unified Paint Sync initialization warning: {sync_exc}")
+
     update_blender_paint_sync_baseline(
         image_id,
         blender_image
@@ -3452,22 +3681,10 @@ def blendgimp_blender_paint_sync_timer():
         )
         return BLENDER_PAINT_SYNC_POLL_INTERVAL
 
-    active_object = getattr(
-        bpy.context,
-        "active_object",
-        None
+    active_object = getattr(bpy.context, "active_object", None)
+    in_texture_paint = (
+        active_object is not None and str(active_object.mode) == "TEXTURE_PAINT"
     )
-
-    if (
-        active_object is None
-        or str(
-            active_object.mode
-        ) != "TEXTURE_PAINT"
-    ):
-        scene.blendgimp_blender_paint_sync_status = (
-            "Waiting for Texture Paint mode"
-        )
-        return BLENDER_PAINT_SYNC_POLL_INTERVAL
 
     sync_result = (
         get_texture_sync_result(
@@ -3477,19 +3694,30 @@ def blendgimp_blender_paint_sync_timer():
         or {}
     )
 
-    blender_image = _find_blendgimp_image(
-        image_id,
-        sync_result.get(
-            "sync_token",
-            ""
-        )
-    )
+    blender_image = _active_layer_buffer_for_sync(scene, image_id)
 
     if blender_image is None:
-        scene.blendgimp_blender_paint_sync_status = (
-            "Refresh From GIMP first"
-        )
-        return BLENDER_PAINT_SYNC_POLL_INTERVAL
+        scene.blendgimp_blender_paint_sync_status = "Loading active GIMP layer"
+        try:
+            target = resolve_gimp_paint_target(scene, image_id, create_if_missing=True)
+            blender_image = load_active_layer_buffer_from_gimp(
+                scene, image_id, int(target["layer_id"]), clear_first=True
+            )
+        except Exception as exc:
+            scene.blendgimp_blender_paint_sync_status = f"Active layer load failed: {exc}"
+            return 1.0
+
+    if in_texture_paint:
+        try:
+            composite_image = _find_blendgimp_image(
+                image_id, sync_result.get("sync_token", "")
+            )
+            if composite_image is not None:
+                _ensure_active_layer_paint_node(
+                    bpy.context, composite_image, blender_image, image_id
+                )
+        except Exception as exc:
+            print(f"BLENDGIMP: Active Layer paint target selection warning: {exc}")
 
     try:
 
@@ -3636,11 +3864,9 @@ def blendgimp_blender_paint_sync_timer():
         "pending_bbox"
     ]
 
-    debounce = max(
-        0.1,
-        float(
-            scene.blendgimp_blender_paint_sync_debounce
-        )
+    debounce = (
+        max(0.1, float(scene.blendgimp_blender_paint_sync_debounce))
+        if in_texture_paint else 0.0
     )
 
     elapsed = (
@@ -3681,27 +3907,9 @@ def blendgimp_blender_paint_sync_timer():
 
     try:
 
-        layer_response = resolve_gimp_paint_target(
-            scene,
-            image_id,
-            create_if_missing=True
-        )
-
-        layer_id = int(
-            layer_response["layer_id"]
-        )
-
-        if int(
-            scene.blendgimp_blender_paint_sync_layer_id
-        ) != layer_id:
-            print(
-                "BLENDGIMP: "
-                f"3D Paint Sync target changed to selected GIMP layer "
-                f"ID {layer_id} ({layer_response.get('name', '')})"
-            )
-
-        scene.blendgimp_blender_paint_sync_layer_id = layer_id
-        _BLENDER_PAINT_SYNC_RUNTIME["layer_id"] = layer_id
+        layer_id = int(scene.blendgimp_blender_paint_sync_layer_id)
+        if layer_id < 0:
+            raise RuntimeError("No active GIMP raster layer is bound to the Blender paint buffer")
 
         try:
 
@@ -3790,7 +3998,7 @@ def blendgimp_blender_paint_sync_timer():
 
         print(
             "BLENDGIMP: "
-            "3D Paint Sync pushed "
+            "Unified Paint Sync pushed "
             f"x={x} y={y} "
             f"{region_width}x{region_height} "
             f"{len(region_pixels)} raw RGBA bytes "
@@ -3811,7 +4019,7 @@ def blendgimp_blender_paint_sync_timer():
 
         print(
             "BLENDGIMP: "
-            f"3D Paint Sync failed: {exc}"
+            f"Unified Paint Sync failed: {exc}"
         )
 
         return 1.0
@@ -6126,6 +6334,91 @@ class BLENDGIMP_OT_refresh_from_gimp(
 # DIRECT GIMP PAINT LIVE VIEWPORT FEEDBACK
 # ============================================================
 
+_DIRECT_OBJECT_REDRAW_PENDING = False
+
+
+def _tag_object_paint_viewports_for_redraw():
+    """Tag every visible VIEW_3D window region, not only operator context."""
+    redraw_count = 0
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        return redraw_count
+
+    for window in list(getattr(window_manager, "windows", ())):
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            try:
+                area.tag_redraw()
+                redraw_count += 1
+            except Exception:
+                pass
+            for region in area.regions:
+                if region.type != "WINDOW":
+                    continue
+                try:
+                    region.tag_redraw()
+                except Exception:
+                    pass
+
+    return redraw_count
+
+
+def _deferred_object_paint_redraw():
+    """One-shot redraw after the modal/operator event returns to Blender."""
+    global _DIRECT_OBJECT_REDRAW_PENDING
+    _DIRECT_OBJECT_REDRAW_PENDING = False
+    _tag_object_paint_viewports_for_redraw()
+    return None
+
+
+def _force_object_paint_texture_redraw(blender_image):
+    """Invalidate the material's GPU image cache and schedule a real redraw.
+
+    Image.update() refreshes Blender's display buffer, but Material Preview can
+    continue sampling an already-cached GPU texture.  Freeing that GPU copy
+    forces the next VIEW_3D draw to rebuild it from the updated image buffer.
+    The zero-delay app timer guarantees another redraw after the current modal
+    event/operator has returned, which avoids relying on mouse orbit/pan events.
+    """
+    global _DIRECT_OBJECT_REDRAW_PENDING
+
+    gpu_invalidated = False
+    if blender_image is not None:
+        try:
+            blender_image.gl_free()
+            gpu_invalidated = True
+        except Exception as exc:
+            print(
+                "BLENDGIMP: Object Paint GPU texture invalidation failed: "
+                f"{exc}"
+            )
+        try:
+            blender_image.update_tag()
+        except Exception:
+            pass
+
+    redraw_count = _tag_object_paint_viewports_for_redraw()
+
+    if not _DIRECT_OBJECT_REDRAW_PENDING:
+        _DIRECT_OBJECT_REDRAW_PENDING = True
+        try:
+            bpy.app.timers.register(
+                _deferred_object_paint_redraw,
+                first_interval=0.0,
+            )
+        except Exception as exc:
+            _DIRECT_OBJECT_REDRAW_PENDING = False
+            print(
+                "BLENDGIMP: Object Paint deferred redraw scheduling failed: "
+                f"{exc}"
+            )
+
+    return gpu_invalidated, redraw_count
+
 class BLENDGIMP_OT_direct_live_refresh(
     bpy.types.Operator
 ):
@@ -6151,12 +6444,10 @@ class BLENDGIMP_OT_direct_live_refresh(
             return {"CANCELLED"}
 
         try:
-
+            started = time.perf_counter()
             result = synchronize_gimp_composite(
                 context,
-                int(
-                    self.image_id
-                ),
+                int(self.image_id),
                 assign_material=False,
                 dirty_only=True
             )
@@ -6166,93 +6457,64 @@ class BLENDGIMP_OT_direct_live_refresh(
                 {}
             )
 
-            if transport_response.get(
-                "changed",
-                False
-            ):
-
+            if transport_response.get("changed", False):
+                # Keep Blender's reusable raw-layer paint target coherent with
+                # the GIMP edit, using only the same dirty rectangle.
+                try:
+                    sync_layer_id = int(getattr(
+                        context.scene, "blendgimp_blender_paint_sync_layer_id", -1
+                    ))
+                    if sync_layer_id >= 0:
+                        x = int(transport_response.get("x", 0))
+                        y = int(transport_response.get("y", 0))
+                        rw = int(transport_response.get("region_width", 0))
+                        rh = int(transport_response.get("region_height", 0))
+                        if rw > 0 and rh > 0:
+                            layer_pixels = connection_manager.get_layer_pixels_binary(
+                                int(self.image_id), sync_layer_id, x, y, rw, rh
+                            )
+                            apply_active_layer_buffer_response(
+                                context.scene, int(self.image_id), sync_layer_id,
+                                layer_pixels, clear_first=False, activate_target=False
+                            )
+                except Exception as layer_exc:
+                    print(
+                        "BLENDGIMP: Active Layer Buffer live patch warning: "
+                        f"{layer_exc}"
+                    )
+                blender_image = result.get("blender_image")
+                gpu_invalidated, redraw_views = (
+                    _force_object_paint_texture_redraw(blender_image)
+                )
                 print(
                     "BLENDGIMP: "
                     "Direct live viewport feedback applied "
                     f"x={transport_response.get('x', 0)} "
                     f"y={transport_response.get('y', 0)} "
                     f"{transport_response.get('region_width', 0)}x"
-                    f"{transport_response.get('region_height', 0)}"
+                    f"{transport_response.get('region_height', 0)} "
+                    f"gpu_invalidated={gpu_invalidated} "
+                    f"redraw_views={redraw_views} "
+                    f"total_ms={(time.perf_counter() - started) * 1000.0:.1f}"
                 )
 
-            # Consume/acknowledge the observer revision associated with the
-            # pixels we just applied. This is lightweight compared with the
-            # composite read that already happened above and prevents normal
-            # Auto Sync from performing another dirty composite check for the
-            # same direct-paint chunk.
-            state = connection_manager.get_image_state(
-                int(
-                    self.image_id
-                )
-            )
+            # Phase 6.2.10: Do not issue GET_IMAGE_STATE after every live
+            # chunk. Direct Paint already owns Auto Sync refreshes for the
+            # duration of the modal tool, so that second synchronous socket
+            # round trip was pure interaction latency. Auto Sync catches up
+            # once ownership is released.
+            context.scene.blendgimp_connected = True
 
-            revision = int(
-                state.get(
-                    "revision",
-                    0
-                )
-            )
-
-            _AUTO_SYNC_RUNTIME[
-                "image_id"
-            ] = int(
-                self.image_id
-            )
-
-            _AUTO_SYNC_RUNTIME[
-                "last_seen_revision"
-            ] = revision
-
-            _AUTO_SYNC_RUNTIME[
-                "last_synced_revision"
-            ] = revision
-
-            _AUTO_SYNC_RUNTIME[
-                "pending_revision"
-            ] = None
-
-            _AUTO_SYNC_RUNTIME[
-                "pending_since"
-            ] = 0.0
-
-            scene = context.scene
-
-            scene.blendgimp_auto_sync_revision = (
-                revision
-            )
-
-            detector = str(
-                state.get(
-                    "detector",
-                    ""
-                )
-            )
-
-            if (
-                detector
-                and hasattr(
-                    scene,
-                    "blendgimp_auto_sync_detector"
-                )
-            ):
-                scene.blendgimp_auto_sync_detector = (
-                    detector
-                )
+            if context.area is not None:
+                context.area.tag_redraw()
 
             return {"FINISHED"}
 
         except Exception as exc:
-
             print(
                 "BLENDGIMP: "
                 f"Direct live viewport feedback failed: {exc}"
             )
-
             return {"CANCELLED"}
 
 
@@ -6474,7 +6736,7 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
 ):
 
     bl_idname = "blendgimp.toggle_blender_paint_sync"
-    bl_label = "Toggle 3D Paint Sync"
+    bl_label = "Toggle Unified Paint Sync"
 
     bl_description = (
         "Automatically push Blender Texture Paint changes into the selected "
@@ -6525,12 +6787,12 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
 
             print(
                 "BLENDGIMP: "
-                "3D Paint Sync disabled"
+                "Unified Paint Sync disabled"
             )
 
             self.report(
                 {"INFO"},
-                "3D Paint Sync disabled"
+                "Unified Paint Sync disabled"
             )
 
             return {"FINISHED"}
@@ -6587,15 +6849,12 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
                 ]
             )
 
-            width, height, baseline = (
-                _blender_image_to_top_left_rgba8(
-                    blender_image
-                )
+            buffer_image = load_active_layer_buffer_from_gimp(
+                scene, image_id, layer_id, clear_first=True, activate_target=True
             )
+            width, height, baseline = _blender_image_to_top_left_rgba8(buffer_image)
 
-            scene.blendgimp_blender_paint_sync_enabled = (
-                True
-            )
+            scene.blendgimp_blender_paint_sync_enabled = True
 
             scene.blendgimp_blender_paint_sync_image_id = (
                 image_id
@@ -6624,7 +6883,7 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
             self.report(
                 {"INFO"},
                 (
-                    "3D Paint Sync enabled - "
+                    "Unified Paint Sync enabled - "
                     f"GIMP layer {layer_response.get('name')}"
                 )
             )
@@ -6640,7 +6899,7 @@ class BLENDGIMP_OT_toggle_blender_paint_sync(
 
             self.report(
                 {"ERROR"},
-                f"3D Paint Sync failed: {exc}"
+                f"Unified Paint Sync failed: {exc}"
             )
 
             return {"CANCELLED"}
@@ -6654,8 +6913,7 @@ class BLENDGIMP_OT_push_to_gimp(
     bl_label = "Push Blender Texture to GIMP"
 
     bl_description = (
-        "Write the synchronized Blender Image into the currently selected "
-        "raster layer in GIMP"
+        "Write the reusable Blender Active Layer Buffer into its bound GIMP raster layer"
     )
 
     image_id: bpy.props.IntProperty(
@@ -6694,13 +6952,11 @@ class BLENDGIMP_OT_push_to_gimp(
                 or {}
             )
 
-            blender_image = _find_blendgimp_image(
-                image_id,
-                sync_result.get(
-                    "sync_token",
-                    ""
+            blender_image = _active_layer_buffer_for_sync(scene, image_id)
+            if blender_image is None:
+                raise RuntimeError(
+                    "Unified Paint Sync active-layer buffer is not loaded"
                 )
-            )
 
             if blender_image is None:
 
@@ -6965,6 +7221,9 @@ class BLENDGIMP_OT_set_active_layer(
 
         try:
 
+            flush_blender_paint_changes(
+                scene, reason="before GIMP layer switch", fail_if_unsent=True
+            )
             connection_manager.set_active_layer(
                 self.image_id,
                 self.layer_id
@@ -6975,19 +7234,9 @@ class BLENDGIMP_OT_set_active_layer(
                 self.image_id
             )
 
-            if (
-                scene.blendgimp_blender_paint_sync_enabled
-                and int(scene.blendgimp_blender_paint_sync_image_id)
-                == int(self.image_id)
-            ):
-                scene.blendgimp_blender_paint_sync_layer_id = int(
-                    self.layer_id
-                )
-                _BLENDER_PAINT_SYNC_RUNTIME["layer_id"] = int(
-                    self.layer_id
-                )
-                scene.blendgimp_blender_paint_sync_status = (
-                    f"Target layer {self.layer_id}"
+            if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) == int(self.image_id):
+                load_active_layer_buffer_from_gimp(
+                    scene, self.image_id, self.layer_id, clear_first=True, activate_target=True
                 )
 
             scene.blendgimp_connected = True
@@ -8370,7 +8619,7 @@ class BLENDGIMP_PT_main_panel(
         # ====================================================
 
         layout.label(
-            text="BlendGimp 0.1.0"
+            text="BlendGimp 0.4.0"
         )
 
         layout.separator()
@@ -9067,9 +9316,9 @@ class BLENDGIMP_PT_main_panel(
                                 image_box.operator(
                                     "blendgimp.toggle_blender_paint_sync",
                                     text=(
-                                        "Disable 3D Paint Sync"
+                                        "Disable Unified Paint Sync"
                                         if paint_sync_active
-                                        else "Enable 3D Paint Sync"
+                                        else "Enable Unified Paint Sync"
                                     ),
                                     icon=(
                                         "PAUSE"
@@ -9087,7 +9336,7 @@ class BLENDGIMP_PT_main_panel(
 
                                 image_box.label(
                                     text=(
-                                        "3D Paint Sync: "
+                                        "Unified Paint Sync: "
                                         f"{scene.blendgimp_blender_paint_sync_status}"
                                     ),
                                     icon="CHECKMARK"
@@ -9561,6 +9810,70 @@ def blendgimp_exit_pre(_is_user_exit):
     )
 
 
+@persistent
+def blendgimp_undo_redo_post(_scene_arg=None):
+    """Repair transient BlendGimp paint ownership after Blender Undo/Redo.
+
+    GIMP raster operations are external to Blender's undo stack, while the
+    reusable active-layer buffer and material paint-slot selection are Blender
+    data. Undo/Redo must therefore never leave stale modal flags or a missing
+    paint target behind. The existing runtime baseline is intentionally kept:
+    if Blender actually undid pixels in the working buffer, the normal Unified
+    Paint Sync timer will detect that delta and send the undone pixels to GIMP.
+    """
+    try:
+        scene = getattr(bpy.context, "scene", None)
+        if scene is None:
+            return
+
+        try:
+            scene["blendgimp_paint_cancel_serial"] = int(
+                scene.get("blendgimp_paint_cancel_serial", 0)
+            ) + 1
+        except Exception:
+            pass
+
+        if hasattr(scene, "blendgimp_2d_paint_active"):
+            scene.blendgimp_2d_paint_active = False
+        if hasattr(scene, "blendgimp_2d_paint_layer_id"):
+            scene.blendgimp_2d_paint_layer_id = -1
+        if hasattr(scene, "blendgimp_direct_paint_active"):
+            scene.blendgimp_direct_paint_active = False
+        if hasattr(scene, "blendgimp_direct_paint_image_id"):
+            scene.blendgimp_direct_paint_image_id = -1
+        set_direct_paint_refresh_owner(False)
+
+        runtime_image = int(_BLENDER_PAINT_SYNC_RUNTIME.get("image_id", -1))
+        runtime_layer = int(_BLENDER_PAINT_SYNC_RUNTIME.get("layer_id", -1))
+        if runtime_image < 0 or runtime_layer < 0:
+            return
+
+        if hasattr(scene, "blendgimp_blender_paint_sync_enabled"):
+            scene.blendgimp_blender_paint_sync_enabled = True
+        if hasattr(scene, "blendgimp_blender_paint_sync_image_id"):
+            scene.blendgimp_blender_paint_sync_image_id = runtime_image
+        if hasattr(scene, "blendgimp_blender_paint_sync_layer_id"):
+            scene.blendgimp_blender_paint_sync_layer_id = runtime_layer
+
+        buffer_image = _active_layer_buffer_for_sync(scene, runtime_image)
+        sync_result = get_texture_sync_result(scene, runtime_image) or {}
+        composite = _find_blendgimp_image(runtime_image, sync_result.get("sync_token", ""))
+        if buffer_image is not None and composite is not None:
+            _ensure_active_layer_paint_node(
+                bpy.context, composite, buffer_image, runtime_image
+            )
+            _BLENDER_PAINT_SYNC_RUNTIME["buffer_image_name"] = buffer_image.name
+            scene.blendgimp_blender_paint_sync_status = (
+                "Undo/Redo recovered — checking Blender layer changes"
+            )
+            print(
+                "BLENDGIMP: Undo/Redo recovery restored active-layer paint target "
+                f"image ID {runtime_image} layer ID {runtime_layer}"
+            )
+    except Exception as exc:
+        print(f"BLENDGIMP: Undo/Redo recovery warning: {exc}")
+
+
 def register():
 
     global _EXIT_PRE_HANDLED
@@ -9581,6 +9894,10 @@ def register():
 
     if blendgimp_exit_pre not in bpy.app.handlers.exit_pre:
         bpy.app.handlers.exit_pre.append(blendgimp_exit_pre)
+    if blendgimp_undo_redo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(blendgimp_undo_redo_post)
+    if blendgimp_undo_redo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(blendgimp_undo_redo_post)
 
     bpy.types.Scene.blendgimp_engine_mode = (
         bpy.props.EnumProperty(
@@ -10014,7 +10331,7 @@ def register():
 
     bpy.types.Scene.blendgimp_blender_paint_sync_enabled = (
         bpy.props.BoolProperty(
-            name="3D Paint Sync",
+            name="Unified Paint Sync",
             default=False,
             options={"SKIP_SAVE"}
         )
@@ -10046,13 +10363,13 @@ def register():
 
     bpy.types.Scene.blendgimp_blender_paint_sync_debounce = (
         bpy.props.FloatProperty(
-            name="3D Paint Sync Delay",
+            name="Unified Paint Sync Delay",
             description=(
                 "Wait this long after the most recent Blender Texture Paint "
                 "change before pushing its dirty region to GIMP"
             ),
-            default=0.4,
-            min=0.1,
+            default=0.12,
+            min=0.05,
             max=5.0,
             precision=2,
             options={"SKIP_SAVE"}
@@ -10176,6 +10493,13 @@ def unregister():
     try:
         if blendgimp_exit_pre in bpy.app.handlers.exit_pre:
             bpy.app.handlers.exit_pre.remove(blendgimp_exit_pre)
+    except Exception:
+        pass
+    try:
+        if blendgimp_undo_redo_post in bpy.app.handlers.undo_post:
+            bpy.app.handlers.undo_post.remove(blendgimp_undo_redo_post)
+        if blendgimp_undo_redo_post in bpy.app.handlers.redo_post:
+            bpy.app.handlers.redo_post.remove(blendgimp_undo_redo_post)
     except Exception:
         pass
 

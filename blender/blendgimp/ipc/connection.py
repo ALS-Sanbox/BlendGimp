@@ -1,10 +1,29 @@
 import json
 import socket
+import threading
+from functools import wraps
 
 
 # ============================================================
 # BlendGimp IPC
 # ============================================================
+
+
+def _serialized_io(method):
+    """Serialize access to the one persistent Blender<->GIMP socket.
+
+    Phase 6.2.4 moves 2D painting IPC to a background worker so Blender's UI
+    thread never waits on stroke/dirty-pixel round trips.  GIMP lifecycle and
+    heartbeat code still use this same connection from Blender's main thread,
+    therefore every socket transaction must remain strictly ordered.
+    """
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._io_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -25,56 +44,66 @@ PROTOCOL_VERSION = 1
 _DIRECT_PAINT_REFRESH_RUNTIME = {
     "active": False,
     "image_id": -1,
+    "owners": {},
 }
+
+
+def _sync_direct_paint_refresh_summary():
+    owners = _DIRECT_PAINT_REFRESH_RUNTIME.setdefault("owners", {})
+    _DIRECT_PAINT_REFRESH_RUNTIME["active"] = bool(owners)
+    if not owners:
+        _DIRECT_PAINT_REFRESH_RUNTIME["image_id"] = -1
+        return
+    image_ids = {int(value) for value in owners.values()}
+    _DIRECT_PAINT_REFRESH_RUNTIME["image_id"] = (
+        next(iter(image_ids)) if len(image_ids) == 1 else -1
+    )
 
 
 def set_direct_paint_refresh_owner(
     active,
-    image_id=-1
+    image_id=-1,
+    owner=None,
 ):
-    _DIRECT_PAINT_REFRESH_RUNTIME[
-        "active"
-    ] = bool(
-        active
-    )
+    """Acquire/release Auto Sync refresh ownership.
 
-    _DIRECT_PAINT_REFRESH_RUNTIME[
-        "image_id"
-    ] = (
-        int(
-            image_id
-        )
-        if active
-        else -1
-    )
+    Phase 6.3.7 can keep Texture Paint and Object Paint modal routers armed at
+    the same time. Named owners prevent one idle/modal teardown from clearing
+    another active stroke's refresh lock. Legacy callers that omit ``owner``
+    retain the old semantics: ``False`` clears all ownership.
+    """
+    owners = _DIRECT_PAINT_REFRESH_RUNTIME.setdefault("owners", {})
+    if owner is None:
+        key = "__legacy__"
+        if active:
+            owners[key] = int(image_id)
+        else:
+            owners.clear()
+    else:
+        key = str(owner)
+        if active:
+            owners[key] = int(image_id)
+        else:
+            owners.pop(key, None)
+    _sync_direct_paint_refresh_summary()
 
 
 def direct_paint_owns_refresh(
     image_id=None
 ):
-    if not _DIRECT_PAINT_REFRESH_RUNTIME.get(
-        "active",
-        False
-    ):
+    owners = _DIRECT_PAINT_REFRESH_RUNTIME.setdefault("owners", {})
+    if not owners:
         return False
-
     if image_id is None:
         return True
-
-    return int(
-        _DIRECT_PAINT_REFRESH_RUNTIME.get(
-            "image_id",
-            -1
-        )
-    ) == int(
-        image_id
-    )
+    target = int(image_id)
+    return any(int(value) == target for value in owners.values())
 
 
 def get_direct_paint_refresh_owner():
-    return dict(
-        _DIRECT_PAINT_REFRESH_RUNTIME
-    )
+    snapshot = dict(_DIRECT_PAINT_REFRESH_RUNTIME)
+    snapshot["owners"] = dict(_DIRECT_PAINT_REFRESH_RUNTIME.get("owners", {}))
+    return snapshot
 
 BLENDGIMP_VERSION = "0.1.0"
 
@@ -134,6 +163,11 @@ class BlendGimpConnection:
 
     def __init__(self):
 
+        # The connection is shared by Blender's main thread and the Phase
+        # 6.2.4 Texture Paint IPC worker. RLock allows connect/disconnect to
+        # call other serialized methods without deadlocking.
+        self._io_lock = threading.RLock()
+
         self.socket = None
         self.receive_buffer = b""
 
@@ -171,6 +205,7 @@ class BlendGimpConnection:
     # CONNECT
     # ========================================================
 
+    @_serialized_io
     def connect(self):
 
         # ----------------------------------------------------
@@ -317,6 +352,7 @@ class BlendGimpConnection:
     # REQUEST
     # ========================================================
 
+    @_serialized_io
     def request(
         self,
         message,
@@ -413,6 +449,7 @@ class BlendGimpConnection:
     # BINARY PAYLOAD REQUEST
     # ========================================================
 
+    @_serialized_io
     def _send_binary_request(
         self,
         message,
@@ -501,6 +538,15 @@ class BlendGimpConnection:
                 f"{response.get('type')}"
             )
 
+            # Some write commands return a recomposited dirty rectangle in
+            # the same round trip. Preserve compatibility with JSON-only
+            # acknowledgements while consuming binary data when declared.
+            if response.get("binary_payload", False):
+                binary_length = int(response.get("binary_length", 0))
+                if binary_length < 0:
+                    raise RuntimeError("GIMP returned a negative binary payload length")
+                response["pixels_raw"] = self._receive_exact_bytes(binary_length)
+
             return response
 
         except Exception:
@@ -525,6 +571,7 @@ class BlendGimpConnection:
     # BINARY RESPONSE REQUEST
     # ========================================================
 
+    @_serialized_io
     def _request_binary(
         self,
         message,
@@ -1856,6 +1903,52 @@ class BlendGimpConnection:
             raise RuntimeError(response.get("error", "GET_BRUSHES failed"))
         return response
 
+    def get_dynamics(self):
+        response = self.request(
+            {
+                "type": "GET_DYNAMICS",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": self._next_request_id("get-dynamics"),
+            },
+            timeout=5.0,
+        )
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+        if response.get("type") != "DYNAMICS":
+            raise RuntimeError(f"Unexpected GET_DYNAMICS response: {response.get('type')}")
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "GET_DYNAMICS failed"))
+        return response
+
+    def set_dynamics(self, name):
+        response = self.request(
+            {
+                "type": "SET_DYNAMICS",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "name": str(name or ""),
+                "request_id": self._next_request_id("set-dynamics"),
+            },
+            timeout=5.0,
+        )
+        self._validate_write_response(response, expected_type="BRUSH_STATE_SET")
+        return response
+
+    def set_dynamics_enabled(self, enabled):
+        response = self.request(
+            {
+                "type": "SET_DYNAMICS_ENABLED",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "enabled": bool(enabled),
+                "request_id": self._next_request_id("set-dynamics-enabled"),
+            },
+            timeout=5.0,
+        )
+        self._validate_write_response(response, expected_type="BRUSH_STATE_SET")
+        return response
+
     def get_brush_state(
         self
     ):
@@ -1902,32 +1995,143 @@ class BlendGimpConnection:
 
         return response
 
+    def bucket_fill(
+        self,
+        image_id,
+        layer_id,
+        x,
+        y,
+        fill_type="FOREGROUND",
+    ):
+        response = self.request(
+            {
+                "type": "BUCKET_FILL",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "image_id": int(image_id),
+                "layer_id": int(layer_id),
+                "x": float(x),
+                "y": float(y),
+                "fill_type": str(fill_type or "FOREGROUND").upper(),
+                "request_id": self._next_request_id("bucket-fill"),
+            },
+            timeout=15.0,
+        )
+
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+
+        if response.get("type") != "BUCKET_FILLED":
+            raise RuntimeError(
+                "Unexpected BUCKET_FILL response: "
+                f"{response.get('type')}"
+            )
+
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "BUCKET_FILL failed"))
+
+        return response
+
+    def get_gradients(self):
+        response = self.request(
+            {
+                "type": "GET_GRADIENTS",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "request_id": self._next_request_id("get-gradients"),
+            },
+            timeout=10.0,
+        )
+
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+        if response.get("type") != "GRADIENTS":
+            raise RuntimeError(
+                "Unexpected GET_GRADIENTS response: "
+                f"{response.get('type')}"
+            )
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "GET_GRADIENTS failed"))
+        return response
+
+    def gradient_fill(
+        self,
+        image_id,
+        layer_id,
+        x1,
+        y1,
+        x2,
+        y2,
+        gradient_source="FG_BG",
+        gradient_name="",
+        gradient_type="LINEAR",
+        reverse=False,
+        repeat_mode="NONE",
+    ):
+        response = self.request(
+            {
+                "type": "GRADIENT_FILL",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "image_id": int(image_id),
+                "layer_id": int(layer_id),
+                "x1": float(x1),
+                "y1": float(y1),
+                "x2": float(x2),
+                "y2": float(y2),
+                "gradient_source": str(gradient_source or "FG_BG").upper(),
+                "gradient_name": str(gradient_name or ""),
+                "gradient_type": str(gradient_type or "LINEAR").upper(),
+                "reverse": bool(reverse),
+                "repeat_mode": str(repeat_mode or "NONE").upper(),
+                "request_id": self._next_request_id("gradient-fill"),
+            },
+            timeout=20.0,
+        )
+
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+        if response.get("type") != "GRADIENT_FILLED":
+            raise RuntimeError(
+                "Unexpected GRADIENT_FILL response: "
+                f"{response.get('type')}"
+            )
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "GRADIENT_FILL failed"))
+        return response
+
     def begin_paint_stroke(
         self,
         image_id,
         layer_id,
         stroke_id,
-        tool="PAINTBRUSH"
+        tool="PAINTBRUSH",
+        source_image_id=None,
+        source_layer_id=None,
+        source_x=None,
+        source_y=None,
     ):
+        payload = {
+            "type": "BEGIN_PAINT_STROKE",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "stroke_id": str(stroke_id),
+            "tool": str(tool or "PAINTBRUSH").upper(),
+            "request_id": self._next_request_id("begin-paint-stroke"),
+        }
+        if source_image_id is not None:
+            payload["source_image_id"] = int(source_image_id)
+        if source_layer_id is not None:
+            payload["source_layer_id"] = int(source_layer_id)
+        if source_x is not None:
+            payload["source_x"] = float(source_x)
+        if source_y is not None:
+            payload["source_y"] = float(source_y)
+
         response = self.request(
-            {
-                "type": "BEGIN_PAINT_STROKE",
-                "component": "blender",
-                "protocol": PROTOCOL_VERSION,
-                "image_id": int(
-                    image_id
-                ),
-                "layer_id": int(
-                    layer_id
-                ),
-                "stroke_id": str(
-                    stroke_id
-                ),
-                "tool": str(tool or "PAINTBRUSH").upper(),
-                "request_id": self._next_request_id(
-                    "begin-paint-stroke"
-                ),
-            },
+            payload,
             timeout=5.0
         )
 
@@ -1956,7 +2160,8 @@ class BlendGimpConnection:
         image_id,
         layer_id,
         stroke_id,
-        strokes
+        strokes,
+        input_samples=None
     ):
         coordinates = [
             float(
@@ -1974,25 +2179,21 @@ class BlendGimpConnection:
                 "point_count": 0,
             }
 
+        payload = {
+            "type": "PAINT_STROKE_CHUNK",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "stroke_id": str(stroke_id),
+            "strokes": coordinates,
+            "request_id": self._next_request_id("paint-stroke-chunk"),
+        }
+        if input_samples is not None:
+            payload["input_samples"] = list(input_samples)
+
         response = self.request(
-            {
-                "type": "PAINT_STROKE_CHUNK",
-                "component": "blender",
-                "protocol": PROTOCOL_VERSION,
-                "image_id": int(
-                    image_id
-                ),
-                "layer_id": int(
-                    layer_id
-                ),
-                "stroke_id": str(
-                    stroke_id
-                ),
-                "strokes": coordinates,
-                "request_id": self._next_request_id(
-                    "paint-stroke-chunk"
-                ),
-            },
+            payload,
             timeout=10.0
         )
 
@@ -2021,7 +2222,8 @@ class BlendGimpConnection:
         image_id,
         layer_id,
         stroke_id,
-        segments
+        segments,
+        input_segments=None
     ):
         """Send several disconnected, topology-safe segments in one packet."""
 
@@ -2050,8 +2252,7 @@ class BlendGimpConnection:
                 "segment_count": 0,
             }
 
-        response = self.request(
-            {
+        payload = {
                 "type": "PAINT_STROKE_CHUNK",
                 "component": "blender",
                 "protocol": PROTOCOL_VERSION,
@@ -2068,7 +2269,12 @@ class BlendGimpConnection:
                 "request_id": self._next_request_id(
                     "paint-stroke-segments-chunk"
                 ),
-            },
+            }
+        if input_segments is not None:
+            payload["input_segments"] = [list(segment) for segment in input_segments]
+
+        response = self.request(
+            payload,
             timeout=10.0
         )
 
@@ -2380,6 +2586,67 @@ class BlendGimpConnection:
                 )
             )
 
+        if response.get("binary_payload", False):
+            expected = int(response.get("composite_byte_length", response.get("binary_length", -1)))
+            actual = len(response.get("pixels_raw", b""))
+            if expected != actual:
+                raise RuntimeError(
+                    "Blender-originated composite patch length mismatch. "
+                    f"Expected {expected}, got {actual}"
+                )
+
+        return response
+
+
+    # ========================================================
+    # GET GIMP LAYER PIXELS
+    # ========================================================
+
+    def get_layer_pixels_binary(
+        self,
+        image_id,
+        layer_id,
+        x=None,
+        y=None,
+        width=None,
+        height=None,
+    ):
+        """Read raw raster-layer pixels in image-space coordinates."""
+
+        request = {
+            "type": "GET_LAYER_PIXELS_BINARY",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "request_id": self._next_request_id("get-layer-pixels-binary"),
+        }
+        if x is not None:
+            request["x"] = int(x)
+        if y is not None:
+            request["y"] = int(y)
+        if width is not None:
+            request["width"] = int(width)
+        if height is not None:
+            request["height"] = int(height)
+
+        response = self._request_binary(request, timeout=GET_IMAGE_PIXELS_TIMEOUT)
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+        if response.get("type") != "LAYER_PIXELS_BINARY":
+            raise RuntimeError(
+                "Unexpected binary layer-pixel response: "
+                f"{response.get('type')}"
+            )
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "GET_LAYER_PIXELS_BINARY failed"))
+        expected = int(response.get("byte_length", -1))
+        actual = len(response.get("pixels_raw", b""))
+        if expected != actual:
+            raise RuntimeError(
+                "Binary layer payload length mismatch. "
+                f"Expected {expected}, got {actual}"
+            )
         return response
 
 
@@ -2389,7 +2656,9 @@ class BlendGimpConnection:
 
     def get_image_dirty_pixels_binary(
         self,
-        image_id
+        image_id,
+        *,
+        full_width_rows=False
     ):
         """
         Request only the changed visible-composite rectangle as raw RGBA8
@@ -2406,6 +2675,7 @@ class BlendGimpConnection:
                 "component": "blender",
                 "protocol": PROTOCOL_VERSION,
                 "image_id": image_id,
+                "full_width_rows": bool(full_width_rows),
                 "request_id": self._next_request_id(
                     "get-image-dirty-pixels-binary"
                 ),
@@ -3049,6 +3319,7 @@ class BlendGimpConnection:
     # DISCONNECT
     # ========================================================
 
+    @_serialized_io
     def disconnect(self):
 
         if self.socket:
