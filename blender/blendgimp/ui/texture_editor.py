@@ -1636,7 +1636,7 @@ def register():
             persistent=True,
         )
 
-    print("BLENDGIMP: Phase 6.5.1 Canvas/UV Polish + automatic pointer routing registered")
+    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel + automatic pointer routing registered")
 
 
 def unregister():
@@ -1685,4 +1685,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.5.1 Canvas/UV Polish + automatic pointer routing unregistered")
+    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel + automatic pointer routing unregistered")

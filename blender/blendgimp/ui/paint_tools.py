@@ -31,7 +31,7 @@ from ..ipc.connection import connection_manager, set_direct_paint_refresh_owner
 from . import main_panel
 from . import texture_editor
 
-BUILD_ID = "6.5.1-canvas-uv-polish"
+BUILD_ID = "6.5.2-native-layer-panel"
 
 
 LIVE_REFRESH_INTERVAL = 0.125  # Throttled authoritative GIMP updates while LMB is down.
@@ -2391,7 +2391,7 @@ def _draw_layer_controls(layout, context):
     if not layers:
         box.label(text="No layers returned by GIMP", icon="INFO")
         return
-    main_panel.draw_layer_tree(box, layers, image_id)
+    main_panel.draw_layer_stack_compact(box, layers, image_id)
 
 
 def _draw_tool_specific_options(box, context):
@@ -2926,7 +2926,7 @@ def register():
         default=False,
     )
 
-    print("BLENDGIMP: Phase 6.5.1 Canvas & UV Polish registered — build 6.5.1-canvas-uv-polish")
+    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel registered — build 6.5.2-native-layer-panel")
 
 
 def unregister():
@@ -2992,4 +2992,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.5.1 Canvas & UV Polish unregistered — build 6.5.1-canvas-uv-polish")
+    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel unregistered — build 6.5.2-native-layer-panel")

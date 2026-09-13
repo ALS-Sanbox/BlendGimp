@@ -5122,6 +5122,179 @@ def draw_layer_tree(
 
 
 # ============================================================
+# PHASE 6.5.2 — COMPACT / NATIVE-FEELING LAYER STACK
+# ============================================================
+
+def _iter_layer_stack_rows(layers, depth=0):
+    """Yield layer rows in display order while preserving GIMP hierarchy."""
+    for sibling_index, layer in enumerate(layers or []):
+        yield layer, depth, sibling_index, len(layers or [])
+        children = layer.get("children", []) if isinstance(layer, dict) else []
+        if children:
+            yield from _iter_layer_stack_rows(children, depth + 1)
+
+
+def _find_selected_layer_any(layers):
+    """Return the selected GIMP layer/group, including hierarchy location."""
+    for layer, depth, sibling_index, sibling_count in _iter_layer_stack_rows(layers):
+        if bool(layer.get("selected", False)):
+            return layer, depth, sibling_index, sibling_count
+    return None, 0, -1, 0
+
+
+def draw_layer_stack_compact(layout, layers, image_id):
+    """Draw a compact layer stack plus controls for the active GIMP layer.
+
+    Phase 6.5.2 keeps the existing GIMP layer protocol/operators authoritative;
+    only the Blender presentation changes.  One compact row represents each
+    layer/group, while detailed controls are shown once for the selected layer.
+    """
+    layers = list(layers or [])
+    stack = layout.column(align=True)
+
+    if not layers:
+        stack.label(text="No layers returned by GIMP", icon="INFO")
+        return
+
+    for layer, depth, _sibling_index, _sibling_count in _iter_layer_stack_rows(layers):
+        try:
+            layer_id = int(layer.get("id", -1))
+        except (TypeError, ValueError):
+            continue
+        if layer_id < 0:
+            continue
+
+        selected = bool(layer.get("selected", False))
+        visible = bool(layer.get("visible", False))
+        is_group = bool(layer.get("is_group", False))
+        name = str(layer.get("name", "[Unnamed]"))
+        prefix = "    " * max(0, int(depth))
+
+        row = stack.row(align=True)
+        active = row.operator(
+            "blendgimp.set_active_layer",
+            text=prefix + name,
+            icon="FILE_FOLDER" if is_group else "IMAGE_DATA",
+            depress=selected,
+        )
+        active.image_id = int(image_id)
+        active.layer_id = layer_id
+
+        visibility = row.operator(
+            "blendgimp.set_layer_visibility",
+            text="",
+            icon="HIDE_OFF" if visible else "HIDE_ON",
+            depress=visible,
+        )
+        visibility.image_id = int(image_id)
+        visibility.layer_id = layer_id
+        visibility.visible = not visible
+
+    selected_layer, _depth, sibling_index, sibling_count = _find_selected_layer_any(layers)
+    if selected_layer is None:
+        layout.label(text="Select a layer to edit its properties", icon="INFO")
+        return
+
+    try:
+        layer_id = int(selected_layer.get("id", -1))
+    except (TypeError, ValueError):
+        return
+    if layer_id < 0:
+        return
+
+    name = str(selected_layer.get("name", "[Unnamed]"))
+    is_group = bool(selected_layer.get("is_group", False))
+    try:
+        opacity = max(0.0, min(100.0, float(selected_layer.get("opacity", 100.0))))
+    except (TypeError, ValueError):
+        opacity = 100.0
+    mode_name = str(selected_layer.get("mode", "NORMAL"))
+
+    details = layout.box()
+    header = details.row(align=True)
+    header.label(
+        text=f"Active {'Group' if is_group else 'Layer'}: {name}",
+        icon="FILE_FOLDER" if is_group else "IMAGE_DATA",
+    )
+
+    props = details.row(align=True)
+    opacity_operator = props.operator(
+        "blendgimp.set_layer_opacity",
+        text=f"Opacity {opacity:.0f}%",
+    )
+    opacity_operator.image_id = int(image_id)
+    opacity_operator.layer_id = layer_id
+    opacity_operator.opacity = opacity
+
+    mode_operator = props.operator(
+        "blendgimp.set_layer_mode",
+        text=blendgimp_layer_mode_label(mode_name),
+    )
+    mode_operator.image_id = int(image_id)
+    mode_operator.layer_id = layer_id
+    mode_operator.mode = (
+        mode_name
+        if any(item[0] == mode_name for item in BLENDGIMP_LAYER_MODE_ITEMS)
+        else "NORMAL"
+    )
+
+    lock_row = details.row(align=True)
+    lock_row.label(text="Locks")
+    for lock_type, label, field_name in (
+        ("CONTENT", "Pixels", "lock_content"),
+        ("POSITION", "Position", "lock_position"),
+        ("ALPHA", "Alpha", "lock_alpha"),
+    ):
+        current_locked = bool(selected_layer.get(field_name, False))
+        op = lock_row.operator(
+            "blendgimp.set_layer_lock",
+            text=label,
+            depress=current_locked,
+        )
+        op.image_id = int(image_id)
+        op.layer_id = layer_id
+        op.lock_type = lock_type
+        op.locked = not current_locked
+
+    actions = details.row(align=True)
+    rename = actions.operator("blendgimp.rename_layer", text="Rename")
+    rename.image_id = int(image_id)
+    rename.layer_id = layer_id
+    rename.layer_name = name
+
+    duplicate = actions.operator("blendgimp.duplicate_layer", text="Duplicate")
+    duplicate.image_id = int(image_id)
+    duplicate.layer_id = layer_id
+
+    delete = actions.operator("blendgimp.delete_layer", text="Delete")
+    delete.image_id = int(image_id)
+    delete.layer_id = layer_id
+    delete.layer_name = name
+
+    order = details.row(align=True)
+    if sibling_index > 0:
+        up = order.operator("blendgimp.reorder_layer", text="Up")
+        up.image_id = int(image_id)
+        up.layer_id = layer_id
+        up.direction = "UP"
+    if 0 <= sibling_index < max(0, sibling_count - 1):
+        down = order.operator("blendgimp.reorder_layer", text="Down")
+        down.image_id = int(image_id)
+        down.layer_id = layer_id
+        down.direction = "DOWN"
+
+    move = order.operator("blendgimp.move_layer", text="Move…")
+    move.image_id = int(image_id)
+    move.layer_id = layer_id
+
+    if 0 <= sibling_index < max(0, sibling_count - 1):
+        merge = order.operator("blendgimp.merge_layer_down", text="Merge Down")
+        merge.image_id = int(image_id)
+        merge.layer_id = layer_id
+        merge.layer_name = name
+
+
+# ============================================================
 # DETECT GIMP
 # ============================================================
 
@@ -8619,7 +8792,7 @@ class BLENDGIMP_PT_main_panel(
         # ====================================================
 
         layout.label(
-            text="BlendGimp 0.4.1"
+            text="BlendGimp 0.4.2"
         )
 
         layout.separator()
@@ -9601,7 +9774,7 @@ class BLENDGIMP_PT_main_panel(
                                     )
                                 )
 
-                                draw_layer_tree(
+                                draw_layer_stack_compact(
                                     image_box,
                                     layer_result.get(
                                         "layers",
