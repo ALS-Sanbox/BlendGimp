@@ -26,6 +26,20 @@ from ..ipc.connection import connection_manager
 
 MODE_TEXTURE = "TEXTURE"
 MODE_OBJECT = "OBJECT"
+
+TEXTURE_DISPLAY_CHANNEL_ITEMS = (
+    ("COLOR_ALPHA", "Checkerboard", "Display RGB with alpha transparency over Blender's checkerboard"),
+    ("COLOR", "RGB", "Display RGB without alpha transparency"),
+    ("ALPHA", "Alpha", "Display the alpha channel only"),
+)
+
+UV_EDGE_STYLE_ITEMS = (
+    ("OUTLINE", "Outline", "White UV edges with a dark outline"),
+    ("DASH", "Dash", "Dashed black/white UV edges"),
+    ("BLACK", "Black", "Black UV edges"),
+    ("WHITE", "White", "White UV edges"),
+)
+
 TEXTURE_EDITOR_POLL_INTERVAL = 0.35
 AUTO_ROUTER_RETRY_INTERVAL = 2.0
 AUTO_ROUTER_FAILURE_INTERVAL = 5.0
@@ -564,7 +578,16 @@ def _apply_uv_overlay_to_space(space, scene):
     if space is None:
         return
 
-    _set_if_present(space, "display_channels", "COLOR_ALPHA")
+    # Phase 6.5.1: presentation is explicit instead of hard-wired to
+    # COLOR_ALPHA.  This keeps Blender's native checkerboard for transparent
+    # pixels while also giving artists fast RGB-only and alpha-only inspection.
+    display_channels = str(
+        getattr(scene, "blendgimp_texture_editor_display_channels", "COLOR_ALPHA")
+        or "COLOR_ALPHA"
+    )
+    if display_channels not in {"COLOR_ALPHA", "COLOR", "ALPHA"}:
+        display_channels = "COLOR_ALPHA"
+    _set_if_present(space, "display_channels", display_channels)
     _set_if_present(space, "use_realtime_update", True)
 
     overlay = getattr(space, "overlay", None)
@@ -574,21 +597,33 @@ def _apply_uv_overlay_to_space(space, scene):
     if uv_editor is None:
         return
 
-    show_uv = bool(
-        scene.blendgimp_texture_editor_show_uv
-        and scene.blendgimp_texture_editor_show_islands
+    overlay_enabled = bool(scene.blendgimp_texture_editor_show_uv)
+    show_islands = bool(
+        overlay_enabled and scene.blendgimp_texture_editor_show_islands
+    )
+    show_faces = bool(
+        overlay_enabled and scene.blendgimp_texture_editor_active_face_highlight
     )
     opacity = float(scene.blendgimp_texture_editor_uv_opacity)
+    edge_style = str(
+        getattr(scene, "blendgimp_texture_editor_uv_edge_style", "OUTLINE")
+        or "OUTLINE"
+    )
+    if edge_style not in {"OUTLINE", "DASH", "BLACK", "WHITE"}:
+        edge_style = "OUTLINE"
 
-    _set_if_present(uv_editor, "show_uv", show_uv)
-    _set_if_present(uv_editor, "edge_display_type", "OUTLINE")
-    _set_if_present(uv_editor, "uv_opacity", opacity)
-    _set_if_present(uv_editor, "uv_edge_opacity", opacity)
-    _set_if_present(uv_editor, "uv_face_opacity", min(opacity * 0.30, 1.0))
+    # Island edges and selected-face fill are intentionally independent.
+    # This lets an artist hide the full UV wire while retaining selected-face
+    # context over the texture.
+    _set_if_present(uv_editor, "show_uv", show_islands)
+    _set_if_present(uv_editor, "edge_display_type", edge_style)
+    _set_if_present(uv_editor, "uv_opacity", opacity if show_islands else 0.0)
+    _set_if_present(uv_editor, "uv_edge_opacity", opacity if show_islands else 0.0)
+    _set_if_present(uv_editor, "show_faces", show_faces)
     _set_if_present(
         uv_editor,
-        "show_faces",
-        bool(scene.blendgimp_texture_editor_active_face_highlight and show_uv),
+        "uv_face_opacity",
+        min(max(opacity * 0.35, 0.08), 1.0) if show_faces else 0.0,
     )
 
 
@@ -1105,19 +1140,34 @@ class BLENDGIMP_OT_texture_editor_set_image(bpy.types.Operator):
 
 class BLENDGIMP_OT_texture_view_fit(bpy.types.Operator):
     bl_idname = "blendgimp.texture_view_fit"
-    bl_label = "Fit"
+    bl_label = "Fit Image"
     bl_description = "Fit the complete texture into this BlendGimp canvas"
 
     @classmethod
     def poll(cls, context):
         return context.area is not None and context.area.type == "IMAGE_EDITOR"
 
-    def execute(self, _context):
+    def execute(self, context):
+        region = _area_window_region(context.area)
+        if region is None:
+            self.report({"WARNING"}, "BlendGimp canvas window region is unavailable")
+            return {"CANCELLED"}
         try:
-            bpy.ops.image.view_all(fit_view=True)
-        except TypeError:
-            bpy.ops.image.view_all()
-        return {"FINISHED"}
+            with context.temp_override(
+                window=context.window,
+                screen=context.screen,
+                area=context.area,
+                region=region,
+            ):
+                try:
+                    bpy.ops.image.view_all(fit_view=True)
+                except TypeError:
+                    bpy.ops.image.view_all()
+            context.area.tag_redraw()
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not fit texture view: {exc}")
+            return {"CANCELLED"}
 
 
 class BLENDGIMP_OT_texture_view_100(bpy.types.Operator):
@@ -1129,9 +1179,24 @@ class BLENDGIMP_OT_texture_view_100(bpy.types.Operator):
     def poll(cls, context):
         return context.area is not None and context.area.type == "IMAGE_EDITOR"
 
-    def execute(self, _context):
-        bpy.ops.image.view_zoom_ratio(ratio=1.0)
-        return {"FINISHED"}
+    def execute(self, context):
+        region = _area_window_region(context.area)
+        if region is None:
+            self.report({"WARNING"}, "BlendGimp canvas window region is unavailable")
+            return {"CANCELLED"}
+        try:
+            with context.temp_override(
+                window=context.window,
+                screen=context.screen,
+                area=context.area,
+                region=region,
+            ):
+                bpy.ops.image.view_zoom_ratio(ratio=1.0)
+            context.area.tag_redraw()
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not set texture view to 100%: {exc}")
+            return {"CANCELLED"}
 
 
 # -----------------------------------------------------------------------------
@@ -1214,13 +1279,16 @@ def _draw_uv_controls(layout, context):
 
     col = box.column()
     col.enabled = scene.blendgimp_texture_editor_show_uv
-    col.prop(scene, "blendgimp_texture_editor_uv_opacity", text="Opacity", slider=True)
-    col.prop(scene, "blendgimp_texture_editor_show_islands", text="Show UV Islands")
+    col.prop(scene, "blendgimp_texture_editor_show_islands", text="UV Island Edges")
     col.prop(
         scene,
         "blendgimp_texture_editor_active_face_highlight",
-        text="Selected Face Highlight",
+        text="Selected Face Fill",
     )
+    col.prop(scene, "blendgimp_texture_editor_uv_opacity", text="Overlay Opacity", slider=True)
+    edge = col.row()
+    edge.enabled = scene.blendgimp_texture_editor_show_islands
+    edge.prop(scene, "blendgimp_texture_editor_uv_edge_style", text="Edge Style")
 
     obj = context.active_object
     if obj is None or obj.type != "MESH":
@@ -1231,7 +1299,7 @@ def _draw_uv_controls(layout, context):
         uv_layer = obj.data.uv_layers.active
         box.label(text=f"UV Map: {uv_layer.name if uv_layer else '[None]'}")
         if scene.blendgimp_texture_editor_active_face_highlight:
-            box.label(text="Face highlight follows Edit Mode selection")
+            box.label(text="Selected-face fill uses Blender's native UV overlay")
 
 
 def _draw_object_paint_controls(layout, context, image):
@@ -1380,10 +1448,21 @@ class BLENDGIMP_PT_texture_area(bpy.types.Panel):
         nav = layout.box()
         nav.label(text="Texture Canvas", icon="IMAGE_DATA")
         row = nav.row(align=True)
-        row.operator("blendgimp.texture_view_fit", text="Fit")
+        row.operator("blendgimp.texture_view_fit", text="Fit Image")
         row.operator("blendgimp.texture_view_100", text="100%")
         nav.label(text="MMB Pan  •  Wheel Zoom")
-        nav.label(text="RGBA checkerboard transparency")
+        nav.prop(
+            scene,
+            "blendgimp_texture_editor_display_channels",
+            text="Presentation",
+        )
+        display_mode = str(scene.blendgimp_texture_editor_display_channels)
+        if display_mode == "COLOR_ALPHA":
+            nav.label(text="Transparent pixels use Blender's checkerboard")
+        elif display_mode == "ALPHA":
+            nav.label(text="Alpha-only inspection")
+        else:
+            nav.label(text="RGB preview ignores alpha")
 
         _draw_uv_controls(layout, context)
 
@@ -1473,6 +1552,13 @@ def register():
         default=True,
         update=_follow_property_update,
     )
+    bpy.types.Scene.blendgimp_texture_editor_display_channels = bpy.props.EnumProperty(
+        name="Texture Presentation",
+        description="Choose how the BlendGimp texture is presented in the Image Editor",
+        items=TEXTURE_DISPLAY_CHANNEL_ITEMS,
+        default="COLOR_ALPHA",
+        update=_texture_editor_property_update,
+    )
     bpy.types.Scene.blendgimp_texture_editor_show_uv = bpy.props.BoolProperty(
         name="Show UV Overlay",
         default=True,
@@ -1488,8 +1574,15 @@ def register():
     )
     bpy.types.Scene.blendgimp_texture_editor_show_islands = bpy.props.BoolProperty(
         name="Show UV Islands",
-        description="Show or hide the active mesh UV islands over the texture",
+        description="Show or hide the active mesh UV island edges over the texture",
         default=True,
+        update=_texture_editor_property_update,
+    )
+    bpy.types.Scene.blendgimp_texture_editor_uv_edge_style = bpy.props.EnumProperty(
+        name="UV Edge Style",
+        description="Blender-native display style for UV island edges",
+        items=UV_EDGE_STYLE_ITEMS,
+        default="OUTLINE",
         update=_texture_editor_property_update,
     )
     bpy.types.Scene.blendgimp_texture_editor_active_face_highlight = bpy.props.BoolProperty(
@@ -1543,7 +1636,7 @@ def register():
             persistent=True,
         )
 
-    print("BLENDGIMP: Phase 6.3.7 BlendGimp Area + automatic pointer routing registered")
+    print("BLENDGIMP: Phase 6.5.1 Canvas/UV Polish + automatic pointer routing registered")
 
 
 def unregister():
@@ -1573,9 +1666,11 @@ def unregister():
         "blendgimp_area_last_mode",
         "blendgimp_texture_editor_status",
         "blendgimp_texture_editor_active_face_highlight",
+        "blendgimp_texture_editor_uv_edge_style",
         "blendgimp_texture_editor_show_islands",
         "blendgimp_texture_editor_uv_opacity",
         "blendgimp_texture_editor_show_uv",
+        "blendgimp_texture_editor_display_channels",
         "blendgimp_texture_editor_follow_active",
         "blendgimp_texture_editor_image_name",
         "blendgimp_texture_editor_image_id",
@@ -1590,4 +1685,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.3.7 BlendGimp Area + automatic pointer routing unregistered")
+    print("BLENDGIMP: Phase 6.5.1 Canvas/UV Polish + automatic pointer routing unregistered")

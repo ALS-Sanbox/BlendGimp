@@ -1797,11 +1797,19 @@ def _blendgimp_accept_blender_originated_write(
             image_id
         )
 
+        return {
+            "width": int(width),
+            "height": int(height),
+            "pixels": composite_pixels,
+            "sync_token": _blendgimp_composite_token(image_id),
+        }
+
     except Exception as exc:
         log(
             "Warning: could not establish Blender-originated "
             f"echo suppression for image ID {image_id}: {exc}"
         )
+        return None
 
 
 def _blendgimp_filter_self_originated_state_change(
@@ -1990,9 +1998,30 @@ def _gimp_foreground_rgba():
     ]
 
 
-def gimp_set_foreground_color(rgba):
-    """MAIN THREAD ONLY. Set the GIMP foreground from normalized RGBA."""
+def _gimp_color_rgba(color):
+    """MAIN THREAD ONLY. Normalize a Gegl.Color to an RGBA list."""
 
+    if color is None:
+        return None
+
+    try:
+        values = list(color.get_rgba())
+    except Exception:
+        return None
+
+    if len(values) == 5 and isinstance(values[0], bool):
+        values = values[1:]
+
+    if len(values) != 4:
+        return None
+
+    return [
+        max(0.0, min(1.0, float(value)))
+        for value in values
+    ]
+
+
+def _gimp_make_color(rgba):
     values = list(rgba)
 
     if len(values) not in {3, 4}:
@@ -2006,7 +2035,7 @@ def gimp_set_foreground_color(rgba):
     if len(values) == 3:
         values.append(1.0)
 
-    foreground = Gegl.Color.new(
+    color = Gegl.Color.new(
         "rgba("
         f"{values[0]:.9f},"
         f"{values[1]:.9f},"
@@ -2014,8 +2043,16 @@ def gimp_set_foreground_color(rgba):
         f"{values[3]:.9f})"
     )
 
-    if foreground is None:
-        raise RuntimeError("GIMP could not construct the foreground color")
+    if color is None:
+        raise RuntimeError("GIMP could not construct the requested color")
+
+    return color, values
+
+
+def gimp_set_foreground_color(rgba):
+    """MAIN THREAD ONLY. Set the GIMP foreground from normalized RGBA."""
+
+    foreground, values = _gimp_make_color(rgba)
 
     if not Gimp.context_set_foreground(foreground):
         raise RuntimeError("GIMP could not set the foreground color")
@@ -2025,180 +2062,761 @@ def gimp_set_foreground_color(rgba):
     }
 
 
+def gimp_set_background_color(rgba):
+    """MAIN THREAD ONLY. Set the GIMP background from normalized RGBA."""
+
+    background, values = _gimp_make_color(rgba)
+
+    if not Gimp.context_set_background(background):
+        raise RuntimeError("GIMP could not set the background color")
+
+    return {
+        "background_color": values,
+    }
+
+
+def gimp_list_brushes():
+    """MAIN THREAD ONLY. Return installed GIMP brush names."""
+
+    try:
+        brushes = Gimp.brushes_get_list(None)
+    except TypeError:
+        brushes = Gimp.brushes_get_list("")
+
+    names = []
+    for brush in brushes or []:
+        try:
+            name = str(brush.get_name() or "")
+        except Exception:
+            name = str(brush or "")
+        if name:
+            names.append(name)
+
+    return {
+        "brushes": sorted(set(names), key=str.casefold),
+    }
+
+
+def gimp_list_dynamics():
+    """MAIN THREAD ONLY. Return installed paint dynamics and current activation state."""
+
+    try:
+        dynamics = Gimp.dynamics_get_name_list(None)
+    except TypeError:
+        dynamics = Gimp.dynamics_get_name_list("")
+
+    names = [str(name) for name in (dynamics or []) if str(name)]
+    try:
+        active = str(Gimp.context_get_dynamics_name() or "")
+    except Exception:
+        active = ""
+    try:
+        enabled = bool(Gimp.context_are_dynamics_enabled())
+    except Exception:
+        enabled = False
+
+    return {
+        "dynamics": sorted(set(names), key=str.casefold),
+        "active_dynamics": active,
+        "enabled": enabled,
+    }
+
+
+def gimp_set_dynamics(name):
+    """MAIN THREAD ONLY. Set the active GIMP paint dynamics resource."""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("Dynamics name is required")
+    if not Gimp.context_set_dynamics_name(name):
+        raise RuntimeError(f"GIMP could not activate dynamics: {name}")
+    return gimp_get_brush_state()
+
+
+def gimp_set_dynamics_enabled(enabled):
+    """MAIN THREAD ONLY. Enable or disable the active GIMP paint dynamics."""
+    enabled = bool(enabled)
+    if Gimp.context_enable_dynamics(enabled) is False:
+        raise RuntimeError(
+            "GIMP could not " + ("enable" if enabled else "disable") + " paint dynamics"
+        )
+    return gimp_get_brush_state()
+
+
 def gimp_get_brush_state():
     """
     MAIN THREAD ONLY.
 
-    Return the active GIMP brush context that direct 3D painting will use.
+    Return the shared GIMP paint context used by BlendGimp 2D and 3D painting.
     """
 
     brush = Gimp.context_get_brush()
-
     brush_name = ""
 
     if brush is not None:
         try:
-            brush_name = str(
-                brush.get_name()
-                or ""
-            )
+            brush_name = str(brush.get_name() or "")
         except Exception:
-            brush_name = str(
-                brush
-            )
+            brush_name = str(brush)
 
     try:
-        dynamics_name = str(
-            Gimp.context_get_dynamics_name()
-            or ""
-        )
+        dynamics_name = str(Gimp.context_get_dynamics_name() or "")
     except Exception:
         dynamics_name = ""
 
     try:
-        emulate_dynamics = bool(
-            Gimp.context_get_emulate_brush_dynamics()
-        )
+        dynamics_enabled = bool(Gimp.context_are_dynamics_enabled())
+    except Exception:
+        dynamics_enabled = False
+
+    try:
+        emulate_dynamics = bool(Gimp.context_get_emulate_brush_dynamics())
     except Exception:
         emulate_dynamics = False
 
+    try:
+        background_color = _gimp_color_rgba(Gimp.context_get_background())
+    except Exception:
+        background_color = None
+
+    def safe_float(getter, default):
+        try:
+            return float(getter())
+        except Exception:
+            return float(default)
+
     return {
         "brush_name": brush_name,
-        "brush_size": float(
-            Gimp.context_get_brush_size()
-        ),
-        "brush_opacity": float(
-            Gimp.context_get_opacity()
-        ),
-        "brush_spacing": float(
-            Gimp.context_get_brush_spacing()
-        ),
-        "paint_method": str(
-            Gimp.context_get_paint_method()
-            or ""
-        ),
+        "brush_size": safe_float(Gimp.context_get_brush_size, 20.0),
+        "brush_opacity": safe_float(Gimp.context_get_opacity, 100.0),
+        "brush_spacing": safe_float(Gimp.context_get_brush_spacing, 0.10),
+        "brush_hardness": safe_float(Gimp.context_get_brush_hardness, 0.50),
+        "brush_angle": safe_float(Gimp.context_get_brush_angle, 0.0),
+        "brush_aspect_ratio": safe_float(Gimp.context_get_brush_aspect_ratio, 0.0),
+        "paint_method": str(Gimp.context_get_paint_method() or ""),
         "dynamics_name": dynamics_name,
+        "dynamics_enabled": dynamics_enabled,
         "emulate_dynamics": emulate_dynamics,
         "foreground_color": _gimp_foreground_rgba(),
+        "background_color": background_color,
     }
+
+
+def gimp_set_brush_state(state):
+    """MAIN THREAD ONLY. Update any supplied fields in the shared GIMP paint context."""
+
+    if not isinstance(state, dict):
+        raise ValueError("brush state must be an object")
+
+    brush_name = str(state.get("brush_name", "") or "").strip()
+    if brush_name:
+        brush = Gimp.Brush.get_by_name(brush_name)
+        if brush is None:
+            raise ValueError(f"GIMP brush not found: {brush_name}")
+        if not Gimp.context_set_brush(brush):
+            raise RuntimeError(f"GIMP could not activate brush: {brush_name}")
+
+    setters = (
+        ("brush_size", Gimp.context_set_brush_size, float),
+        ("brush_opacity", Gimp.context_set_opacity, float),
+        ("brush_spacing", Gimp.context_set_brush_spacing, float),
+        ("brush_hardness", Gimp.context_set_brush_hardness, float),
+        ("brush_angle", Gimp.context_set_brush_angle, float),
+        ("brush_aspect_ratio", Gimp.context_set_brush_aspect_ratio, float),
+    )
+
+    for key, setter, caster in setters:
+        if key not in state or state.get(key) is None:
+            continue
+        value = caster(state[key])
+        if setter(value) is False:
+            raise RuntimeError(f"GIMP could not set {key}")
+
+    if state.get("foreground_color") is not None:
+        gimp_set_foreground_color(state["foreground_color"])
+
+    if state.get("background_color") is not None:
+        gimp_set_background_color(state["background_color"])
+
+    dynamics_name = str(state.get("dynamics_name", "") or "").strip()
+    if dynamics_name:
+        if not Gimp.context_set_dynamics_name(dynamics_name):
+            raise RuntimeError(f"GIMP could not activate dynamics: {dynamics_name}")
+
+    if state.get("dynamics_enabled") is not None:
+        enabled = bool(state.get("dynamics_enabled"))
+        if Gimp.context_enable_dynamics(enabled) is False:
+            raise RuntimeError(
+                "GIMP could not " + ("enable" if enabled else "disable") + " paint dynamics"
+            )
+
+    return gimp_get_brush_state()
+
+
+BLENDGIMP_FILL_TYPES = {
+    "FOREGROUND": Gimp.FillType.FOREGROUND,
+    "BACKGROUND": Gimp.FillType.BACKGROUND,
+}
+
+
+def gimp_bucket_fill(
+    image_id,
+    layer_id,
+    x,
+    y,
+    fill_type="FOREGROUND",
+):
+    """MAIN THREAD ONLY. Seed-fill the selected raster layer at image coordinates."""
+
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    image_x = float(x)
+    image_y = float(y)
+    fill_key = str(fill_type or "FOREGROUND").upper().strip()
+
+    if fill_key not in BLENDGIMP_FILL_TYPES:
+        raise ValueError(f"Unsupported BlendGimp fill type: {fill_key}")
+
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    if layer.is_group():
+        raise ValueError("GIMP Fill requires a raster layer")
+
+    image_width = int(image.get_width())
+    image_height = int(image.get_height())
+    if image_x < 0.0 or image_y < 0.0 or image_x >= image_width or image_y >= image_height:
+        raise ValueError(
+            f"Fill coordinate ({image_x:.1f}, {image_y:.1f}) is outside image "
+            f"{image_width}x{image_height}"
+        )
+
+    # edit_bucket_fill interprets coordinates in image space when sample-merged
+    # is enabled, otherwise in drawable-local space. BlendGimp always receives
+    # image-space UV coordinates, so translate only when GIMP is sampling the
+    # target drawable itself. This preserves the user's GIMP fill context.
+    sample_merged = bool(Gimp.context_get_sample_merged())
+    layer_offset_x, layer_offset_y = _blendgimp_layer_offsets(layer)
+    bucket_x = image_x if sample_merged else image_x - float(layer_offset_x)
+    bucket_y = image_y if sample_merged else image_y - float(layer_offset_y)
+
+    layer_width = int(layer.get_width())
+    layer_height = int(layer.get_height())
+    if not sample_merged and (
+        bucket_x < 0.0
+        or bucket_y < 0.0
+        or bucket_x >= layer_width
+        or bucket_y >= layer_height
+    ):
+        raise ValueError(
+            f"Fill coordinate is outside target layer bounds after offset: "
+            f"({bucket_x:.1f}, {bucket_y:.1f}) in {layer_width}x{layer_height}"
+        )
+
+    # A newly created BlendGimp texture is commonly transparent. GIMP's seed
+    # fill context may ignore transparent pixels unless sample-transparent is
+    # enabled, which makes edit_bucket_fill() return success without changing
+    # the drawable. Enable it only for this operation and restore the user's
+    # prior GIMP context immediately afterward.
+    previous_sample_transparent = None
+    sample_transparent_changed = False
+    try:
+        previous_sample_transparent = bool(Gimp.context_get_sample_transparent())
+        if not previous_sample_transparent:
+            if Gimp.context_set_sample_transparent(True) is False:
+                raise RuntimeError("GIMP could not enable transparent sampling for Fill")
+            sample_transparent_changed = True
+    except AttributeError:
+        # Binding-tolerance fallback: older/introspection variants may not
+        # expose the getter. The setter is available in supported GIMP 3.2.4.
+        if Gimp.context_set_sample_transparent(True) is False:
+            raise RuntimeError("GIMP could not enable transparent sampling for Fill")
+        sample_transparent_changed = True
+
+    if not image.undo_group_start():
+        if sample_transparent_changed and previous_sample_transparent is not None:
+            try:
+                Gimp.context_set_sample_transparent(previous_sample_transparent)
+            except Exception:
+                pass
+        raise RuntimeError("GIMP could not start the Fill undo group")
+
+    try:
+        success = layer.edit_bucket_fill(
+            BLENDGIMP_FILL_TYPES[fill_key],
+            float(bucket_x),
+            float(bucket_y),
+        )
+        if success is False:
+            raise RuntimeError("GIMP bucket fill returned failure")
+        Gimp.displays_flush()
+    finally:
+        try:
+            image.undo_group_end()
+        except Exception:
+            pass
+        if sample_transparent_changed:
+            try:
+                if previous_sample_transparent is None:
+                    # We cannot know the prior state on a binding without the
+                    # getter. False is GIMP's conservative/default behavior.
+                    Gimp.context_set_sample_transparent(False)
+                else:
+                    Gimp.context_set_sample_transparent(previous_sample_transparent)
+            except Exception as exc:
+                log(f"BUCKET_FILL warning: could not restore sample-transparent context: {exc}")
+
+    return {
+        "image_id": image_id,
+        "layer_id": layer_id,
+        "x": image_x,
+        "y": image_y,
+        "drawable_x": float(bucket_x),
+        "drawable_y": float(bucket_y),
+        "fill_type": fill_key,
+        "sample_merged": sample_merged,
+        "sample_transparent": True,
+        "layer_offset_x": int(layer_offset_x),
+        "layer_offset_y": int(layer_offset_y),
+    }
+
+
+BLENDGIMP_GRADIENT_TYPES = {
+    "LINEAR": Gimp.GradientType.LINEAR,
+    "BILINEAR": Gimp.GradientType.BILINEAR,
+    "RADIAL": Gimp.GradientType.RADIAL,
+    "SQUARE": Gimp.GradientType.SQUARE,
+    "CONICAL_SYMMETRIC": Gimp.GradientType.CONICAL_SYMMETRIC,
+    "CONICAL_ASYMMETRIC": Gimp.GradientType.CONICAL_ASYMMETRIC,
+    "SHAPEBURST_ANGULAR": Gimp.GradientType.SHAPEBURST_ANGULAR,
+    "SHAPEBURST_SPHERICAL": Gimp.GradientType.SHAPEBURST_SPHERICAL,
+    "SHAPEBURST_DIMPLED": Gimp.GradientType.SHAPEBURST_DIMPLED,
+    "SPIRAL_CLOCKWISE": Gimp.GradientType.SPIRAL_CLOCKWISE,
+    "SPIRAL_ANTICLOCKWISE": Gimp.GradientType.SPIRAL_ANTICLOCKWISE,
+}
+
+BLENDGIMP_GRADIENT_REPEAT_MODES = {
+    "NONE": Gimp.RepeatMode.NONE,
+    "TRUNCATE": Gimp.RepeatMode.TRUNCATE,
+    "SAWTOOTH": Gimp.RepeatMode.SAWTOOTH,
+    "TRIANGULAR": Gimp.RepeatMode.TRIANGULAR,
+}
+
+
+def gimp_list_gradients():
+    """MAIN THREAD ONLY. Return installed GIMP gradient resource names."""
+
+    try:
+        gradients = Gimp.gradients_get_list(None)
+    except TypeError:
+        gradients = Gimp.gradients_get_list("")
+
+    names = []
+    active_name = ""
+    try:
+        active = Gimp.context_get_gradient()
+        if active is not None:
+            active_name = str(active.get_name() or "")
+    except Exception:
+        active_name = ""
+
+    for gradient in gradients or []:
+        try:
+            name = str(gradient.get_name() or "")
+        except Exception:
+            name = str(gradient or "")
+        if name:
+            names.append(name)
+
+    return {
+        "gradients": sorted(set(names), key=str.casefold),
+        "active_gradient": active_name,
+    }
+
+
+def _blendgimp_gradient_by_name(name):
+    wanted = str(name or "").strip()
+    if not wanted:
+        raise ValueError("Gradient resource name is empty")
+
+    try:
+        gradients = Gimp.gradients_get_list(None)
+    except TypeError:
+        gradients = Gimp.gradients_get_list("")
+
+    for gradient in gradients or []:
+        try:
+            candidate = str(gradient.get_name() or "")
+        except Exception:
+            candidate = str(gradient or "")
+        if candidate == wanted:
+            return gradient
+
+    raise ValueError(f"GIMP gradient resource not found: {wanted}")
+
+
+def gimp_gradient_fill(
+    image_id,
+    layer_id,
+    x1,
+    y1,
+    x2,
+    y2,
+    gradient_source="FG_BG",
+    gradient_name="",
+    gradient_type="LINEAR",
+    reverse=False,
+    repeat_mode="NONE",
+):
+    """MAIN THREAD ONLY. Apply one authoritative GIMP gradient operation."""
+
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    x1 = float(x1)
+    y1 = float(y1)
+    x2 = float(x2)
+    y2 = float(y2)
+    source_key = str(gradient_source or "FG_BG").upper().strip()
+    type_key = str(gradient_type or "LINEAR").upper().strip()
+    repeat_key = str(repeat_mode or "NONE").upper().strip()
+    gradient_name = str(gradient_name or "").strip()
+
+    if type_key not in BLENDGIMP_GRADIENT_TYPES:
+        raise ValueError(f"Unsupported BlendGimp gradient type: {type_key}")
+    if repeat_key not in BLENDGIMP_GRADIENT_REPEAT_MODES:
+        raise ValueError(f"Unsupported BlendGimp gradient repeat mode: {repeat_key}")
+    if source_key not in {"FG_BG", "RESOURCE"}:
+        raise ValueError(f"Unsupported BlendGimp gradient source: {source_key}")
+    if abs(x2 - x1) < 0.001 and abs(y2 - y1) < 0.001:
+        raise ValueError("Gradient start and end points must be different")
+
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    if layer.is_group():
+        raise ValueError("GIMP Gradient requires a raster layer")
+
+    layer_offset_x, layer_offset_y = _blendgimp_layer_offsets(layer)
+    drawable_x1 = x1 - float(layer_offset_x)
+    drawable_y1 = y1 - float(layer_offset_y)
+    drawable_x2 = x2 - float(layer_offset_x)
+    drawable_y2 = y2 - float(layer_offset_y)
+
+    if source_key == "FG_BG":
+        if Gimp.context_set_gradient_fg_bg_rgb() is False:
+            raise RuntimeError("GIMP could not activate the FG/BG RGB gradient")
+        active_gradient_name = "FG to BG (RGB)"
+    else:
+        gradient = _blendgimp_gradient_by_name(gradient_name)
+        if Gimp.context_set_gradient(gradient) is False:
+            raise RuntimeError(f"GIMP could not activate gradient: {gradient_name}")
+        try:
+            active_gradient_name = str(gradient.get_name() or gradient_name)
+        except Exception:
+            active_gradient_name = gradient_name
+
+    if Gimp.context_set_gradient_reverse(bool(reverse)) is False:
+        raise RuntimeError("GIMP could not set gradient reverse state")
+    if Gimp.context_set_gradient_repeat_mode(
+        BLENDGIMP_GRADIENT_REPEAT_MODES[repeat_key]
+    ) is False:
+        raise RuntimeError("GIMP could not set gradient repeat mode")
+
+    if not image.undo_group_start():
+        raise RuntimeError("GIMP could not start the Gradient undo group")
+
+    try:
+        success = layer.edit_gradient_fill(
+            BLENDGIMP_GRADIENT_TYPES[type_key],
+            0.0,
+            False,
+            3,
+            0.2,
+            True,
+            float(drawable_x1),
+            float(drawable_y1),
+            float(drawable_x2),
+            float(drawable_y2),
+        )
+        if success is False:
+            raise RuntimeError("GIMP gradient fill returned failure")
+        Gimp.displays_flush()
+    finally:
+        try:
+            image.undo_group_end()
+        except Exception:
+            pass
+
+    return {
+        "image_id": image_id,
+        "layer_id": layer_id,
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "drawable_x1": float(drawable_x1),
+        "drawable_y1": float(drawable_y1),
+        "drawable_x2": float(drawable_x2),
+        "drawable_y2": float(drawable_y2),
+        "gradient_source": source_key,
+        "gradient_name": active_gradient_name,
+        "gradient_type": type_key,
+        "reverse": bool(reverse),
+        "repeat_mode": repeat_key,
+        "layer_offset_x": int(layer_offset_x),
+        "layer_offset_y": int(layer_offset_y),
+    }
+
+
+BLENDGIMP_PAINT_TOOL_NAMES = {
+    "PAINTBRUSH": "Paintbrush",
+    "PENCIL": "Pencil",
+    "ERASER": "Eraser",
+    "AIRBRUSH": "Airbrush",
+    "SMUDGE": "Smudge",
+    "CLONE": "Clone",
+    "HEAL": "Heal",
+}
+
+
+def _normalize_blendgimp_paint_tool(tool):
+    tool = str(tool or "PAINTBRUSH").upper().strip()
+    if tool not in BLENDGIMP_PAINT_TOOL_NAMES:
+        raise ValueError(f"Unsupported BlendGimp paint tool: {tool}")
+    return tool
+
+
+def _call_gimp_stroke_tool(tool, layer, coordinates):
+    tool = _normalize_blendgimp_paint_tool(tool)
+    function = {
+        "PAINTBRUSH": Gimp.paintbrush_default,
+        "PENCIL": Gimp.pencil,
+        "ERASER": Gimp.eraser_default,
+        "AIRBRUSH": Gimp.airbrush_default,
+        "SMUDGE": Gimp.smudge_default,
+    }[tool]
+
+    # Current GIMP 3 GI builds hide the C array-length argument. Retain the
+    # explicit-length fallback for binding-version tolerance.
+    try:
+        success = function(layer, coordinates)
+    except TypeError:
+        success = function(layer, len(coordinates), coordinates)
+
+    if success is False:
+        raise RuntimeError(f"GIMP {BLENDGIMP_PAINT_TOOL_NAMES[tool]} returned failure")
+
+
+def _call_gimp_clone_tool(
+    layer,
+    source_layer,
+    source_x,
+    source_y,
+    coordinates,
+):
+    clone_type = Gimp.CloneType.IMAGE
+    try:
+        success = Gimp.clone(
+            layer,
+            source_layer,
+            clone_type,
+            float(source_x),
+            float(source_y),
+            coordinates,
+        )
+    except TypeError:
+        success = Gimp.clone(
+            layer,
+            source_layer,
+            clone_type,
+            float(source_x),
+            float(source_y),
+            len(coordinates),
+            coordinates,
+        )
+    if success is False:
+        raise RuntimeError("GIMP Clone returned failure")
+
+
+def _call_gimp_heal_tool(
+    layer,
+    source_layer,
+    source_x,
+    source_y,
+    coordinates,
+):
+    try:
+        success = Gimp.heal(
+            layer,
+            source_layer,
+            float(source_x),
+            float(source_y),
+            coordinates,
+        )
+    except TypeError:
+        success = Gimp.heal(
+            layer,
+            source_layer,
+            float(source_x),
+            float(source_y),
+            len(coordinates),
+            coordinates,
+        )
+    if success is False:
+        raise RuntimeError("GIMP Heal returned failure")
+
+
+def _blendgimp_clone_segment(
+    image_id,
+    layer_id,
+    source_image_id,
+    source_layer_id,
+    source_x,
+    source_y,
+    reference_dest_x,
+    reference_dest_y,
+    strokes,
+):
+    """Clone one image-space segment while preserving source alignment."""
+    _, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
+    _, source_layer = _gimp_resolve_image_layer(int(source_image_id), int(source_layer_id))
+
+    if layer.is_group() or source_layer.is_group():
+        raise ValueError("GIMP Clone requires raster source and destination layers")
+    if not isinstance(strokes, (list, tuple)) or len(strokes) < 2 or len(strokes) % 2:
+        raise ValueError("Clone stroke coordinates must contain x/y pairs")
+
+    image_coordinates = [float(value) for value in strokes]
+    first_x = image_coordinates[0]
+    first_y = image_coordinates[1]
+
+    source_offset_x, source_offset_y = _blendgimp_layer_offsets(source_layer)
+    dest_offset_x, dest_offset_y = _blendgimp_layer_offsets(layer)
+
+    adjusted_source_x = (
+        float(source_x)
+        + (first_x - float(reference_dest_x))
+        - float(source_offset_x)
+    )
+    adjusted_source_y = (
+        float(source_y)
+        + (first_y - float(reference_dest_y))
+        - float(source_offset_y)
+    )
+
+    local_coordinates = []
+    for index in range(0, len(image_coordinates), 2):
+        local_coordinates.extend((
+            image_coordinates[index] - float(dest_offset_x),
+            image_coordinates[index + 1] - float(dest_offset_y),
+        ))
+
+    _call_gimp_clone_tool(
+        layer,
+        source_layer,
+        adjusted_source_x,
+        adjusted_source_y,
+        local_coordinates,
+    )
+    return int(len(image_coordinates) // 2)
+
+
+def _blendgimp_heal_segment(
+    image_id,
+    layer_id,
+    source_image_id,
+    source_layer_id,
+    source_x,
+    source_y,
+    reference_dest_x,
+    reference_dest_y,
+    strokes,
+):
+    """Heal one image-space segment while preserving source alignment."""
+    _, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
+    _, source_layer = _gimp_resolve_image_layer(int(source_image_id), int(source_layer_id))
+
+    if layer.is_group() or source_layer.is_group():
+        raise ValueError("GIMP Heal requires raster source and destination layers")
+    if not isinstance(strokes, (list, tuple)) or len(strokes) < 2 or len(strokes) % 2:
+        raise ValueError("Heal stroke coordinates must contain x/y pairs")
+
+    image_coordinates = [float(value) for value in strokes]
+    first_x = image_coordinates[0]
+    first_y = image_coordinates[1]
+
+    source_offset_x, source_offset_y = _blendgimp_layer_offsets(source_layer)
+    dest_offset_x, dest_offset_y = _blendgimp_layer_offsets(layer)
+
+    adjusted_source_x = (
+        float(source_x)
+        + (first_x - float(reference_dest_x))
+        - float(source_offset_x)
+    )
+    adjusted_source_y = (
+        float(source_y)
+        + (first_y - float(reference_dest_y))
+        - float(source_offset_y)
+    )
+
+    local_coordinates = []
+    for index in range(0, len(image_coordinates), 2):
+        local_coordinates.extend((
+            image_coordinates[index] - float(dest_offset_x),
+            image_coordinates[index + 1] - float(dest_offset_y),
+        ))
+
+    _call_gimp_heal_tool(
+        layer,
+        source_layer,
+        adjusted_source_x,
+        adjusted_source_y,
+        local_coordinates,
+    )
+    return int(len(image_coordinates) // 2)
 
 
 def gimp_paint_stroke(
     image_id,
     layer_id,
     strokes,
+    tool="PAINTBRUSH",
     flush=True,
     include_brush_state=True
 ):
-    """
-    MAIN THREAD ONLY.
+    """MAIN THREAD ONLY. Paint one image-space stroke with a real GIMP paint tool."""
 
-    Paint one UV-space stroke with GIMP's active paintbrush. `strokes` is a
-    flat list:
-        [x0, y0, x1, y1, ...]
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    tool = _normalize_blendgimp_paint_tool(tool)
 
-    This deliberately does NOT invoke Blender-originated pixel echo
-    suppression. GIMP owns this paint operation, so normal GIMP -> Blender
-    Auto Sync must observe the resulting raster change.
-    """
-
-    image_id = int(
-        image_id
-    )
-
-    layer_id = int(
-        layer_id
-    )
-
-    image, layer = _gimp_resolve_image_layer(
-        image_id,
-        layer_id
-    )
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
 
     if layer.is_group():
-        raise ValueError(
-            "Direct GIMP painting requires a raster layer"
-        )
+        raise ValueError("Direct GIMP painting requires a raster layer")
 
-    if not isinstance(
-        strokes,
-        (list, tuple)
-    ):
-        raise ValueError(
-            "Stroke coordinates must be a list"
-        )
+    if not isinstance(strokes, (list, tuple)):
+        raise ValueError("Stroke coordinates must be a list")
 
-    if len(
-        strokes
-    ) < 2:
-        raise ValueError(
-            "A GIMP stroke requires at least one x/y point"
-        )
+    if len(strokes) < 2:
+        raise ValueError("A GIMP stroke requires at least one x/y point")
 
-    if (
-        len(
-            strokes
-        )
-        % 2
-        != 0
-    ):
-        raise ValueError(
-            "GIMP stroke coordinate count must be even"
-        )
+    if len(strokes) % 2 != 0:
+        raise ValueError("GIMP stroke coordinate count must be even")
 
-    if len(
-        strokes
-    ) > 32768:
-        raise ValueError(
-            "GIMP stroke contains too many coordinate values"
-        )
+    if len(strokes) > 32768:
+        raise ValueError("GIMP stroke contains too many coordinate values")
 
-    coordinates = [
-        float(
-            value
-        )
-        for value in strokes
-    ]
-
-    # GIMP 3 Python GI hides the C array-length argument on current builds.
-    # Retain the explicit-length fallback for binding compatibility.
-    try:
-        success = Gimp.paintbrush_default(
-            layer,
-            coordinates
-        )
-    except TypeError:
-        success = Gimp.paintbrush_default(
-            layer,
-            len(
-                coordinates
-            ),
-            coordinates
-        )
-
-    if success is False:
-        raise RuntimeError(
-            "GIMP paintbrush_default returned failure"
-        )
+    coordinates = [float(value) for value in strokes]
+    if tool in {"CLONE", "HEAL"}:
+        raise ValueError(f"{BLENDGIMP_PAINT_TOOL_NAMES[tool]} strokes require an explicit source and streamed source state")
+    _call_gimp_stroke_tool(tool, layer, coordinates)
 
     if flush:
         Gimp.displays_flush()
 
-    brush_state = (
-        gimp_get_brush_state()
-        if include_brush_state
-        else {}
-    )
+    brush_state = gimp_get_brush_state() if include_brush_state else {}
 
     return {
         "image_id": image_id,
         "layer_id": layer_id,
-        "point_count": int(
-            len(
-                coordinates
-            )
-            // 2
-        ),
+        "tool": tool,
+        "point_count": int(len(coordinates) // 2),
         **brush_state,
     }
 
@@ -2206,106 +2824,321 @@ def gimp_paint_stroke(
 def gimp_begin_direct_paint_stroke(
     image_id,
     layer_id,
-    stroke_id
+    stroke_id,
+    tool="PAINTBRUSH",
+    source_image_id=None,
+    source_layer_id=None,
+    source_x=None,
+    source_y=None,
 ):
-    """
-    MAIN THREAD ONLY.
+    """MAIN THREAD ONLY. Open one GIMP undo group for a streamed BlendGimp stroke."""
 
-    Open one GIMP undo group for a streamed Blender 3D stroke.
-    """
-
-    image_id = int(
-        image_id
-    )
-
-    layer_id = int(
-        layer_id
-    )
-
-    stroke_id = str(
-        stroke_id
-    ).strip()
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    stroke_id = str(stroke_id).strip()
+    tool = _normalize_blendgimp_paint_tool(tool)
 
     if not stroke_id:
-        raise ValueError(
-            "Direct paint stroke ID is required"
-        )
+        raise ValueError("Direct paint stroke ID is required")
 
-    image, layer = _gimp_resolve_image_layer(
-        image_id,
-        layer_id
-    )
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
 
     if layer.is_group():
-        raise ValueError(
-            "Direct GIMP painting requires a raster layer"
-        )
+        raise ValueError("Direct GIMP painting requires a raster layer")
 
     if stroke_id in BLENDGIMP_ACTIVE_DIRECT_STROKES:
-        raise ValueError(
-            f"Direct paint stroke {stroke_id} is already active"
-        )
+        raise ValueError(f"Direct paint stroke {stroke_id} is already active")
 
-    # Only one direct stroke should remain open for a given image. If a stale
-    # one survived an interrupted client operation, close it before opening
-    # the new group.
+    source_state = {}
+    if tool in {"CLONE", "HEAL"}:
+        tool_name = BLENDGIMP_PAINT_TOOL_NAMES[tool]
+        if source_image_id is None or source_layer_id is None or source_x is None or source_y is None:
+            raise ValueError(f"{tool_name} requires source image, layer, and coordinates")
+        source_image_id = int(source_image_id)
+        source_layer_id = int(source_layer_id)
+        source_x = float(source_x)
+        source_y = float(source_y)
+        _, source_layer = _gimp_resolve_image_layer(source_image_id, source_layer_id)
+        if source_layer.is_group():
+            raise ValueError(f"{tool_name} source must be a raster layer")
+        source_state = {
+            "source_image_id": source_image_id,
+            "source_layer_id": source_layer_id,
+            "source_x": source_x,
+            "source_y": source_y,
+            "reference_dest_x": None,
+            "reference_dest_y": None,
+        }
+
     stale_ids = [
         active_id
         for active_id, active in BLENDGIMP_ACTIVE_DIRECT_STROKES.items()
-        if int(
-            active.get(
-                "image_id",
-                -1
-            )
-        ) == image_id
+        if int(active.get("image_id", -1)) == image_id
     ]
 
     for stale_id in stale_ids:
-
-        stale = BLENDGIMP_ACTIVE_DIRECT_STROKES.pop(
-            stale_id,
-            None
-        )
-
+        stale = BLENDGIMP_ACTIVE_DIRECT_STROKES.pop(stale_id, None)
         if stale is None:
             continue
-
-        stale_image = Gimp.Image.get_by_id(
-            int(
-                stale.get(
-                    "image_id",
-                    -1
-                )
-            )
-        )
-
+        stale_image = Gimp.Image.get_by_id(int(stale.get("image_id", -1)))
         if stale_image is not None and stale_image.is_valid():
-
             try:
                 stale_image.undo_group_end()
             except Exception:
                 pass
 
     if not image.undo_group_start():
-        raise RuntimeError(
-            "GIMP could not start the direct-paint undo group"
-        )
+        raise RuntimeError("GIMP could not start the direct-paint undo group")
 
-    BLENDGIMP_ACTIVE_DIRECT_STROKES[
-        stroke_id
-    ] = {
+    base_brush_state = gimp_get_brush_state()
+
+    BLENDGIMP_ACTIVE_DIRECT_STROKES[stroke_id] = {
         "image_id": image_id,
         "layer_id": layer_id,
+        "tool": tool,
+        "base_brush_size": float(base_brush_state.get("brush_size", 20.0)),
+        "base_brush_opacity": float(base_brush_state.get("brush_opacity", 100.0)),
+        "pressure_application": "metadata-only",
+        "pressure_subsegments": 0,
         "chunk_count": 0,
         "point_count": 0,
+        "input_sample_count": 0,
+        "tablet_sample_count": 0,
+        "pressure_sum": 0.0,
+        "pressure_min": 1.0,
+        "pressure_max": 0.0,
+        "tilt_max": 0.0,
+        **source_state,
     }
 
     return {
         "stroke_id": stroke_id,
         "image_id": image_id,
         "layer_id": layer_id,
+        "tool": tool,
+        **({
+            "source_image_id": int(source_state["source_image_id"]),
+            "source_layer_id": int(source_state["source_layer_id"]),
+            "source_x": float(source_state["source_x"]),
+            "source_y": float(source_state["source_y"]),
+        } if source_state else {}),
         **gimp_get_brush_state(),
     }
+
+
+def _normalize_blendgimp_input_sample(sample):
+    """Normalize compact Blender tablet metadata.
+
+    Format: [pressure, tilt_x, tilt_y, is_tablet].  This foundation phase
+    transports the values faithfully but does not yet alter GIMP paint-tool
+    behavior; application is handled by later 6.4 work.
+    """
+    try:
+        if isinstance(sample, dict):
+            pressure = float(sample.get("pressure", 1.0))
+            tilt_x = float(sample.get("tilt_x", 0.0))
+            tilt_y = float(sample.get("tilt_y", 0.0))
+            is_tablet = bool(sample.get("is_tablet", False))
+        else:
+            pressure = float(sample[0])
+            tilt_x = float(sample[1])
+            tilt_y = float(sample[2])
+            is_tablet = bool(sample[3])
+    except Exception:
+        pressure, tilt_x, tilt_y, is_tablet = 1.0, 0.0, 0.0, False
+    return [
+        max(0.0, min(1.0, pressure)),
+        tilt_x,
+        tilt_y,
+        1 if is_tablet else 0,
+    ]
+
+
+def _blendgimp_input_stats(samples, expected_points):
+    expected_points = max(0, int(expected_points))
+    if not isinstance(samples, (list, tuple)):
+        samples = []
+    normalized = [
+        _normalize_blendgimp_input_sample(sample)
+        for sample in list(samples)[:expected_points]
+    ]
+    if len(normalized) < expected_points:
+        normalized.extend(
+            [[1.0, 0.0, 0.0, 0] for _ in range(expected_points - len(normalized))]
+        )
+    if not normalized:
+        return {
+            "input_sample_count": 0,
+            "tablet_sample_count": 0,
+            "pressure_min": 1.0,
+            "pressure_max": 1.0,
+            "pressure_sum": 0.0,
+            "tilt_max": 0.0,
+        }
+    pressures = [float(sample[0]) for sample in normalized]
+    tilt_max = max(
+        (float(sample[1]) ** 2 + float(sample[2]) ** 2) ** 0.5
+        for sample in normalized
+    )
+    return {
+        "input_sample_count": len(normalized),
+        "tablet_sample_count": sum(1 for sample in normalized if bool(sample[3])),
+        "pressure_min": min(pressures),
+        "pressure_max": max(pressures),
+        "pressure_sum": sum(pressures),
+        "tilt_max": float(tilt_max),
+    }
+
+
+BLENDGIMP_PRESSURE_LEVELS = 16
+BLENDGIMP_PRESSURE_ZERO_EPSILON = 0.01
+BLENDGIMP_PRESSURE_MIN_BRUSH_SIZE = 1.0
+
+
+def _blendgimp_pressure_groups(coordinates, samples):
+    """Build pressure-coherent coordinate groups for one GIMP PDB call series.
+
+    GIMP's Paintbrush/Pencil/Eraser PDB calls accept XY coordinates but no
+    per-point tablet pressure.  BlendGimp therefore groups tablet samples into
+    a small number of pressure levels and lets GIMP rasterize each connected
+    group using its real brush engine.  Group boundaries overlap one point so
+    the resulting stroke remains continuous.  Non-tablet gaps inside an
+    otherwise tablet-driven stroke inherit the nearest preceding pen pressure
+    (or the first pen pressure before the first tablet-tagged sample) rather
+    than producing a false 100% pressure spike.
+    """
+    if not isinstance(coordinates, (list, tuple)):
+        return []
+    point_count = len(coordinates) // 2
+    if point_count <= 0:
+        return []
+
+    raw_samples = list(samples) if isinstance(samples, (list, tuple)) else []
+    normalized = [
+        _normalize_blendgimp_input_sample(sample)
+        for sample in raw_samples[:point_count]
+    ]
+    if len(normalized) < point_count:
+        normalized.extend(
+            [[1.0, 0.0, 0.0, 0] for _ in range(point_count - len(normalized))]
+        )
+
+    tablet_pressures = [
+        float(sample[0]) for sample in normalized if bool(sample[3])
+    ]
+    if not tablet_pressures:
+        return []
+
+    first_tablet_pressure = tablet_pressures[0]
+    pressure_values = []
+    last_pressure = first_tablet_pressure
+    for sample in normalized:
+        if bool(sample[3]):
+            last_pressure = float(sample[0])
+        pressure_values.append(max(0.0, min(1.0, float(last_pressure))))
+
+    levels = max(2, int(BLENDGIMP_PRESSURE_LEVELS))
+    buckets = [
+        int(round(value * float(levels - 1)))
+        for value in pressure_values
+    ]
+
+    runs = []
+    run_start = 0
+    run_bucket = buckets[0]
+    for index in range(1, point_count):
+        if buckets[index] == run_bucket:
+            continue
+        runs.append((run_start, index - 1))
+        run_start = index
+        run_bucket = buckets[index]
+    runs.append((run_start, point_count - 1))
+
+    groups = []
+    for start, end in runs:
+        coordinate_start = max(0, start - 1) if start > 0 else start
+        group_coordinates = []
+        for point_index in range(coordinate_start, end + 1):
+            group_coordinates.extend((
+                float(coordinates[point_index * 2]),
+                float(coordinates[point_index * 2 + 1]),
+            ))
+        representative = sum(pressure_values[start:end + 1]) / max(1, end - start + 1)
+        groups.append((group_coordinates, max(0.0, min(1.0, representative))))
+    return groups
+
+
+def _call_gimp_pressure_tool(tool, layer, coordinates, pressure, base_brush_size):
+    """Apply one pressure-coherent subsegment using GIMP's raster engine.
+
+    Airbrush and Smudge expose a native pressure parameter in GIMP 3.2.4.
+    Paintbrush, Pencil, and Eraser do not, so pressure is mapped to GIMP brush
+    size for the duration of the subsegment.  The caller restores the shared
+    brush size after the full segment has been processed.
+    """
+    tool = _normalize_blendgimp_paint_tool(tool)
+    pressure = max(0.0, min(1.0, float(pressure)))
+    if pressure <= BLENDGIMP_PRESSURE_ZERO_EPSILON:
+        return False
+
+    if tool in {"AIRBRUSH", "SMUDGE"}:
+        function = Gimp.airbrush if tool == "AIRBRUSH" else Gimp.smudge
+        # GIMP's PDB pressure parameter uses the tool's traditional 0..100
+        # pressure scale.  BlendGimp transports normalized Blender pressure.
+        native_pressure = pressure * 100.0
+        try:
+            success = function(layer, native_pressure, coordinates)
+        except TypeError:
+            success = function(layer, native_pressure, len(coordinates), coordinates)
+        if success is False:
+            raise RuntimeError(
+                f"GIMP {BLENDGIMP_PAINT_TOOL_NAMES[tool]} pressure stroke returned failure"
+            )
+        return True
+
+    if tool in {"PAINTBRUSH", "PENCIL", "ERASER"}:
+        pressure_size = max(
+            float(BLENDGIMP_PRESSURE_MIN_BRUSH_SIZE),
+            float(base_brush_size) * pressure,
+        )
+        if Gimp.context_set_brush_size(pressure_size) is False:
+            raise RuntimeError("GIMP could not apply tablet pressure brush size")
+        _call_gimp_stroke_tool(tool, layer, coordinates)
+        return True
+
+    return False
+
+
+def _gimp_paint_pressure_segment(image_id, layer_id, coordinates, samples, tool, base_brush_size):
+    """Paint one segment with tablet pressure, returning application diagnostics."""
+    groups = _blendgimp_pressure_groups(coordinates, samples)
+    if not groups or tool not in {"PAINTBRUSH", "PENCIL", "ERASER", "AIRBRUSH", "SMUDGE"}:
+        result = gimp_paint_stroke(
+            image_id, layer_id, coordinates, tool=tool, flush=False, include_brush_state=False
+        )
+        return int(result.get("point_count", 0)), "metadata-only", 0
+
+    _image, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
+    calls = 0
+    try:
+        for group_coordinates, pressure in groups:
+            if _call_gimp_pressure_tool(
+                tool, layer, group_coordinates, pressure, float(base_brush_size)
+            ):
+                calls += 1
+    finally:
+        if tool in {"PAINTBRUSH", "PENCIL", "ERASER"}:
+            try:
+                Gimp.context_set_brush_size(float(base_brush_size))
+            except Exception:
+                pass
+
+    application = (
+        "gimp-native-pressure"
+        if tool in {"AIRBRUSH", "SMUDGE"}
+        else "gimp-brush-size-pressure"
+    )
+    return int(len(coordinates) // 2), application, int(calls)
 
 
 def gimp_paint_direct_stroke_chunk(
@@ -2313,132 +3146,179 @@ def gimp_paint_direct_stroke_chunk(
     layer_id,
     stroke_id,
     strokes,
-    segments=None
+    segments=None,
+    input_samples=None,
+    input_segments=None
 ):
-    """
-    MAIN THREAD ONLY.
+    """MAIN THREAD ONLY. Paint one chunk inside an already-open undo group."""
 
-    Paint one chunk inside an already-open undo group.
-    """
+    image_id = int(image_id)
+    layer_id = int(layer_id)
+    stroke_id = str(stroke_id)
 
-    image_id = int(
-        image_id
-    )
-
-    layer_id = int(
-        layer_id
-    )
-
-    stroke_id = str(
-        stroke_id
-    )
-
-    active = BLENDGIMP_ACTIVE_DIRECT_STROKES.get(
-        stroke_id
-    )
-
+    active = BLENDGIMP_ACTIVE_DIRECT_STROKES.get(stroke_id)
     if active is None:
-        raise ValueError(
-            f"Direct paint stroke {stroke_id} is not active"
-        )
+        raise ValueError(f"Direct paint stroke {stroke_id} is not active")
 
     if (
-        int(
-            active.get(
-                "image_id",
-                -1
-            )
-        ) != image_id
-        or int(
-            active.get(
-                "layer_id",
-                -1
-            )
-        ) != layer_id
+        int(active.get("image_id", -1)) != image_id
+        or int(active.get("layer_id", -1)) != layer_id
     ):
-        raise ValueError(
-            "Direct paint stroke target changed while streaming"
-        )
+        raise ValueError("Direct paint stroke target changed while streaming")
 
-    if isinstance(
-        segments,
-        (list, tuple)
-    ) and segments:
-        stroke_segments = list(
-            segments
-        )
+    tool = _normalize_blendgimp_paint_tool(active.get("tool", "PAINTBRUSH"))
+
+    if isinstance(segments, (list, tuple)) and segments:
+        stroke_segments = list(segments)
+        raw_input_segments = list(input_segments) if isinstance(input_segments, (list, tuple)) else []
     else:
-        stroke_segments = [
-            strokes
-        ]
+        stroke_segments = [strokes]
+        raw_input_segments = [input_samples] if input_samples is not None else []
 
     total_point_count = 0
+    chunk_input_stats = {
+        "input_sample_count": 0,
+        "tablet_sample_count": 0,
+        "pressure_sum": 0.0,
+        "pressure_min": 1.0,
+        "pressure_max": 0.0,
+        "tilt_max": 0.0,
+    }
+    for segment_index, segment in enumerate(stroke_segments):
+        point_count = (len(segment) // 2) if isinstance(segment, (list, tuple)) else 0
+        samples = raw_input_segments[segment_index] if segment_index < len(raw_input_segments) else None
+        stats = _blendgimp_input_stats(samples, point_count)
+        count = int(stats["input_sample_count"])
+        if count:
+            if int(chunk_input_stats["input_sample_count"]) == 0:
+                chunk_input_stats["pressure_min"] = float(stats["pressure_min"])
+                chunk_input_stats["pressure_max"] = float(stats["pressure_max"])
+            else:
+                chunk_input_stats["pressure_min"] = min(float(chunk_input_stats["pressure_min"]), float(stats["pressure_min"]))
+                chunk_input_stats["pressure_max"] = max(float(chunk_input_stats["pressure_max"]), float(stats["pressure_max"]))
+            chunk_input_stats["input_sample_count"] += count
+            chunk_input_stats["tablet_sample_count"] += int(stats["tablet_sample_count"])
+            chunk_input_stats["pressure_sum"] += float(stats["pressure_sum"])
+            chunk_input_stats["tilt_max"] = max(float(chunk_input_stats["tilt_max"]), float(stats["tilt_max"]))
+    if tool in {"CLONE", "HEAL"}:
+        first_segment = next((segment for segment in stroke_segments if isinstance(segment, (list, tuple)) and len(segment) >= 2), None)
+        if first_segment is None:
+            raise ValueError(f"{BLENDGIMP_PAINT_TOOL_NAMES[tool]} chunk has no destination coordinates")
+        if active.get("reference_dest_x") is None:
+            active["reference_dest_x"] = float(first_segment[0])
+            active["reference_dest_y"] = float(first_segment[1])
 
-    for segment in stroke_segments:
-        result = gimp_paint_stroke(
-            image_id,
-            layer_id,
-            segment,
-            flush=False,
-            include_brush_state=False
-        )
-
-        total_point_count += int(
-            result.get(
-                "point_count",
-                0
+        segment_function = _blendgimp_clone_segment if tool == "CLONE" else _blendgimp_heal_segment
+        for segment in stroke_segments:
+            if not isinstance(segment, (list, tuple)) or len(segment) < 2:
+                continue
+            total_point_count += segment_function(
+                image_id,
+                layer_id,
+                int(active["source_image_id"]),
+                int(active["source_layer_id"]),
+                float(active["source_x"]),
+                float(active["source_y"]),
+                float(active["reference_dest_x"]),
+                float(active["reference_dest_y"]),
+                segment,
             )
-        )
+    else:
+        pressure_application = "mouse-fast-path"
+        pressure_subsegments = 0
+        for segment_index, segment in enumerate(stroke_segments):
+            if not isinstance(segment, (list, tuple)) or len(segment) < 2:
+                continue
+            samples = raw_input_segments[segment_index] if segment_index < len(raw_input_segments) else None
+            segment_tablet_samples = 0
+            if isinstance(samples, (list, tuple)):
+                segment_tablet_samples = sum(
+                    1
+                    for sample in list(samples)[: len(segment) // 2]
+                    if bool(_normalize_blendgimp_input_sample(sample)[3])
+                )
+
+            if segment_tablet_samples > 0:
+                painted_points, segment_application, segment_calls = _gimp_paint_pressure_segment(
+                    image_id,
+                    layer_id,
+                    segment,
+                    samples,
+                    tool,
+                    float(active.get("base_brush_size", 20.0)),
+                )
+                total_point_count += int(painted_points)
+                pressure_subsegments += int(segment_calls)
+                if segment_application != "metadata-only":
+                    pressure_application = segment_application
+            else:
+                result = gimp_paint_stroke(
+                    image_id,
+                    layer_id,
+                    segment,
+                    tool=tool,
+                    flush=False,
+                    include_brush_state=False,
+                )
+                total_point_count += int(result.get("point_count", 0))
+
+        active["pressure_application"] = pressure_application
+        active["pressure_subsegments"] = int(active.get("pressure_subsegments", 0)) + int(pressure_subsegments)
 
     Gimp.displays_flush()
 
     result = {
         "image_id": image_id,
         "layer_id": layer_id,
-        "point_count": int(
-            total_point_count
-        ),
-        "segment_count": len(
-            stroke_segments
-        ),
+        "tool": tool,
+        "point_count": int(total_point_count),
+        "segment_count": len(stroke_segments),
+        **({
+            "source_image_id": int(active["source_image_id"]),
+            "source_layer_id": int(active["source_layer_id"]),
+            "source_x": float(active["source_x"]),
+            "source_y": float(active["source_y"]),
+            "reference_dest_x": float(active["reference_dest_x"]),
+            "reference_dest_y": float(active["reference_dest_y"]),
+        } if tool in {"CLONE", "HEAL"} else {}),
         **gimp_get_brush_state(),
     }
 
-    active[
-        "chunk_count"
-    ] = int(
-        active.get(
-            "chunk_count",
-            0
-        )
-    ) + 1
-
-    active[
-        "point_count"
-    ] = int(
-        active.get(
-            "point_count",
-            0
-        )
-    ) + int(
-        result.get(
-            "point_count",
-            0
-        )
-    )
+    active["chunk_count"] = int(active.get("chunk_count", 0)) + 1
+    active["point_count"] = int(active.get("point_count", 0)) + int(result.get("point_count", 0))
+    previous_input_count = int(active.get("input_sample_count", 0))
+    chunk_input_count = int(chunk_input_stats["input_sample_count"])
+    if chunk_input_count:
+        if previous_input_count == 0:
+            active["pressure_min"] = float(chunk_input_stats["pressure_min"])
+            active["pressure_max"] = float(chunk_input_stats["pressure_max"])
+        else:
+            active["pressure_min"] = min(float(active.get("pressure_min", 1.0)), float(chunk_input_stats["pressure_min"]))
+            active["pressure_max"] = max(float(active.get("pressure_max", 0.0)), float(chunk_input_stats["pressure_max"]))
+        active["input_sample_count"] = previous_input_count + chunk_input_count
+        active["tablet_sample_count"] = int(active.get("tablet_sample_count", 0)) + int(chunk_input_stats["tablet_sample_count"])
+        active["pressure_sum"] = float(active.get("pressure_sum", 0.0)) + float(chunk_input_stats["pressure_sum"])
+        active["tilt_max"] = max(float(active.get("tilt_max", 0.0)), float(chunk_input_stats["tilt_max"]))
 
     return {
         "stroke_id": stroke_id,
-        "chunk_index": int(
-            active[
-                "chunk_count"
-            ]
+        "chunk_index": int(active["chunk_count"]),
+        "total_point_count": int(active["point_count"]),
+        "tablet_transport": (
+            "pressure-applied"
+            if str(active.get("pressure_application", "metadata-only")) not in {"metadata-only", "mouse-fast-path"}
+            else "metadata-only"
         ),
-        "total_point_count": int(
-            active[
-                "point_count"
-            ]
+        "pressure_application": str(active.get("pressure_application", "metadata-only")),
+        "pressure_subsegments": int(pressure_subsegments if tool not in {"CLONE", "HEAL"} else 0),
+        "input_sample_count": int(chunk_input_stats["input_sample_count"]),
+        "tablet_sample_count": int(chunk_input_stats["tablet_sample_count"]),
+        "pressure_min": float(chunk_input_stats["pressure_min"]),
+        "pressure_max": float(chunk_input_stats["pressure_max"] if int(chunk_input_stats["input_sample_count"]) else 1.0),
+        "pressure_avg": (
+            float(chunk_input_stats["pressure_sum"]) / max(1, int(chunk_input_stats["input_sample_count"]))
         ),
+        "tilt_max": float(chunk_input_stats["tilt_max"]),
         **result,
     }
 
@@ -2465,6 +3345,7 @@ def gimp_end_direct_paint_stroke(
         return {
             "stroke_id": stroke_id,
             "ended": False,
+            "tool": "PAINTBRUSH",
             "chunk_count": 0,
             "point_count": 0,
         }
@@ -2511,6 +3392,24 @@ def gimp_end_direct_paint_stroke(
                 0
             )
         ),
+        "tool": _normalize_blendgimp_paint_tool(
+            active.get("tool", "PAINTBRUSH")
+        ),
+        "tablet_transport": (
+            "pressure-applied"
+            if str(active.get("pressure_application", "metadata-only")) not in {"metadata-only", "mouse-fast-path"}
+            else "metadata-only"
+        ),
+        "pressure_application": str(active.get("pressure_application", "metadata-only")),
+        "pressure_subsegments": int(active.get("pressure_subsegments", 0)),
+        "input_sample_count": int(active.get("input_sample_count", 0)),
+        "tablet_sample_count": int(active.get("tablet_sample_count", 0)),
+        "pressure_min": float(active.get("pressure_min", 1.0)),
+        "pressure_max": float(active.get("pressure_max", 1.0) if int(active.get("input_sample_count", 0)) else 1.0),
+        "pressure_avg": (
+            float(active.get("pressure_sum", 0.0)) / max(1, int(active.get("input_sample_count", 0)))
+        ),
+        "tilt_max": float(active.get("tilt_max", 0.0)),
     }
 
 
@@ -2869,9 +3768,27 @@ def gimp_set_layer_pixels_binary(
 
     Gimp.displays_flush()
 
-    _blendgimp_accept_blender_originated_write(
+    accepted_composite = _blendgimp_accept_blender_originated_write(
         image_id
     )
+
+    composite_patch = b""
+    composite_width = int(image.get_width())
+    composite_height = int(image.get_height())
+    sync_token = _blendgimp_composite_token(image_id)
+    if accepted_composite is not None:
+        composite_width = int(accepted_composite.get("width", composite_width))
+        composite_height = int(accepted_composite.get("height", composite_height))
+        sync_token = str(accepted_composite.get("sync_token", sync_token))
+        composite_patch = _blendgimp_crop_rgba_region(
+            accepted_composite.get("pixels", b""),
+            composite_width,
+            composite_height,
+            write_left,
+            write_top,
+            write_width,
+            write_height,
+        )
 
     return {
         "image_id": image_id,
@@ -2885,12 +3802,95 @@ def gimp_set_layer_pixels_binary(
         "byte_length": len(
             write_pixels
         ),
+        "sync_token": sync_token,
+        "image_width": composite_width,
+        "image_height": composite_height,
+        "composite_x": write_left,
+        "composite_y": write_top,
+        "composite_width": write_width,
+        "composite_height": write_height,
+        "composite_byte_length": len(composite_patch),
+        "_binary_payload": composite_patch,
         "clipped": bool(
             write_width != region_width
             or write_height != region_height
             or write_left != requested_left
             or write_top != requested_top
         ),
+    }
+
+
+def gimp_get_layer_pixels_binary(
+    image_id,
+    layer_id,
+    image_x=None,
+    image_y=None,
+    region_width=None,
+    region_height=None,
+):
+    """MAIN THREAD ONLY. Return raw raster-layer RGBA8 without compositing."""
+
+    image, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
+    if layer.is_group():
+        raise ValueError("Cannot read raster pixels directly from a GIMP group layer")
+
+    image_width = int(image.get_width())
+    image_height = int(image.get_height())
+    layer_width = int(layer.get_width())
+    layer_height = int(layer.get_height())
+    layer_offset_x, layer_offset_y = _blendgimp_layer_offsets(layer)
+
+    if image_x is None or image_y is None or region_width is None or region_height is None:
+        requested_left = layer_offset_x
+        requested_top = layer_offset_y
+        requested_right = layer_offset_x + layer_width
+        requested_bottom = layer_offset_y + layer_height
+    else:
+        requested_left = int(image_x)
+        requested_top = int(image_y)
+        requested_right = requested_left + int(region_width)
+        requested_bottom = requested_top + int(region_height)
+
+    read_left = max(requested_left, layer_offset_x, 0)
+    read_top = max(requested_top, layer_offset_y, 0)
+    read_right = min(requested_right, layer_offset_x + layer_width, image_width)
+    read_bottom = min(requested_bottom, layer_offset_y + layer_height, image_height)
+
+    if read_right <= read_left or read_bottom <= read_top:
+        return {
+            "image_id": int(image_id), "layer_id": int(layer_id),
+            "image_width": image_width, "image_height": image_height,
+            "x": int(read_left), "y": int(read_top),
+            "width": 0, "height": 0, "layer_offset_x": layer_offset_x,
+            "layer_offset_y": layer_offset_y, "pixel_format": "R'G'B'A u8",
+            "origin": "top-left", "byte_length": 0, "_binary_payload": b"",
+        }
+
+    read_width = read_right - read_left
+    read_height = read_bottom - read_top
+    local_x = read_left - layer_offset_x
+    local_y = read_top - layer_offset_y
+    buffer = layer.get_buffer()
+    if buffer is None:
+        raise RuntimeError("GIMP did not return a GEGL buffer for the selected layer")
+    rectangle = Gegl.Rectangle.new(local_x, local_y, read_width, read_height)
+    pixel_result = buffer.get(rectangle, 1.0, "R'G'B'A u8", Gegl.AbyssPolicy.NONE)
+    raw_pixels = _blendgimp_bytes_from_gi(pixel_result)
+    expected = read_width * read_height * 4
+    if len(raw_pixels) != expected:
+        raise RuntimeError(
+            f"Unexpected layer byte count. Expected {expected}, got {len(raw_pixels)}"
+        )
+    return {
+        "image_id": int(image_id), "layer_id": int(layer_id),
+        "image_width": image_width, "image_height": image_height,
+        "x": int(read_left), "y": int(read_top),
+        "width": int(read_width), "height": int(read_height),
+        "layer_offset_x": int(layer_offset_x), "layer_offset_y": int(layer_offset_y),
+        "layer_width": int(layer_width), "layer_height": int(layer_height),
+        "pixel_format": "R'G'B'A u8", "alpha": "straight",
+        "origin": "top-left", "byte_length": len(raw_pixels),
+        "_binary_payload": raw_pixels,
     }
 
 
@@ -4258,7 +5258,8 @@ def gimp_get_image_pixels(
 
 
 def gimp_get_image_dirty_pixels_binary(
-    image_id
+    image_id,
+    full_width_rows=False
 ):
     """
     MAIN THREAD ONLY.
@@ -4514,6 +5515,23 @@ def gimp_get_image_dirty_pixels_binary(
                 "_binary_payload": b"",
             }
 
+    # Texture Paint final commits can request a full-width row stripe.
+    # This transfers more bytes than the minimal dirty rectangle, but allows
+    # Blender to apply the result with one contiguous Image.pixels slice
+    # assignment instead of hundreds of Python row assignments. On local IPC
+    # that trade is substantially faster for 2K/4K interactive painting.
+    if bool(full_width_rows) and region_width != width:
+        x = 0
+        region_width = width
+        current_region = _blendgimp_extract_region_rgba(
+            current_pixels,
+            width,
+            x,
+            y,
+            region_width,
+            region_height,
+        )
+
     _blendgimp_store_pixel_snapshot(
         image_id,
         width,
@@ -4560,6 +5578,7 @@ def gimp_get_image_dirty_pixels_binary(
             full_byte_length
             - region_byte_length
         ),
+        "full_width_rows": bool(full_width_rows),
         "sha256": hashlib.sha256(
             current_region
         ).hexdigest(),
@@ -6453,6 +7472,154 @@ class BlendGimpIPCServer:
                     error=str(exc),
                 )
 
+        if message_type == "SET_BACKGROUND_COLOR":
+            log("SET_BACKGROUND_COLOR received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_set_background_color,
+                    message.get("rgba", [1.0, 1.0, 1.0, 1.0]),
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "BACKGROUND_COLOR_SET",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                return response
+            except Exception as exc:
+                log(f"SET_BACKGROUND_COLOR failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="SET_BACKGROUND_COLOR",
+                    error=str(exc),
+                )
+
+        if message_type == "GET_DYNAMICS":
+            log("GET_DYNAMICS received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_list_dynamics,
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "DYNAMICS",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                log(
+                    f"GET_DYNAMICS returned {len(result.get('dynamics', []))} dynamics; "
+                    f"active={result.get('active_dynamics', '')} enabled={result.get('enabled', False)}"
+                )
+                return response
+            except Exception as exc:
+                log(f"GET_DYNAMICS failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="GET_DYNAMICS",
+                    error=str(exc),
+                )
+
+        if message_type == "SET_DYNAMICS":
+            log("SET_DYNAMICS received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_set_dynamics,
+                    message.get("name", ""),
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "BRUSH_STATE_SET",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                log(f"SET_DYNAMICS active={result.get('dynamics_name', '')}")
+                return response
+            except Exception as exc:
+                log(f"SET_DYNAMICS failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="SET_DYNAMICS",
+                    error=str(exc),
+                )
+
+        if message_type == "SET_DYNAMICS_ENABLED":
+            log("SET_DYNAMICS_ENABLED received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_set_dynamics_enabled,
+                    bool(message.get("enabled", False)),
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "BRUSH_STATE_SET",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                log(f"SET_DYNAMICS_ENABLED enabled={result.get('dynamics_enabled', False)}")
+                return response
+            except Exception as exc:
+                log(f"SET_DYNAMICS_ENABLED failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="SET_DYNAMICS_ENABLED",
+                    error=str(exc),
+                )
+
+        if message_type == "SET_BRUSH_STATE":
+            log("SET_BRUSH_STATE received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_set_brush_state,
+                    message.get("state", {}),
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "BRUSH_STATE_SET",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                return response
+            except Exception as exc:
+                log(f"SET_BRUSH_STATE failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="SET_BRUSH_STATE",
+                    error=str(exc),
+                )
+
+        if message_type == "GET_BRUSHES":
+            log("GET_BRUSHES received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_list_brushes,
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "BRUSHES",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                return response
+            except Exception as exc:
+                log(f"GET_BRUSHES failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="GET_BRUSHES",
+                    error=str(exc),
+                )
+
         if message_type == "GET_BRUSH_STATE":
             log("GET_BRUSH_STATE received")
 
@@ -6486,6 +7653,112 @@ class BlendGimpIPCServer:
                     error=str(exc),
                 )
 
+        if message_type == "GET_GRADIENTS":
+            log("GET_GRADIENTS received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_list_gradients,
+                    timeout=10.0,
+                )
+                response = {
+                    "type": "GRADIENTS",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                log(f"GET_GRADIENTS returned {len(result.get('gradients', []))} gradient(s)")
+                return response
+            except Exception as exc:
+                log(f"GET_GRADIENTS failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="GET_GRADIENTS",
+                    error=str(exc),
+                )
+
+        if message_type == "GRADIENT_FILL":
+            log("GRADIENT_FILL received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_gradient_fill,
+                    int(message["image_id"]),
+                    int(message["layer_id"]),
+                    float(message["x1"]),
+                    float(message["y1"]),
+                    float(message["x2"]),
+                    float(message["y2"]),
+                    str(message.get("gradient_source", "FG_BG")),
+                    str(message.get("gradient_name", "")),
+                    str(message.get("gradient_type", "LINEAR")),
+                    bool(message.get("reverse", False)),
+                    str(message.get("repeat_mode", "NONE")),
+                    timeout=20.0,
+                )
+                response = {
+                    "type": "GRADIENT_FILLED",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                log(
+                    "GRADIENT_FILL "
+                    f"image ID {result['image_id']} layer ID {result['layer_id']} "
+                    f"start=({result['x1']:.1f},{result['y1']:.1f}) "
+                    f"end=({result['x2']:.1f},{result['y2']:.1f}) "
+                    f"type={result['gradient_type']} source={result['gradient_source']} "
+                    f"gradient={result['gradient_name']} reverse={result['reverse']} "
+                    f"repeat={result['repeat_mode']}"
+                )
+                return response
+            except Exception as exc:
+                log(f"GRADIENT_FILL failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="GRADIENT_FILL",
+                    error=str(exc),
+                )
+
+        if message_type == "BUCKET_FILL":
+            log("BUCKET_FILL received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_bucket_fill,
+                    int(message["image_id"]),
+                    int(message["layer_id"]),
+                    float(message["x"]),
+                    float(message["y"]),
+                    str(message.get("fill_type", "FOREGROUND")),
+                    timeout=15.0,
+                )
+
+                response = {
+                    "type": "BUCKET_FILLED",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+
+                log(
+                    "BUCKET_FILL "
+                    f"image ID {result['image_id']} layer ID {result['layer_id']} "
+                    f"x={result['x']:.1f} y={result['y']:.1f} "
+                    f"fill={result['fill_type']} "
+                    f"sample_merged={result['sample_merged']} "
+                    f"sample_transparent={result.get('sample_transparent', True)}"
+                )
+                return response
+
+            except Exception as exc:
+                log(f"BUCKET_FILL failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="BUCKET_FILL",
+                    error=str(exc),
+                )
+
         if message_type == "BEGIN_PAINT_STROKE":
             log("BEGIN_PAINT_STROKE received")
 
@@ -6501,6 +7774,11 @@ class BlendGimpIPCServer:
                     str(
                         message["stroke_id"]
                     ),
+                    str(message.get("tool", "PAINTBRUSH")),
+                    message.get("source_image_id"),
+                    message.get("source_layer_id"),
+                    message.get("source_x"),
+                    message.get("source_y"),
                     timeout=5.0,
                 )
 
@@ -6519,7 +7797,16 @@ class BlendGimpIPCServer:
                     "BEGIN_PAINT_STROKE "
                     f"stroke={result['stroke_id']} "
                     f"image ID {result['image_id']} "
-                    f"layer ID {result['layer_id']}"
+                    f"layer ID {result['layer_id']} "
+                    f"tool={result.get('tool', 'PAINTBRUSH')}"
+                    + (
+                        f" source_image={result.get('source_image_id')} "
+                        f"source_layer={result.get('source_layer_id')} "
+                        f"source=({float(result.get('source_x', 0.0)):.1f},"
+                        f"{float(result.get('source_y', 0.0)):.1f})"
+                        if result.get("tool") in {"CLONE", "HEAL"}
+                        else ""
+                    )
                 )
 
                 return response
@@ -6555,6 +7842,12 @@ class BlendGimpIPCServer:
                     message.get(
                         "segments"
                     ),
+                    message.get(
+                        "input_samples"
+                    ),
+                    message.get(
+                        "input_segments"
+                    ),
                     timeout=10.0,
                 )
 
@@ -6575,7 +7868,14 @@ class BlendGimpIPCServer:
                     f"chunk={result['chunk_index']} "
                     f"segments={result.get('segment_count', 1)} "
                     f"points={result['point_count']} "
-                    f"total={result['total_point_count']}"
+                    f"total={result['total_point_count']} "
+                    f"tool={result.get('tool', 'PAINTBRUSH')} "
+                    f"tablet_samples={result.get('tablet_sample_count', 0)} "
+                    f"pressure={float(result.get('pressure_min', 1.0)):.3f}-"
+                    f"{float(result.get('pressure_max', 1.0)):.3f} "
+                    f"apply={result.get('pressure_application', 'metadata-only')} "
+                    f"pressure_calls={int(result.get('pressure_subsegments', 0))} "
+                    f"tilt_max={float(result.get('tilt_max', 0.0)):.3f}"
                 )
 
                 return response
@@ -6618,7 +7918,15 @@ class BlendGimpIPCServer:
                     "END_PAINT_STROKE "
                     f"stroke={result['stroke_id']} "
                     f"chunks={result.get('chunk_count', 0)} "
-                    f"points={result.get('point_count', 0)}"
+                    f"points={result.get('point_count', 0)} "
+                    f"tool={result.get('tool', 'PAINTBRUSH')} "
+                    f"tablet_samples={result.get('tablet_sample_count', 0)} "
+                    f"pressure={float(result.get('pressure_min', 1.0)):.3f}-"
+                    f"{float(result.get('pressure_max', 1.0)):.3f} "
+                    f"avg={float(result.get('pressure_avg', 1.0)):.3f} "
+                    f"apply={result.get('pressure_application', 'metadata-only')} "
+                    f"pressure_calls={int(result.get('pressure_subsegments', 0))} "
+                    f"tilt_max={float(result.get('tilt_max', 0.0)):.3f}"
                 )
 
                 return response
@@ -6656,6 +7964,7 @@ class BlendGimpIPCServer:
                     image_id,
                     layer_id,
                     strokes,
+                    str(message.get("tool", "PAINTBRUSH")),
                     timeout=15.0,
                 )
 
@@ -6744,6 +8053,39 @@ class BlendGimpIPCServer:
                     message,
                     command="ENSURE_PAINT_LAYER",
                     error=str(exc),
+                )
+
+
+        if message_type == "GET_LAYER_PIXELS_BINARY":
+            log("GET_LAYER_PIXELS_BINARY received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                supplied = all(key in message for key in ("x", "y", "width", "height"))
+                result = self.dispatcher.call(
+                    gimp_get_layer_pixels_binary,
+                    image_id,
+                    layer_id,
+                    int(message["x"]) if supplied else None,
+                    int(message["y"]) if supplied else None,
+                    int(message["width"]) if supplied else None,
+                    int(message["height"]) if supplied else None,
+                    timeout=30.0,
+                )
+                response = {"type": "LAYER_PIXELS_BINARY", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(
+                    "GET_LAYER_PIXELS_BINARY "
+                    f"image ID {image_id} layer ID {layer_id} -> "
+                    f"x={result['x']} y={result['y']} "
+                    f"{result['width']}x{result['height']} "
+                    f"{result['byte_length']} raw RGBA bytes"
+                )
+                return response
+            except Exception as exc:
+                log(f"GET_LAYER_PIXELS_BINARY failed: {exc}")
+                return self._error_response(
+                    message, command="GET_LAYER_PIXELS_BINARY", error=str(exc)
                 )
 
 
@@ -6882,10 +8224,14 @@ class BlendGimpIPCServer:
                 image_id = int(
                     message["image_id"]
                 )
+                full_width_rows = bool(
+                    message.get("full_width_rows", False)
+                )
 
                 result = self.dispatcher.call(
                     gimp_get_image_dirty_pixels_binary,
                     image_id,
+                    full_width_rows,
                     timeout=30.0,
                 )
 

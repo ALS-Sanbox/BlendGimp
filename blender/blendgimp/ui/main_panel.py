@@ -8619,7 +8619,7 @@ class BLENDGIMP_PT_main_panel(
         # ====================================================
 
         layout.label(
-            text="BlendGimp 0.4.0"
+            text="BlendGimp 0.4.1"
         )
 
         layout.separator()

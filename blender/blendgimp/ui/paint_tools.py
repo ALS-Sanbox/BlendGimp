@@ -31,7 +31,7 @@ from ..ipc.connection import connection_manager, set_direct_paint_refresh_owner
 from . import main_panel
 from . import texture_editor
 
-BUILD_ID = "6.4.2-pressure-application"
+BUILD_ID = "6.5.1-canvas-uv-polish"
 
 
 LIVE_REFRESH_INTERVAL = 0.125  # Throttled authoritative GIMP updates while LMB is down.
@@ -2926,7 +2926,7 @@ def register():
         default=False,
     )
 
-    print("BLENDGIMP: Phase 6.4.2 Tablet Pressure Application registered — build 6.4.2-pressure-application")
+    print("BLENDGIMP: Phase 6.5.1 Canvas & UV Polish registered — build 6.5.1-canvas-uv-polish")
 
 
 def unregister():
@@ -2992,4 +2992,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.4.2 Tablet Pressure Application unregistered — build 6.4.2-pressure-application")
+    print("BLENDGIMP: Phase 6.5.1 Canvas & UV Polish unregistered — build 6.5.1-canvas-uv-polish")
