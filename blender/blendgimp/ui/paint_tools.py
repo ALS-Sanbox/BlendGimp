@@ -28,10 +28,12 @@ except Exception:
     batch_for_shader = None
 
 from ..ipc.connection import connection_manager, set_direct_paint_refresh_owner
+from ..core.tool_state import tool_action_hint, tool_cursor, tool_label, normalize_tool
 from . import main_panel
 from . import texture_editor
+from . import preferences as blendgimp_preferences
 
-BUILD_ID = "6.5.2-native-layer-panel"
+BUILD_ID = "7.0-image-material-ui"
 
 
 LIVE_REFRESH_INTERVAL = 0.125  # Throttled authoritative GIMP updates while LMB is down.
@@ -275,17 +277,7 @@ def _dynamics_enabled_update(_self, context):
 
 
 def _tool_label(tool):
-    return {
-        "PAINTBRUSH": "Paintbrush",
-        "PENCIL": "Pencil",
-        "ERASER": "Eraser",
-        "AIRBRUSH": "Airbrush",
-        "FILL": "Fill",
-        "GRADIENT": "Gradient",
-        "SMUDGE": "Smudge",
-        "CLONE": "Clone",
-        "HEAL": "Heal",
-    }.get(str(tool), str(tool).title())
+    return tool_label(tool)
 
 
 def _refresh_brush_cache(scene):
@@ -896,6 +888,30 @@ class _Gimp2DPaintWorker:
                 self.jobs.task_done()
 
 
+def _safe_2d_preview_draw(owner, holder):
+    """Draw-handler trampoline that self-removes if Blender invalidates the operator RNA."""
+    try:
+        owner._draw_preview()
+    except ReferenceError:
+        handler = holder.get("handler") if isinstance(holder, dict) else None
+        if handler is not None:
+            try:
+                bpy.types.SpaceImageEditor.draw_handler_remove(handler, "WINDOW")
+            except Exception:
+                pass
+            holder["handler"] = None
+        return
+    except Exception as exc:
+        # A draw callback must never take down a modal owner. Log once when
+        # possible, then keep the UI alive.
+        try:
+            if not bool(getattr(owner, "_preview_draw_error_logged", False)):
+                owner._preview_draw_error_logged = True
+                print(f"BLENDGIMP: 2D preview draw recovered from error: {exc}")
+        except Exception:
+            pass
+
+
 class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
     bl_idname = "blendgimp.gimp_2d_paint"
     bl_label = "Start Texture Paint"
@@ -909,6 +925,48 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         except Exception:
             pass
 
+    def _rebind_active_layer(self, context, reason="stroke"):
+        """Resolve the artist-selected GIMP raster layer immediately before an operation.
+
+        Phase 6.5.2 Fix1: the modal owner can remain armed while the user changes
+        layers from the BlendGimp panel.  Never let the layer cached at modal
+        invoke time decide a later stroke target.
+        """
+        scene = context.scene
+        try:
+            target = main_panel.resolve_gimp_paint_target(
+                scene, self._image_id, create_if_missing=True
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            self._set_status(context, message)
+            try:
+                self.report({"WARNING"}, message)
+            except Exception:
+                pass
+            print(f"BLENDGIMP: 2D paint target unavailable reason={reason}: {message}")
+            return None
+        new_layer_id = int(target["layer_id"])
+        old_layer_id = int(getattr(self, "_layer_id", -1))
+        if new_layer_id != old_layer_id:
+            if (
+                int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1))
+                == int(self._image_id)
+                and int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1))
+                != new_layer_id
+            ):
+                main_panel.load_active_layer_buffer_from_gimp(
+                    scene, self._image_id, new_layer_id,
+                    clear_first=True, activate_target=False
+                )
+            self._layer_id = new_layer_id
+            scene.blendgimp_2d_paint_layer_id = new_layer_id
+            print(
+                "BLENDGIMP: 2D active paint layer rebound "
+                f"{old_layer_id}->{new_layer_id} reason={reason}"
+            )
+        return new_layer_id
+
     def _preview_tag_redraw(self):
         try:
             self._area.tag_redraw()
@@ -920,12 +978,15 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
             self._preview_handler = None
             return
         try:
+            holder = {"handler": None}
             self._preview_handler = bpy.types.SpaceImageEditor.draw_handler_add(
-                self._draw_preview,
-                (),
+                _safe_2d_preview_draw,
+                (self, holder),
                 "WINDOW",
                 "POST_PIXEL",
             )
+            holder["handler"] = self._preview_handler
+            self._preview_handler_holder = holder
         except Exception as exc:
             self._preview_handler = None
             print(f"BLENDGIMP: 2D preview handler unavailable: {exc}")
@@ -938,6 +999,10 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
             except Exception:
                 pass
             self._preview_handler = None
+        holder = getattr(self, "_preview_handler_holder", None)
+        if isinstance(holder, dict):
+            holder["handler"] = None
+        self._preview_handler_holder = None
         self._preview_tag_redraw()
 
     def _clone_source_preview_point(self):
@@ -1670,6 +1735,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if self._stroke_id or self._ending or getattr(self, "_commit_state", None):
             return False
 
+        if self._rebind_active_layer(context, reason="fill") is None:
+            return False
         self._acquire_refresh_owner()
         self._fill_operation_id = uuid.uuid4().hex
         self._fill_inflight = True
@@ -1733,6 +1800,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
             return False
 
         scene = context.scene
+        if self._rebind_active_layer(context, reason="gradient") is None:
+            return False
         self._acquire_refresh_owner()
         self._gradient_operation_id = uuid.uuid4().hex
         self._gradient_inflight = True
@@ -1768,6 +1837,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if self._stroke_id or self._ending or getattr(self, "_commit_state", None):
             return False
         scene = context.scene
+        if self._rebind_active_layer(context, reason="clone-source") is None:
+            return False
         x, y = float(point[0]), float(point[1])
         scene.blendgimp_clone_source_set = True
         scene.blendgimp_clone_source_image_id = int(self._image_id)
@@ -1808,6 +1879,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if self._stroke_id or self._ending or getattr(self, "_commit_state", None):
             return False
         scene = context.scene
+        if self._rebind_active_layer(context, reason="heal-source") is None:
+            return False
         x, y = float(point[0]), float(point[1])
         scene.blendgimp_heal_source_set = True
         scene.blendgimp_heal_source_image_id = int(self._image_id)
@@ -1849,6 +1922,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if self._stroke_id or self._ending or getattr(self, "_commit_state", None):
             return False
 
+        if self._rebind_active_layer(context, reason="stroke") is None:
+            return False
         tool = str(context.scene.blendgimp_paint_tool)
         source_payload = None
         if tool == "CLONE":
@@ -1960,25 +2035,16 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 reason="before 2D GIMP tool",
                 fail_if_unsent=True,
             )
-            layer_response = connection_manager.resolve_active_raster_layer(
-                scene.blendgimp_texture_editor_image_id,
-                BRUSH_FALLBACK_LAYER_NAME,
-                create_if_missing=True,
+            # Phase 6.5.4 RC Fix1: automatic pointer routing must be able to
+            # arm an idle Texture Paint owner without polling GIMP's layer tree.
+            # The active raster layer is authoritatively resolved by
+            # _rebind_active_layer() immediately before every real operation.
+            # Reuse Blender's already-synchronized layer ID only as the idle
+            # owner's initial cache.  A stale/-1 cache is harmless because no
+            # raster command uses it before the operation-time rebind.
+            resolved_layer_id = int(
+                getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)
             )
-            if bool(layer_response.get("created", False)):
-                connection_manager.consume_dirty_baseline(scene.blendgimp_texture_editor_image_id)
-
-            resolved_layer_id = int(layer_response["layer_id"])
-            if (
-                int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1))
-                == int(scene.blendgimp_texture_editor_image_id)
-                and int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1))
-                != resolved_layer_id
-            ):
-                main_panel.load_active_layer_buffer_from_gimp(
-                    scene, scene.blendgimp_texture_editor_image_id, resolved_layer_id,
-                    clear_first=True, activate_target=False
-                )
 
             if scene.blendgimp_brush_state_initialized:
                 _push_scene_brush_state(scene)
@@ -1999,7 +2065,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         self._window_region = window_region
         self._image_id = int(scene.blendgimp_texture_editor_image_id)
         self._refresh_owner_token = f"2d:{id(self)}"
-        self._layer_id = int(layer_response["layer_id"])
+        self._layer_id = int(resolved_layer_id)
         self._width = int(image.size[0])
         self._height = int(image.size[1])
         self._stroke_id = ""
@@ -2065,16 +2131,11 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
 
         scene.blendgimp_2d_paint_active = True
         scene.blendgimp_2d_paint_layer_id = self._layer_id
-        active_tool = str(scene.blendgimp_paint_tool)
-        action_hint = (
-            "LMB fill" if active_tool == "FILL"
-            else "LMB drag gradient" if active_tool == "GRADIENT"
-            else "Ctrl+LMB source • LMB clone" if active_tool == "CLONE"
-            else "LMB paint"
-        )
+        self._active_tool = normalize_tool(scene.blendgimp_paint_tool)
         self._set_status(
             context,
-            f"Auto Texture Paint — {_tool_label(active_tool)} • {action_hint}",
+            f"Auto Texture Paint — {tool_label(self._active_tool)} • "
+            f"{tool_action_hint(self._active_tool)}",
         )
 
         # 6.3.7 pointer routing keeps the normal Blender pointer over panels/UI
@@ -2149,8 +2210,32 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                         self._schedule_end_if_ready()
                 self._set_status(context, "Stroke ended — auto Texture Paint ready")
                 return {"RUNNING_MODAL"}
-            self._set_status(context, "Auto Texture Paint ready")
+            self._set_status(
+                context,
+                f"Auto Texture Paint — {tool_label(self._active_tool)} • "
+                f"{tool_action_hint(self._active_tool)}",
+            )
             return {"RUNNING_MODAL"}
+
+        requested_tool = normalize_tool(getattr(context.scene, "blendgimp_paint_tool", self._active_tool))
+        interaction_active = bool(
+            self._painting
+            or self._ending
+            or getattr(self, "_gradient_start_image", None) is not None
+        )
+        if not interaction_active and requested_tool != self._active_tool:
+            previous_tool = self._active_tool
+            self._active_tool = requested_tool
+            self._clear_preview()
+            self._set_status(
+                context,
+                f"Auto Texture Paint — {tool_label(requested_tool)} • "
+                f"{tool_action_hint(requested_tool)}",
+            )
+            print(
+                "BLENDGIMP: Phase 6.5.3 Texture Paint live tool switch "
+                f"{previous_tool}->{requested_tool}; owner preserved"
+            )
 
         if event.type == "RIGHTMOUSE" and event.value == "PRESS":
             if self._painting or self._ending or getattr(self, "_gradient_start_image", None) is not None:
@@ -2168,7 +2253,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 return {"RUNNING_MODAL"}
             return {"PASS_THROUGH"}
 
-        if event.type == "MOUSEMOVE":
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
             try:
                 over_canvas = self._inside_window_region(event)
                 area = getattr(self, "_area", None)
@@ -2181,7 +2266,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 # Only this area's canvas/UI (or a locked stroke) may alter it.
                 if over_area or self._painting:
                     context.window.cursor_modal_set(
-                        "PAINT_BRUSH" if (over_canvas or self._painting) else "DEFAULT"
+                        tool_cursor(self._active_tool, ctrl=bool(getattr(event, "ctrl", False)))
+                        if (over_canvas or self._painting) else "DEFAULT"
                     )
             except Exception:
                 pass
@@ -2204,7 +2290,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
             return {"RUNNING_MODAL"}
 
         if event.type == "LEFTMOUSE":
-            active_tool = str(context.scene.blendgimp_paint_tool)
+            active_tool = self._active_tool
             if event.value == "PRESS":
                 point = self._event_image_point(event)
                 if point is None:
@@ -2252,7 +2338,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 return {"RUNNING_MODAL"}
 
         if event.type == "MOUSEMOVE":
-            if str(context.scene.blendgimp_paint_tool) == "GRADIENT" and getattr(self, "_gradient_start_image", None) is not None:
+            if self._active_tool == "GRADIENT" and getattr(self, "_gradient_start_image", None) is not None:
                 self._update_gradient_preview(event)
                 return {"RUNNING_MODAL"}
             if self._painting:
@@ -2326,14 +2412,6 @@ def _draw_session_summary(layout, context):
         text="GIMP Connected" if connection_manager.is_connected() else "GIMP Disconnected",
         icon="CHECKMARK" if connection_manager.is_connected() else "ERROR",
     )
-    if hasattr(scene, "blendgimp_auto_pointer_routing"):
-        row.prop(
-            scene,
-            "blendgimp_auto_pointer_routing",
-            text="Auto Paint",
-            toggle=True,
-            icon="MOUSE_LMB",
-        )
 
     texture_name = str(getattr(scene, "blendgimp_texture_editor_image_name", "") or "")
     box.label(
@@ -2353,6 +2431,7 @@ def _draw_session_summary(layout, context):
     dyn = str(getattr(scene, "blendgimp_brush_dynamics_name", "") or "None")
     dyn_suffix = "on" if bool(getattr(scene, "blendgimp_brush_dynamics_enabled", False)) else "off"
     box.label(text=f"Tool: {_tool_label(tool)}  •  Brush: {brush}", icon="BRUSH_DATA")
+    box.label(text=f"Input: {tool_action_hint(tool)}", icon="MOUSE_LMB")
     box.label(text=f"Dynamics: {dyn} ({dyn_suffix})", icon="MOD_DYNAMICPAINT")
 
 
@@ -2555,33 +2634,6 @@ def _draw_projection_controls(layout, context):
     box.label(text="Modifier-aware, seam-safe projection remains active", icon="CHECKMARK")
 
 
-def _draw_diagnostics(layout, context):
-    scene = context.scene
-    expanded = bool(getattr(scene, "blendgimp_ui_show_diagnostics", False))
-    box = layout.box()
-    row = box.row(align=True)
-    row.prop(
-        scene,
-        "blendgimp_ui_show_diagnostics",
-        text="Advanced / Diagnostics",
-        emboss=False,
-        icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
-    )
-    if not expanded:
-        return
-    if scene.blendgimp_brush_status:
-        box.label(text=scene.blendgimp_brush_status)
-    if getattr(scene, "blendgimp_2d_paint_status", ""):
-        box.label(text=scene.blendgimp_2d_paint_status)
-    if getattr(scene, "blendgimp_direct_paint_status", ""):
-        box.label(text=scene.blendgimp_direct_paint_status)
-    _load_saved_brush_cache(scene)
-    _load_saved_dynamics_cache(scene)
-    box.label(text=f"Brush resources: {len(_BRUSH_NAMES)}")
-    box.label(text=f"Dynamics resources: {len(_DYNAMICS_NAMES)}")
-    box.label(text=f"Build: {BUILD_ID}", icon="INFO")
-
-
 def _draw_shared_brush(layout, context, include_start=False):
     """Unified artist UI for both BlendGimp Texture Paint and Object Paint."""
     scene = context.scene
@@ -2601,23 +2653,31 @@ def _draw_shared_brush(layout, context, include_start=False):
     # Start/ESC workflow is intentionally not exposed in the artist UI.
     routing = layout.box()
     mode = texture_editor._area_mode(context.screen, context.area)  # noqa: SLF001
-    if mode == texture_editor.MODE_TEXTURE:
+    auto_paint = blendgimp_preferences.auto_paint_enabled(context=context, scene=scene)
+    if not auto_paint:
+        row = routing.row(align=True)
+        row.label(text="Auto Paint disabled in Preferences", icon="INFO")
+        row.operator("blendgimp.open_preferences", text="", icon="PREFERENCES")
+    elif mode == texture_editor.MODE_TEXTURE:
         active = bool(getattr(scene, "blendgimp_2d_paint_active", False))
         routing.label(
             text="Texture Canvas: paint on hover" if active else "Texture Canvas: auto paint owner starting…",
             icon="CHECKMARK" if active else "TIME",
         )
-        routing.label(text="LMB paints • Ctrl+LMB sets Clone/Heal source • ESC ends current operation")
+        routing.label(
+            text=f"{tool_action_hint(scene.blendgimp_paint_tool)} • ESC ends current operation"
+        )
     else:
         active = bool(getattr(scene, "blendgimp_direct_paint_active", False))
         routing.label(
             text="3D View: paint on hover" if active else "3D View: auto paint owner starting…",
             icon="CHECKMARK" if active else "TIME",
         )
-        routing.label(text="LMB paints projected UVs • UI/panels keep normal Blender input")
+        routing.label(
+            text=f"{tool_action_hint(scene.blendgimp_paint_tool)} • UI/panels keep normal Blender input"
+        )
 
     _draw_projection_controls(layout, context)
-    _draw_diagnostics(layout, context)
 
 
 class BLENDGIMP_PT_gimp_texture_paint(bpy.types.Panel):
@@ -2921,12 +2981,7 @@ def register():
         name="Show Surface Projection",
         default=False,
     )
-    bpy.types.Scene.blendgimp_ui_show_diagnostics = bpy.props.BoolProperty(
-        name="Show Advanced Diagnostics",
-        default=False,
-    )
-
-    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel registered — build 6.5.2-native-layer-panel")
+    print(f"BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability registered — build {BUILD_ID}")
 
 
 def unregister():
@@ -2941,7 +2996,6 @@ def unregister():
     _SYNCED_BRUSH_PAYLOADS.clear()
 
     property_names = (
-        "blendgimp_ui_show_diagnostics",
         "blendgimp_ui_show_projection",
         "blendgimp_ui_show_brush_advanced",
         "blendgimp_ui_show_layers",
@@ -2992,4 +3046,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel unregistered — build 6.5.2-native-layer-panel")
+    print(f"BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability unregistered — build {BUILD_ID}")

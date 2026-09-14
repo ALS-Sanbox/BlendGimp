@@ -8,6 +8,7 @@ import re
 from bpy.app.handlers import persistent
 
 from ..core import gimp_manager
+from . import preferences as blendgimp_preferences
 from ..ipc.connection import (
     connection_manager,
     direct_paint_owns_refresh,
@@ -69,6 +70,19 @@ _ENGINE_LIFECYCLE_RUNTIME = {
 }
 
 _EXIT_PRE_HANDLED = False
+
+
+def _scene_from_context(context=None):
+    """Resolve the active Scene even when invoked from Blender Preferences."""
+    scene = getattr(context, "scene", None) if context is not None else None
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene is None and getattr(bpy.data, "scenes", None):
+        try:
+            scene = bpy.data.scenes[0]
+        except Exception:
+            scene = None
+    return scene
 
 
 def reset_engine_lifecycle_runtime():
@@ -385,46 +399,72 @@ def clear_engine_connection(
         )
 
 
+def detect_gimp_for_scene(scene, clear_on_failure=True):
+    """Detect GIMP and cache the executable/version on the active scene.
+
+    Phase 7.0 usability rule: detection is an implementation detail, not a
+    required production-workflow step. The Start GIMP operator calls this
+    automatically whenever the cached executable is missing or stale.
+    """
+
+    gimp_path = gimp_manager.find_gimp()
+
+    if gimp_path and os.path.isfile(gimp_path):
+        version = gimp_manager.get_gimp_version(gimp_path)
+        scene.blendgimp_gimp_path = gimp_path
+        scene.blendgimp_gimp_version = version or "Unknown Version"
+        scene.blendgimp_gimp_detected = True
+        scene.blendgimp_engine_last_error = ""
+        print(f"BLENDGIMP: GIMP auto-detected at {gimp_path}")
+        print(f"BLENDGIMP: Detected GIMP version = {version}")
+        return True, gimp_path, version
+
+    if clear_on_failure:
+        scene.blendgimp_gimp_detected = False
+        scene.blendgimp_gimp_path = ""
+        scene.blendgimp_gimp_version = ""
+        scene.blendgimp_gimp_running = False
+        scene.blendgimp_connected = False
+
+    return False, None, None
+
+
 def start_scene_engine(
     scene,
     automatic=False
 ):
-    """Start the selected engine mode and schedule a non-blocking connect."""
+    """Detect if needed, start the selected GIMP mode, then connect.
 
-    gimp_path = str(
-        scene.blendgimp_gimp_path
-        or ""
-    )
+    The user should never have to press Detect GIMP before Start GIMP.
+    """
 
-    if not gimp_path:
-        scene.blendgimp_engine_state = (
-            gimp_manager.ENGINE_STATE_FAILED
-        )
-        scene.blendgimp_engine_last_error = (
-            "GIMP has not been detected"
-        )
-        return False, None
+    gimp_path = str(scene.blendgimp_gimp_path or "")
 
-    if not os.path.isfile(
-        gimp_path
-    ):
-        scene.blendgimp_gimp_detected = False
-        scene.blendgimp_gimp_running = False
-        scene.blendgimp_engine_state = (
-            gimp_manager.ENGINE_STATE_FAILED
-        )
-        scene.blendgimp_engine_last_error = (
-            "The detected GIMP executable no longer exists"
-        )
-        return False, None
+    # First-run and stale-path behavior: one Start GIMP click performs the
+    # detection step automatically, stores the result, and continues launch.
+    if not gimp_path or not os.path.isfile(gimp_path):
+        detected, gimp_path, _version = detect_gimp_for_scene(scene)
+        if not detected:
+            scene.blendgimp_engine_state = gimp_manager.ENGINE_STATE_FAILED
+            scene.blendgimp_engine_last_error = (
+                "GIMP could not be detected automatically. "
+                "Open BlendGimp Preferences only if you need to troubleshoot the installation."
+            )
+            return False, None
+    else:
+        scene.blendgimp_gimp_detected = True
 
     process_was_running = (
         gimp_manager.is_gimp_running()
     )
 
+    selected_mode = blendgimp_preferences.engine_mode(scene=scene)
+    if hasattr(scene, "blendgimp_engine_mode"):
+        scene.blendgimp_engine_mode = selected_mode
+
     success, pid = gimp_manager.launch_gimp(
         gimp_path,
-        scene.blendgimp_engine_mode
+        selected_mode
     )
 
     if not success:
@@ -766,7 +806,7 @@ def blendgimp_engine_lifecycle_timer():
         )
     )
 
-    if not scene.blendgimp_engine_auto_reconnect:
+    if not blendgimp_preferences.automatic_recovery_enabled(scene=scene):
         scene.blendgimp_engine_state = (
             gimp_manager.ENGINE_STATE_FAILED
         )
@@ -5314,59 +5354,21 @@ class BLENDGIMP_OT_detect_gimp(
         context
     ):
 
-        scene = context.scene
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
 
-        gimp_path = (
-            gimp_manager.find_gimp()
-        )
+        detected, gimp_path, version = detect_gimp_for_scene(scene)
 
-        if gimp_path:
-
-            version = (
-                gimp_manager.get_gimp_version(
-                    gimp_path
-                )
-            )
-
-            scene.blendgimp_gimp_path = (
-                gimp_path
-            )
-
-            scene.blendgimp_gimp_version = (
-                version
-                or
-                "Unknown Version"
-            )
-
-            scene.blendgimp_gimp_detected = True
-
-            print(
-                "BLENDGIMP: "
-                f"GIMP found at {gimp_path}"
-            )
-
-            print(
-                "BLENDGIMP: "
-                f"Version stored = {version}"
-            )
-
+        if detected:
+            print("BLENDGIMP: Manual GIMP detection completed")
             self.report(
                 {"INFO"},
-                "GIMP detected successfully"
+                f"GIMP {version or 'Unknown Version'} detected successfully"
             )
-
         else:
-
-            scene.blendgimp_gimp_detected = False
-            scene.blendgimp_gimp_path = ""
-            scene.blendgimp_gimp_version = ""
-            scene.blendgimp_gimp_running = False
-            scene.blendgimp_connected = False
-
-            clear_image_results(
-                scene
-            )
-
+            clear_image_results(scene)
             self.report(
                 {"WARNING"},
                 "GIMP installation not found"
@@ -5395,7 +5397,10 @@ class BLENDGIMP_OT_launch_gimp(
         context
     ):
 
-        scene = context.scene
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
 
         success, pid = start_scene_engine(
             scene
@@ -5407,7 +5412,7 @@ class BLENDGIMP_OT_launch_gimp(
                 (
                     "GIMP engine starting "
                     f"PID {pid} "
-                    f"({scene.blendgimp_engine_mode})"
+                    f"({blendgimp_preferences.engine_mode(context=context, scene=scene)})"
                 )
             )
 
@@ -5443,9 +5448,14 @@ class BLENDGIMP_OT_stop_gimp(
         self,
         context
     ):
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
+
         success, _exit_code, forced = (
             stop_scene_engine(
-                context.scene
+                scene
             )
         )
 
@@ -5453,7 +5463,7 @@ class BLENDGIMP_OT_stop_gimp(
             self.report(
                 {"ERROR"},
                 (
-                    context.scene.blendgimp_engine_last_error
+                    scene.blendgimp_engine_last_error
                     or "Could not stop GIMP engine"
                 )
             )
@@ -5514,8 +5524,13 @@ class BLENDGIMP_OT_force_stop_gimp(
         except Exception:
             dirty_count = 0
 
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
+
         success, _exit_code, process_forced = stop_scene_engine(
-            context.scene,
+            scene,
             force=True
         )
 
@@ -5523,7 +5538,7 @@ class BLENDGIMP_OT_force_stop_gimp(
             self.report(
                 {"ERROR"},
                 (
-                    context.scene.blendgimp_engine_last_error
+                    scene.blendgimp_engine_last_error
                     or "Could not force-stop GIMP engine"
                 )
             )
@@ -5569,7 +5584,10 @@ class BLENDGIMP_OT_restart_gimp(
         self,
         context
     ):
-        scene = context.scene
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
 
         success, _exit_code, _forced = (
             stop_scene_engine(
@@ -5606,7 +5624,7 @@ class BLENDGIMP_OT_restart_gimp(
             (
                 "GIMP engine restarting "
                 f"PID {pid} "
-                f"({scene.blendgimp_engine_mode})"
+                f"({blendgimp_preferences.engine_mode(context=context, scene=scene)})"
             )
         )
         return {"FINISHED"}
@@ -5628,6 +5646,11 @@ class BLENDGIMP_OT_check_gimp(
         context
     ):
 
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
+
         snapshot = (
             gimp_manager.get_engine_snapshot()
         )
@@ -5638,13 +5661,13 @@ class BLENDGIMP_OT_check_gimp(
             )
         )
 
-        context.scene.blendgimp_gimp_running = (
+        scene.blendgimp_gimp_running = (
             running
         )
 
         if running:
 
-            context.scene.blendgimp_engine_state = str(
+            scene.blendgimp_engine_state = str(
                 snapshot.get(
                     "state",
                     gimp_manager.ENGINE_STATE_STARTING
@@ -5661,13 +5684,13 @@ class BLENDGIMP_OT_check_gimp(
 
         else:
 
-            context.scene.blendgimp_engine_state = str(
+            scene.blendgimp_engine_state = str(
                 snapshot.get(
                     "state",
                     gimp_manager.ENGINE_STATE_STOPPED
                 )
             )
-            context.scene.blendgimp_engine_last_error = str(
+            scene.blendgimp_engine_last_error = str(
                 snapshot.get(
                     "last_error",
                     ""
@@ -5758,7 +5781,10 @@ class BLENDGIMP_OT_ping(
         context
     ):
 
-        scene = context.scene
+        scene = _scene_from_context(context)
+        if scene is None:
+            self.report({"ERROR"}, "No active Blender scene is available")
+            return {"CANCELLED"}
 
         try:
 
@@ -5798,6 +5824,120 @@ class BLENDGIMP_OT_ping(
 
 
 # ============================================================
+# ACTIVE IMAGE / MATERIAL UI HELPERS
+# ============================================================
+
+def _image_gimp_id(image):
+    if image is None:
+        return -1
+    try:
+        return int(image.get("blendgimp_gimp_image_id", -1))
+    except Exception:
+        return -1
+
+
+def _resolve_active_gimp_image_id(context):
+    """Resolve the production-facing BlendGimp image without exposing IDs."""
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return -1
+
+    # The BlendGimp Image Editor is the strongest artist-facing signal.
+    space = getattr(context, "space_data", None)
+    if getattr(space, "type", "") == "IMAGE_EDITOR":
+        image_id = _image_gimp_id(getattr(space, "image", None))
+        if image_id >= 0:
+            return image_id
+
+    # Next prefer the active material's selected Image Texture node. This keeps
+    # the compact Image & Material card aligned with the selected object.
+    obj = getattr(context, "active_object", None)
+    material = getattr(obj, "active_material", None) if obj is not None else None
+    try:
+        if material is not None and material.use_nodes and material.node_tree is not None:
+            nodes = material.node_tree.nodes
+            candidates = []
+            active_node = getattr(nodes, "active", None)
+            if active_node is not None:
+                candidates.append(active_node)
+            candidates.extend(node for node in nodes if node is not active_node)
+            for node in candidates:
+                if getattr(node, "type", "") != "TEX_IMAGE":
+                    continue
+                image_id = _image_gimp_id(getattr(node, "image", None))
+                if image_id >= 0:
+                    return image_id
+                try:
+                    image_id = int(node.get("blendgimp_gimp_image_id", -1))
+                except Exception:
+                    image_id = -1
+                if image_id >= 0:
+                    return image_id
+    except Exception:
+        pass
+
+    # BlendGimp's editor/session ownership is the next fallback.
+    for attr in (
+        "blendgimp_texture_editor_image_id",
+        "blendgimp_auto_sync_image_id",
+        "blendgimp_created_image_id",
+    ):
+        try:
+            image_id = int(getattr(scene, attr, -1))
+        except Exception:
+            image_id = -1
+        if image_id >= 0:
+            return image_id
+
+    # If there is exactly one open GIMP image, it is unambiguous.
+    try:
+        images = get_stored_images(scene)
+        if len(images) == 1:
+            return int(images[0].get("id", -1))
+    except Exception:
+        pass
+
+    return -1
+
+
+def _resolve_active_blender_image(context, image_id=None):
+    if image_id is None:
+        image_id = _resolve_active_gimp_image_id(context)
+    try:
+        image_id = int(image_id)
+    except Exception:
+        image_id = -1
+    if image_id < 0:
+        return None
+
+    scene = getattr(context, "scene", None)
+    sync_result = get_texture_sync_result(scene, image_id) or {} if scene is not None else {}
+    image = _find_blendgimp_image(image_id, sync_result.get("sync_token", ""))
+    if image is not None:
+        return image
+
+    # Final direct lookup by persistent image metadata.
+    try:
+        for candidate in bpy.data.images:
+            if _image_gimp_id(candidate) == image_id:
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _stored_gimp_image_name(scene, image_id):
+    try:
+        image_id = int(image_id)
+        for item in get_stored_images(scene):
+            if int(item.get("id", -1)) == image_id:
+                return str(item.get("name", "") or "")
+    except Exception:
+        pass
+    return ""
+
+
+# ============================================================
 # CREATE BLENDER-OWNED GIMP IMAGE
 # ============================================================
 
@@ -5813,12 +5953,105 @@ class BLENDGIMP_OT_create_image(
         "Image, assign it to the active material, and start Auto Sync"
     )
 
+    texture_name: bpy.props.StringProperty(
+        name="Name",
+        default="BaseColor"
+    )
+    texture_width: bpy.props.IntProperty(
+        name="Width",
+        default=2048,
+        min=1,
+        max=32768
+    )
+    texture_height: bpy.props.IntProperty(
+        name="Height",
+        default=2048,
+        min=1,
+        max=32768
+    )
+    texture_format: bpy.props.EnumProperty(
+        name="Format",
+        items=(
+            ("RGBA", "RGBA", "RGB color with an alpha channel"),
+            ("RGB", "RGB", "Opaque RGB color without an alpha channel"),
+        ),
+        default="RGBA"
+    )
+    texture_background: bpy.props.EnumProperty(
+        name="Background",
+        items=(
+            ("TRANSPARENT", "Transparent", "Transparent initial layer"),
+            ("SOLID", "Solid", "Solid initial layer"),
+        ),
+        default="TRANSPARENT"
+    )
+    texture_background_color: bpy.props.FloatVectorProperty(
+        name="Background Color",
+        subtype="COLOR",
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(0.0, 0.0, 0.0, 1.0)
+    )
+    initial_layer_name: bpy.props.StringProperty(
+        name="Initial Layer",
+        default="BaseColor"
+    )
+
+    def invoke(self, context, event):
+        if not connection_manager.is_connected():
+            self.report({"ERROR"}, "BlendGimp is not connected to GIMP")
+            return {"CANCELLED"}
+
+        scene = context.scene
+        self.texture_name = str(scene.blendgimp_create_name or "BaseColor")
+        self.texture_width = int(scene.blendgimp_create_width)
+        self.texture_height = int(scene.blendgimp_create_height)
+        self.texture_format = str(scene.blendgimp_create_format)
+        self.texture_background = str(scene.blendgimp_create_background)
+        self.texture_background_color = tuple(scene.blendgimp_create_background_color)
+        self.initial_layer_name = str(scene.blendgimp_create_layer_name or self.texture_name)
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=420,
+            title="Create BlendGimp Image",
+            confirm_text="Create",
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "texture_name")
+        size = layout.row(align=True)
+        size.prop(self, "texture_width")
+        size.prop(self, "texture_height")
+        layout.prop(self, "texture_format")
+        layout.prop(self, "texture_background")
+        if self.texture_background == "SOLID":
+            layout.prop(self, "texture_background_color", text="Color")
+        if self.texture_format == "RGB" and self.texture_background == "TRANSPARENT":
+            warning = layout.box()
+            warning.alert = True
+            warning.label(text="RGB requires a solid background", icon="ERROR")
+        layout.prop(self, "initial_layer_name")
+
     def execute(
         self,
         context
     ):
 
         scene = context.scene
+
+        # The create form now lives in an operator dialog instead of occupying
+        # permanent sidebar space. Mirror the accepted values back to the
+        # existing Scene properties so the protected creation pipeline and the
+        # next dialog invocation keep the same defaults.
+        scene.blendgimp_create_name = str(self.texture_name or "BaseColor")
+        scene.blendgimp_create_width = int(self.texture_width)
+        scene.blendgimp_create_height = int(self.texture_height)
+        scene.blendgimp_create_format = str(self.texture_format)
+        scene.blendgimp_create_background = str(self.texture_background)
+        scene.blendgimp_create_background_color = tuple(self.texture_background_color)
+        scene.blendgimp_create_layer_name = str(self.initial_layer_name or self.texture_name or "BaseColor")
 
         if not connection_manager.is_connected():
             scene.blendgimp_connected = False
@@ -6075,8 +6308,149 @@ class BLENDGIMP_OT_get_images(
 
 
 # ============================================================
-# SAVE GIMP IMAGE(S) AS NATIVE XCF
+# OPEN / SAVE GIMP IMAGE(S) AS NATIVE XCF
 # ============================================================
+
+class BLENDGIMP_OT_open_xcf(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.open_xcf"
+    bl_label = "Open BlendGimp XCF"
+    bl_description = (
+        "Open a layered XCF in the headless GIMP engine, synchronize its "
+        "composite into Blender, assign it to the active material, and "
+        "restart Auto Sync"
+    )
+
+    filepath: bpy.props.StringProperty(
+        name="XCF File",
+        subtype="FILE_PATH",
+        default=""
+    )
+
+    filter_glob: bpy.props.StringProperty(
+        default="*.xcf",
+        options={"HIDDEN"}
+    )
+
+    def invoke(self, context, event):
+        if not connection_manager.is_connected():
+            self.report({"ERROR"}, "BlendGimp is not connected to GIMP")
+            return {"CANCELLED"}
+
+        save_dir = _default_blendgimp_save_directory()
+        if os.path.isdir(save_dir):
+            self.filepath = os.path.join(save_dir, "")
+        else:
+            documents = os.path.join(os.path.expanduser("~"), "Documents")
+            self.filepath = os.path.join(
+                documents if os.path.isdir(documents) else os.path.expanduser("~"),
+                ""
+            )
+
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        scene = context.scene
+        path = os.path.abspath(
+            os.path.expanduser(str(self.filepath or "").strip())
+        )
+
+        if not path:
+            self.report({"ERROR"}, "Choose an XCF file to open")
+            return {"CANCELLED"}
+        if not path.lower().endswith(".xcf"):
+            self.report({"ERROR"}, "Open XCF requires a .xcf file")
+            return {"CANCELLED"}
+        if not os.path.isfile(path):
+            self.report({"ERROR"}, f"XCF file not found: {path}")
+            return {"CANCELLED"}
+        if not connection_manager.is_connected():
+            self.report({"ERROR"}, "BlendGimp is not connected to GIMP")
+            return {"CANCELLED"}
+
+        try:
+            response = connection_manager.open_xcf(path)
+            image_id = int(response["image_id"])
+
+            # A GIMP engine restart may reuse process-local image IDs. Retire
+            # old active-layer sync ownership before adopting the newly loaded
+            # document so a stale Blender working buffer cannot be reused.
+            scene.blendgimp_blender_paint_sync_enabled = False
+            scene.blendgimp_blender_paint_sync_image_id = -1
+            scene.blendgimp_blender_paint_sync_layer_id = -1
+            scene.blendgimp_blender_paint_sync_status = "Opening XCF"
+            reset_blender_paint_sync_runtime()
+            _drop_dirty_pixel_cache_for_image(image_id)
+
+            images = _refresh_gimp_images_snapshot(scene)
+
+            sync_result = synchronize_gimp_composite(
+                context,
+                image_id,
+                assign_material=True
+            )
+            blender_image = sync_result["blender_image"]
+
+            _store_saved_xcf_path(scene, image_id, response)
+            reopened_path = str(response.get("path", path) or path)
+            texture_name = os.path.splitext(os.path.basename(reopened_path))[0]
+            blender_image["blendgimp_xcf_path"] = reopened_path
+            blender_image["blendgimp_gimp_image_id"] = image_id
+            blender_image["blendgimp_reopened_xcf"] = True
+            blender_image["blendgimp_texture_name"] = texture_name
+            blender_image.name = texture_name
+            blender_image.update()
+
+            reopened_sync_result = dict(
+                get_texture_sync_result(scene, image_id) or {}
+            )
+            reopened_sync_result["blender_image"] = blender_image.name
+            reopened_sync_result["xcf_path"] = reopened_path
+            store_texture_sync_result(scene, image_id, reopened_sync_result)
+
+            # Populate the layer panel immediately, preserving GIMP's saved
+            # selected raster/group item. Group selection intentionally leaves
+            # the raster paint buffer suspended until a raster layer is chosen.
+            layer_response = connection_manager.get_image_layers(image_id)
+            store_layer_result(scene, image_id, layer_response)
+
+            state = connection_manager.get_image_state(image_id)
+            revision = int(state.get("revision", 0))
+            scene.blendgimp_auto_sync_enabled = True
+            scene.blendgimp_auto_sync_image_id = image_id
+            scene.blendgimp_auto_sync_revision = revision
+            scene.blendgimp_auto_sync_status = f"Watching revision {revision}"
+            scene.blendgimp_auto_sync_detector = str(state.get("detector", ""))
+            reset_auto_sync_runtime(image_id, revision)
+
+            # Follow the reopened document in the BlendGimp texture editor.
+            if hasattr(scene, "blendgimp_texture_editor_image_id"):
+                scene.blendgimp_texture_editor_image_id = image_id
+
+            image_name = str(response.get("image_name", "") or os.path.basename(path))
+            layer_count = int(layer_response.get("layer_count", 0))
+            already_open = bool(response.get("already_open", False))
+            print(
+                "BLENDGIMP: Opened XCF and adopted document "
+                f"image ID {image_id} name={image_name!r} "
+                f"layers={layer_count} revision={revision} "
+                f"already_open={already_open} path={response.get('path', path)}"
+            )
+            self.report(
+                {"INFO"},
+                f"Opened XCF: {os.path.basename(path)} ({layer_count} layers)"
+            )
+            return {"FINISHED"}
+
+        except Exception as exc:
+            scene.blendgimp_connected = connection_manager.is_connected()
+            print(f"BLENDGIMP: OPEN_XCF workflow failed: {exc}")
+            self.report({"ERROR"}, f"Open XCF failed: {exc}")
+            return {"CANCELLED"}
+
 
 class BLENDGIMP_OT_save_image_as(
     bpy.types.Operator
@@ -6104,6 +6478,11 @@ class BLENDGIMP_OT_save_image_as(
 
     def invoke(self, context, event):
         scene = context.scene
+        if int(self.image_id) < 0:
+            self.image_id = _resolve_active_gimp_image_id(context)
+        if int(self.image_id) < 0:
+            self.report({"ERROR"}, "No active BlendGimp image")
+            return {"CANCELLED"}
         images = get_stored_images(scene)
         image = next(
             (item for item in images if int(item.get("id", -1)) == int(self.image_id)),
@@ -6170,6 +6549,11 @@ class BLENDGIMP_OT_save_image(
 
     def execute(self, context):
         scene = context.scene
+        if int(self.image_id) < 0:
+            self.image_id = _resolve_active_gimp_image_id(context)
+        if int(self.image_id) < 0:
+            self.report({"ERROR"}, "No active BlendGimp image")
+            return {"CANCELLED"}
         image = next(
             (item for item in get_stored_images(scene)
              if int(item.get("id", -1)) == int(self.image_id)),
@@ -6300,6 +6684,134 @@ class BLENDGIMP_OT_save_all_images(
         return {"FINISHED"}
 
 
+class BLENDGIMP_MT_image_xcf(bpy.types.Menu):
+    """BlendGimp XCF file operations under the Image Editor's Image menu."""
+
+    bl_idname = "BLENDGIMP_MT_image_xcf"
+    bl_label = "BlendGimp XCF"
+
+    def draw(self, context):
+        layout = self.layout
+        # Dynamic menus default to EXEC context. XCF Open/Save As need their
+        # invoke() methods so Blender can show file selectors.
+        layout.operator_context = "INVOKE_DEFAULT"
+        connected = connection_manager.is_connected()
+        image_id = _resolve_active_gimp_image_id(context)
+
+        open_row = layout.row()
+        open_row.enabled = connected
+        open_row.operator(
+            "blendgimp.open_xcf",
+            text="Open XCF...",
+            icon="FILE_FOLDER",
+        )
+
+        layout.separator()
+
+        save_col = layout.column(align=True)
+        save_col.enabled = bool(connected and image_id >= 0)
+        save_op = save_col.operator(
+            "blendgimp.save_image",
+            text="Save XCF",
+            icon="FILE_TICK",
+        )
+        save_op.image_id = image_id
+        save_as_op = save_col.operator(
+            "blendgimp.save_image_as",
+            text="Save XCF As...",
+            icon="FILE",
+        )
+        save_as_op.image_id = image_id
+
+        layout.separator()
+
+        all_row = layout.row()
+        all_row.enabled = connected
+        all_row.operator(
+            "blendgimp.save_all_images",
+            text="Save All XCF",
+            icon="FILE_TICK",
+        )
+
+        refresh_row = layout.row()
+        refresh_row.enabled = connected
+        refresh_row.operator(
+            "blendgimp.get_images",
+            text="Refresh GIMP Image List",
+            icon="FILE_REFRESH",
+        )
+
+
+def draw_blendgimp_image_menu(self, context):
+    """Add BlendGimp XCF actions to Image Editor > Image."""
+    self.layout.separator()
+    self.layout.menu(
+        "BLENDGIMP_MT_image_xcf",
+        text="BlendGimp XCF",
+        icon="IMAGE_DATA",
+    )
+
+
+class BLENDGIMP_OT_assign_active_image_to_material(
+    bpy.types.Operator
+):
+
+    bl_idname = "blendgimp.assign_active_image_to_material"
+    bl_label = "Assign to Material"
+    bl_description = (
+        "Assign the active BlendGimp texture to its protected owning material; "
+        "if it has no owner yet, use the active object/material"
+    )
+
+    def execute(self, context):
+        scene = context.scene
+        image_id = _resolve_active_gimp_image_id(context)
+        if image_id < 0:
+            self.report({"ERROR"}, "No active BlendGimp image")
+            return {"CANCELLED"}
+
+        blender_image = _resolve_active_blender_image(context, image_id)
+        if blender_image is None:
+            if not connection_manager.is_connected():
+                self.report({"ERROR"}, "BlendGimp is not connected to GIMP")
+                return {"CANCELLED"}
+            try:
+                result = synchronize_gimp_composite(
+                    context,
+                    image_id,
+                    assign_material=True,
+                )
+                assignment = result.get("assignment", {})
+            except Exception as exc:
+                self.report({"ERROR"}, f"Assign to Material failed: {exc}")
+                return {"CANCELLED"}
+        else:
+            assignment = assign_blendgimp_image_to_active_material(
+                context,
+                blender_image,
+                image_id,
+            )
+
+        if not assignment.get("assigned", False):
+            self.report(
+                {"WARNING"},
+                str(assignment.get("reason", "Material assignment skipped")),
+            )
+            return {"CANCELLED"}
+
+        sync_result = dict(get_texture_sync_result(scene, image_id) or {})
+        sync_result.update(assignment)
+        if blender_image is not None:
+            sync_result["blender_image"] = blender_image.name
+        store_texture_sync_result(scene, image_id, sync_result)
+        tag_texture_views_for_redraw(context)
+        self.report(
+            {"INFO"},
+            f"Assigned BlendGimp texture to {assignment.get('material', 'material')}",
+        )
+        return {"FINISHED"}
+
+
 # ============================================================
 # REFRESH GIMP COMPOSITE INTO BLENDER
 # ============================================================
@@ -6389,6 +6901,12 @@ class BLENDGIMP_OT_refresh_from_gimp(
     ):
 
         scene = context.scene
+
+        if int(self.image_id) < 0:
+            self.image_id = _resolve_active_gimp_image_id(context)
+        if int(self.image_id) < 0:
+            self.report({"ERROR"}, "No active BlendGimp image")
+            return {"CANCELLED"}
 
         if not connection_manager.is_connected():
 
@@ -7402,12 +7920,41 @@ class BLENDGIMP_OT_set_active_layer(
                 self.layer_id
             )
 
-            refresh_layer_result(
+            layer_response = refresh_layer_result(
                 scene,
                 self.image_id
             )
 
-            if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) == int(self.image_id):
+            selected_item = _find_layer_in_tree(
+                layer_response.get("layers", []),
+                self.layer_id
+            )
+            selected_is_group = bool(
+                selected_item and selected_item.get("is_group", False)
+            )
+
+            if selected_is_group:
+                # Phase 6.5.4 RC Fix2: a GIMP group can be selected and
+                # manipulated, but it is not a raster drawable.  Do not try
+                # to mirror group pixels into Blender's active-layer buffer.
+                # The next real paint operation will resolve the selected
+                # item and report that a raster layer must be chosen.
+                if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) == int(self.image_id):
+                    scene.blendgimp_blender_paint_sync_enabled = False
+                    scene.blendgimp_blender_paint_sync_layer_id = -1
+                    scene.blendgimp_blender_paint_sync_status = (
+                        "Group selected — choose a raster layer to paint"
+                    )
+                    reset_blender_paint_sync_runtime(
+                        image_id=self.image_id,
+                        layer_id=-1,
+                        baseline=None
+                    )
+                print(
+                    "BLENDGIMP: Active GIMP group selected "
+                    f"ID {self.layer_id}; raster paint buffer suspended"
+                )
+            elif int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) == int(self.image_id):
                 load_active_layer_buffer_from_gimp(
                     scene, self.image_id, self.layer_id, clear_first=True, activate_target=True
                 )
@@ -8792,1019 +9339,171 @@ class BLENDGIMP_PT_main_panel(
         # ====================================================
 
         layout.label(
-            text="BlendGimp 0.4.2"
+            text="BlendGimp 0.5.3 — Production UI"
         )
 
         layout.separator()
 
         # ====================================================
-        # GIMP DETECTION
+        # ENGINE STATUS — production-facing status only
+        # Setup, mode selection, process checks, and diagnostics live in
+        # Blender Preferences -> Add-ons/Extensions -> BlendGimp.
         # ====================================================
 
         gimp_box = layout.box()
-
-        gimp_box.label(
-            text="GIMP Engine"
+        header = gimp_box.row(align=True)
+        header.label(text="Engine", icon="PREFERENCES")
+        header.operator(
+            "blendgimp.open_preferences",
+            text="",
+            icon="PREFERENCES",
         )
 
-        gimp_box.prop(
-            scene,
-            "blendgimp_engine_mode",
-            text="Mode"
-        )
-
-        gimp_box.prop(
-            scene,
-            "blendgimp_engine_auto_reconnect",
-            text="Automatic Recovery"
-        )
-
-        engine_snapshot = (
-            gimp_manager.get_engine_snapshot()
-        )
+        engine_snapshot = gimp_manager.get_engine_snapshot()
         engine_state = str(
             scene.blendgimp_engine_state
-            or engine_snapshot.get(
-                "state",
-                gimp_manager.ENGINE_STATE_STOPPED
-            )
+            or engine_snapshot.get("state", gimp_manager.ENGINE_STATE_STOPPED)
+        )
+        connected = bool(
+            scene.blendgimp_connected
+            and connection_manager.is_connected()
         )
 
-        state_icon = (
-            "CHECKMARK"
-            if engine_state == gimp_manager.ENGINE_STATE_CONNECTED
-            else (
-                "ERROR"
-                if engine_state == gimp_manager.ENGINE_STATE_FAILED
-                else "INFO"
-            )
+        status = gimp_box.row(align=True)
+        status.label(
+            text="Connected" if connected else engine_state.replace("_", " ").title(),
+            icon="CHECKMARK" if connected else ("ERROR" if engine_state == gimp_manager.ENGINE_STATE_FAILED else "INFO"),
         )
 
-        gimp_box.label(
-            text=(
-                "State: "
-                + engine_state.replace(
-                    "_",
-                    " "
-                ).title()
-            ),
-            icon=state_icon
+        version_text = str(
+            scene.blendgimp_runtime_gimp_version
+            or scene.blendgimp_gimp_version
+            or ""
         )
+        if version_text:
+            status.label(text=f"GIMP {version_text}")
 
-        if engine_snapshot.get(
-            "pid"
-        ):
-            gimp_box.label(
-                text=(
-                    "PID: "
-                    f"{engine_snapshot.get('pid')}"
-                )
-            )
-
-        if scene.blendgimp_engine_restart_count > 0:
-            gimp_box.label(
-                text=(
-                    "Automatic Restarts: "
-                    f"{scene.blendgimp_engine_restart_count}"
-                )
-            )
+        mode_value = blendgimp_preferences.engine_mode(context=context, scene=scene)
+        status.label(
+            text="Headless" if mode_value == gimp_manager.ENGINE_MODE_HEADLESS else "Visible / Debug",
+        )
 
         if scene.blendgimp_engine_last_error:
             error_box = gimp_box.box()
-            error_box.label(
-                text=scene.blendgimp_engine_last_error,
-                icon="ERROR"
-            )
+            error_box.alert = True
+            error_box.label(text=scene.blendgimp_engine_last_error, icon="ERROR")
 
-        if scene.blendgimp_gimp_detected:
+        # Keep engine actions visually consistent and immediately usable.
+        # Start uses Blender's active/depressed accent treatment (blue in the
+        # default dark theme); Stop uses the alert treatment (red). Detection
+        # is automatic inside Start, so first-run users never visit Preferences
+        # just to enable this button.
+        controls = gimp_box.row(align=True)
 
-            gimp_box.label(
-                text="Detected",
-                icon="CHECKMARK"
-            )
+        start_cell = controls.row(align=True)
+        start_cell.enabled = not bool(scene.blendgimp_gimp_running or connected)
+        start_cell.operator(
+            "blendgimp.launch_gimp",
+            text="Start GIMP",
+            icon="PLAY",
+            depress=True,
+        )
 
-            gimp_box.label(
-                text=(
-                    f"GIMP "
-                    f"{scene.blendgimp_gimp_version}"
-                )
-            )
+        reconnect_cell = controls.row(align=True)
+        reconnect_cell.enabled = bool(scene.blendgimp_gimp_running and not connected)
+        reconnect_cell.operator(
+            "blendgimp.connect",
+            text="Reconnect",
+            icon="FILE_REFRESH",
+        )
 
-            if scene.blendgimp_gimp_running:
-                controls = gimp_box.row(
-                    align=True
-                )
-                controls.operator(
-                    "blendgimp.stop_gimp",
-                    text="Stop",
-                    icon="CANCEL"
-                )
-                controls.operator(
-                    "blendgimp.restart_gimp",
-                    text="Restart",
-                    icon="FILE_REFRESH"
-                )
-                force_row = gimp_box.row()
-                force_row.alert = True
-                force_row.operator(
-                    "blendgimp.force_stop_gimp",
-                    text="Force Stop (Discard Unsaved)",
-                    icon="ERROR"
-                )
-
-            else:
-                gimp_box.operator(
-                    "blendgimp.launch_gimp",
-                    text="Start Engine",
-                    icon="PLAY"
-                )
-
-            if (
-                scene.blendgimp_gimp_running
-                and engine_snapshot.get(
-                    "mode"
-                )
-                and engine_snapshot.get(
-                    "mode"
-                ) != scene.blendgimp_engine_mode
-            ):
-                gimp_box.label(
-                    text="Restart to apply the selected mode",
-                    icon="INFO"
-                )
-
-            gimp_box.operator(
-                "blendgimp.check_gimp",
-                text="Check Process"
-            )
-
-            gimp_box.separator()
-
-            gimp_box.label(
-                text="Executable:"
-            )
-
-            gimp_box.label(
-                text=scene.blendgimp_gimp_path
-            )
-
-        else:
-
-            gimp_box.label(
-                text="Not Detected",
-                icon="ERROR"
-            )
-
-        gimp_box.operator(
-            "blendgimp.detect_gimp",
-            text="Detect GIMP",
-            icon="VIEWZOOM"
+        stop_cell = controls.row(align=True)
+        stop_cell.alert = True
+        stop_cell.enabled = bool(scene.blendgimp_gimp_running or connected)
+        stop_cell.operator(
+            "blendgimp.stop_gimp",
+            text="Stop",
+            icon="CANCEL",
         )
 
         layout.separator()
 
         # ====================================================
-        # CONNECTION
+        # IMAGE & MATERIAL — compact production workflow
         # ====================================================
 
         connection_box = layout.box()
-
         connection_box.label(
-            text="BlendGimp Connection"
+            text="Image & Material",
+            icon="IMAGE_DATA"
         )
 
-        if (
+        connected = bool(
             scene.blendgimp_connected
             and connection_manager.is_connected()
-        ):
+        )
 
-            connection_box.label(
-                text="Connected",
-                icon="CHECKMARK"
+        if connected:
+            obj = getattr(context, "active_object", None)
+            material = getattr(obj, "active_material", None) if obj is not None else None
+
+            material_row = connection_box.row(align=True)
+            material_row.label(text="Active Material", icon="MATERIAL")
+            if obj is not None and hasattr(obj, "active_material"):
+                try:
+                    material_row.template_ID(obj, "active_material", text="")
+                except Exception:
+                    material_row.label(
+                        text=(material.name if material is not None else "None")
+                    )
+            else:
+                material_row.label(text="No active object")
+
+            image_id = _resolve_active_gimp_image_id(context)
+            blender_image = _resolve_active_blender_image(context, image_id)
+            image_name = (
+                blender_image.name
+                if blender_image is not None
+                else _stored_gimp_image_name(scene, image_id)
             )
 
-            connection_box.label(
-                text=(
-                    "Runtime GIMP: "
-                    f"{scene.blendgimp_runtime_gimp_version}"
-                )
+            image_row = connection_box.row(align=True)
+            image_row.label(text="Active Image", icon="IMAGE_DATA")
+            image_row.label(
+                text=(image_name or "No BlendGimp image")
             )
 
-            connection_box.label(
-                text=(
-                    "Protocol: "
-                    f"{scene.blendgimp_protocol_version}"
-                )
-            )
-
-            connection_box.label(
-                text=(
-                    "GIMP Component: "
-                    f"{scene.blendgimp_remote_version}"
-                )
-            )
-
-            connection_box.separator()
-
-            create_box = connection_box.box()
-            create_box.label(
-                text="New BlendGimp Texture",
+            actions = connection_box.row(align=True)
+            actions.operator(
+                "blendgimp.create_image",
+                text="Create Image",
                 icon="ADD"
             )
-            create_box.prop(
-                scene,
-                "blendgimp_create_name",
-                text="Name"
+
+            refresh_cell = actions.row(align=True)
+            refresh_cell.enabled = image_id >= 0
+            refresh_op = refresh_cell.operator(
+                "blendgimp.refresh_from_gimp",
+                text="Refresh From GIMP",
+                icon="FILE_REFRESH"
+            )
+            refresh_op.image_id = image_id
+
+            assign_row = connection_box.row()
+            assign_row.enabled = image_id >= 0
+            assign_row.operator(
+                "blendgimp.assign_active_image_to_material",
+                text="Assign to Material",
+                icon="MATERIAL"
             )
 
-            size_row = create_box.row(align=True)
-            size_row.prop(
-                scene,
-                "blendgimp_create_width",
-                text="Width"
-            )
-            size_row.prop(
-                scene,
-                "blendgimp_create_height",
-                text="Height"
-            )
-
-            create_box.prop(
-                scene,
-                "blendgimp_create_format",
-                text="Format"
-            )
-            create_box.prop(
-                scene,
-                "blendgimp_create_background",
-                text="Background"
-            )
-
-            if scene.blendgimp_create_background == "SOLID":
-                create_box.prop(
-                    scene,
-                    "blendgimp_create_background_color",
-                    text="Color"
-                )
-
-            if (
-                scene.blendgimp_create_format == "RGB"
-                and scene.blendgimp_create_background == "TRANSPARENT"
-            ):
-                create_box.label(
-                    text="RGB requires a solid background",
-                    icon="ERROR"
-                )
-
-            create_box.prop(
-                scene,
-                "blendgimp_create_layer_name",
-                text="Initial Layer"
-            )
-
-            create_button_row = create_box.row()
-            create_button_row.enabled = not (
-                scene.blendgimp_create_format == "RGB"
-                and scene.blendgimp_create_background == "TRANSPARENT"
-            )
-            create_button_row.operator(
-                "blendgimp.create_image",
-                text="Create",
-                icon="IMAGE_DATA"
-            )
-
-            if scene.blendgimp_create_status:
-                create_box.label(
-                    text=scene.blendgimp_create_status,
-                    icon=(
-                        "ERROR"
-                        if scene.blendgimp_create_status.startswith(
-                            "Create failed"
-                        )
-                        else "CHECKMARK"
-                    )
-                )
-
-            connection_box.separator()
-
-            connection_box.operator(
-                "blendgimp.ping",
-                text="Ping GIMP"
-            )
-
-            connection_box.operator(
-                "blendgimp.get_images",
-                text="Get GIMP Images",
-                icon="IMAGE_DATA"
-            )
-
-            connection_box.operator(
-                "blendgimp.save_all_images",
-                text="Save All XCF",
-                icon="FILE_TICK"
-            )
-
-            # ================================================
-            # LAST GET_IMAGES RESULT
-            # ================================================
-
-            if scene.blendgimp_images_queried:
-
-                connection_box.separator()
-
-                images = (
-                    get_stored_images(
-                        scene
-                    )
-                )
-
-                connection_box.label(
-                    text=(
-                        "Open GIMP Images: "
-                        f"{scene.blendgimp_image_count}"
-                    )
-                )
-
-                if images:
-
-                    for image in images:
-
-                        image_box = (
-                            connection_box.box()
-                        )
-
-                        image_box.label(
-                            text=str(
-                                image.get(
-                                    "name",
-                                    "[Unnamed]"
-                                )
-                            ),
-                            icon="IMAGE_DATA"
-                        )
-
-                        image_box.label(
-                            text=(
-                                f"{image.get('width', '?')} "
-                                f"x "
-                                f"{image.get('height', '?')}"
-                            )
-                        )
-
-                        image_box.label(
-                            text=(
-                                "Image ID: "
-                                f"{image.get('id', '?')}"
-                            )
-                        )
-
-                        try:
-                            image_id = int(
-                                image.get(
-                                    "id",
-                                    -1
-                                )
-                            )
-                        except (
-                            TypeError,
-                            ValueError
-                        ):
-                            image_id = -1
-
-                        if image_id >= 0:
-
-                            xcf_path = str(
-                                image.get(
-                                    "xcf_path",
-                                    ""
-                                )
-                                or ""
-                            )
-                            is_dirty = bool(
-                                image.get(
-                                    "dirty",
-                                    False
-                                )
-                            )
-
-                            if xcf_path:
-                                image_box.label(
-                                    text=(
-                                        "XCF: "
-                                        + os.path.basename(xcf_path)
-                                    ),
-                                    icon="FILE_TICK"
-                                )
-                            else:
-                                image_box.label(
-                                    text="Not saved as XCF yet",
-                                    icon="INFO"
-                                )
-
-                            if is_dirty:
-                                image_box.label(
-                                    text="Unsaved changes",
-                                    icon="ERROR"
-                                )
-                            elif xcf_path:
-                                image_box.label(
-                                    text="Saved",
-                                    icon="CHECKMARK"
-                                )
-
-                            save_row = image_box.row(align=True)
-                            save_operator = save_row.operator(
-                                "blendgimp.save_image",
-                                text=(
-                                    "Save"
-                                    if xcf_path
-                                    else "Save XCF..."
-                                ),
-                                icon="FILE_TICK"
-                            )
-                            save_operator.image_id = image_id
-
-                            save_as_operator = save_row.operator(
-                                "blendgimp.save_image_as",
-                                text="Save As...",
-                                icon="FILE"
-                            )
-                            save_as_operator.image_id = image_id
-
-                            card_sync_result = (
-                                get_texture_sync_result(
-                                    scene,
-                                    image_id
-                                )
-                                or {}
-                            )
-
-                            owner_object = str(
-                                card_sync_result.get(
-                                    "owner_object",
-                                    ""
-                                )
-                                or ""
-                            )
-                            owner_material = str(
-                                card_sync_result.get(
-                                    "material",
-                                    ""
-                                )
-                                or ""
-                            )
-
-                            if owner_object:
-                                image_box.label(
-                                    text=f"Object: {owner_object}",
-                                    icon="OBJECT_DATA"
-                                )
-
-                            if owner_material:
-                                image_box.label(
-                                    text=f"Material: {owner_material}",
-                                    icon="MATERIAL"
-                                )
-
-                            if owner_object:
-                                activate_owner_operator = (
-                                    image_box.operator(
-                                        "blendgimp.activate_texture_owner",
-                                        text="Activate Owner",
-                                        icon="RESTRICT_SELECT_OFF"
-                                    )
-                                )
-                                activate_owner_operator.image_id = image_id
-
-                            refresh_operator = (
-                                image_box.operator(
-                                    "blendgimp.refresh_from_gimp",
-                                    text="Refresh From GIMP"
-                                )
-                            )
-
-                            refresh_operator.image_id = (
-                                image_id
-                            )
-
-                            push_operator = (
-                                image_box.operator(
-                                    "blendgimp.push_to_gimp",
-                                    text="Push Blender Texture to GIMP",
-                                    icon="EXPORT"
-                                )
-                            )
-
-                            push_operator.image_id = (
-                                image_id
-                            )
-
-                            direct_paint_active = (
-                                scene.blendgimp_direct_paint_active
-                                and int(
-                                    scene.blendgimp_direct_paint_image_id
-                                ) == image_id
-                            )
-
-                            direct_box = image_box.box()
-
-                            direct_box.label(
-                                text="Direct GIMP Brush 3D Paint — Live",
-                                icon="BRUSH_DATA"
-                            )
-
-                            if direct_paint_active:
-
-                                direct_box.label(
-                                    text=(
-                                        "ACTIVE — LMB paint, Esc/RMB exit"
-                                    ),
-                                    icon="CHECKMARK"
-                                )
-
-                            else:
-
-                                operator_registered = hasattr(
-                                    bpy.types,
-                                    "BLENDGIMP_OT_direct_gimp_brush_paint"
-                                )
-
-                                if operator_registered:
-
-                                    direct_operator = (
-                                        direct_box.operator(
-                                            "blendgimp.direct_gimp_brush_paint",
-                                            text="Start GIMP Brush 3D Paint",
-                                            icon="BRUSH_DATA"
-                                        )
-                                    )
-
-                                    if direct_operator is not None:
-
-                                        direct_operator.image_id = (
-                                            image_id
-                                        )
-
-                                        direct_operator.image_width = int(
-                                            image.get(
-                                                "width",
-                                                0
-                                            )
-                                        )
-
-                                        direct_operator.image_height = int(
-                                            image.get(
-                                                "height",
-                                                0
-                                            )
-                                        )
-
-                                else:
-
-                                    direct_box.label(
-                                        text=(
-                                            "Direct paint operator is not "
-                                            "registered — restart Blender"
-                                        ),
-                                        icon="ERROR"
-                                    )
-
-                            if scene.blendgimp_direct_paint_brush:
-
-                                direct_box.label(
-                                    text=(
-                                        "GIMP Brush: "
-                                        f"{scene.blendgimp_direct_paint_brush}"
-                                    )
-                                )
-
-                            geometry_box = direct_box.box()
-
-                            geometry_box.enabled = (
-                                not direct_paint_active
-                            )
-
-                            geometry_box.label(
-                                text="Geometry Protection"
-                            )
-
-                            geometry_box.prop(
-                                scene,
-                                "blendgimp_direct_paint_projection_mesh",
-                                text="Projection Mesh"
-                            )
-
-                            if scene.blendgimp_direct_paint_projection_mesh == "AUTO":
-
-                                geometry_box.label(
-                                    text=(
-                                        "Auto uses evaluated modifiers when "
-                                        "the active UV map is preserved"
-                                    )
-                                )
-
-                            geometry_box.prop(
-                                scene,
-                                "blendgimp_direct_paint_occlusion_mode",
-                                text="Surface Mode"
-                            )
-
-                            if scene.blendgimp_direct_paint_occlusion_mode == "THROUGH":
-
-                                geometry_box.label(
-                                    text=(
-                                        "Paint Through traces every surface "
-                                        "under the cursor"
-                                    )
-                                )
-
-                            geometry_box.prop(
-                                scene,
-                                "blendgimp_direct_paint_footprint_protection",
-                                text="Protect Brush Footprint"
-                            )
-
-                            if scene.blendgimp_direct_paint_footprint_protection:
-
-                                geometry_box.prop(
-                                    scene,
-                                    "blendgimp_direct_paint_footprint_samples",
-                                    text="Footprint Rays"
-                                )
-
-                                geometry_box.prop(
-                                    scene,
-                                    "blendgimp_direct_paint_footprint_safe_ratio",
-                                    text="Surface Coverage"
-                                )
-
-                                geometry_box.label(
-                                    text=(
-                                        "Silhouette misses remain strictly "
-                                        "protected"
-                                    )
-                                )
-
-                            geometry_box.prop(
-                                scene,
-                                "blendgimp_direct_paint_front_faces_only",
-                                text="Front Faces Only"
-                            )
-
-                            geometry_box.prop(
-                                scene,
-                                "blendgimp_direct_paint_normal_angle_enabled",
-                                text="Limit View Angle"
-                            )
-
-                            if scene.blendgimp_direct_paint_normal_angle_enabled:
-
-                                geometry_box.prop(
-                                    scene,
-                                    "blendgimp_direct_paint_normal_angle_limit",
-                                    text="Maximum Angle (degrees)"
-                                )
-
-                            if scene.blendgimp_direct_paint_status:
-
-                                direct_box.label(
-                                    text=(
-                                        "Status: "
-                                        f"{scene.blendgimp_direct_paint_status}"
-                                    )
-                                )
-
-                            direct_box.label(
-                                text="Live • seam-safe • brush-footprint protected"
-                            )
-
-                            paint_sync_active = (
-                                scene.blendgimp_blender_paint_sync_enabled
-                                and int(
-                                    scene.blendgimp_blender_paint_sync_image_id
-                                ) == image_id
-                            )
-
-                            paint_toggle = (
-                                image_box.operator(
-                                    "blendgimp.toggle_blender_paint_sync",
-                                    text=(
-                                        "Disable Unified Paint Sync"
-                                        if paint_sync_active
-                                        else "Enable Unified Paint Sync"
-                                    ),
-                                    icon=(
-                                        "PAUSE"
-                                        if paint_sync_active
-                                        else "BRUSH_DATA"
-                                    )
-                                )
-                            )
-
-                            paint_toggle.image_id = (
-                                image_id
-                            )
-
-                            if paint_sync_active:
-
-                                image_box.label(
-                                    text=(
-                                        "Unified Paint Sync: "
-                                        f"{scene.blendgimp_blender_paint_sync_status}"
-                                    ),
-                                    icon="CHECKMARK"
-                                )
-
-                                image_box.label(
-                                    text=(
-                                        "GIMP Target Layer ID: "
-                                        f"{scene.blendgimp_blender_paint_sync_layer_id}"
-                                    )
-                                )
-
-                                image_box.prop(
-                                    scene,
-                                    "blendgimp_blender_paint_sync_debounce",
-                                    text="3D Paint Delay"
-                                )
-
-                            auto_sync_active = (
-                                scene.blendgimp_auto_sync_enabled
-                                and int(
-                                    scene.blendgimp_auto_sync_image_id
-                                ) == image_id
-                            )
-
-                            auto_sync_operator = (
-                                image_box.operator(
-                                    "blendgimp.toggle_auto_sync",
-                                    text=(
-                                        "Auto Sync: ON"
-                                        if auto_sync_active
-                                        else (
-                                            "Switch Auto Sync Here"
-                                            if scene.blendgimp_auto_sync_enabled
-                                            else "Enable Auto Sync"
-                                        )
-                                    ),
-                                    icon="FILE_REFRESH",
-                                    depress=auto_sync_active
-                                )
-                            )
-
-                            auto_sync_operator.image_id = (
-                                image_id
-                            )
-
-                            if auto_sync_active:
-
-                                image_box.prop(
-                                    scene,
-                                    "blendgimp_auto_sync_debounce",
-                                    text="Auto Sync Delay"
-                                )
-
-                                image_box.label(
-                                    text=(
-                                        "Auto Sync: "
-                                        f"{scene.blendgimp_auto_sync_status}"
-                                    ),
-                                    icon="CHECKMARK"
-                                )
-
-                                detector_value = str(
-                                    getattr(
-                                        scene,
-                                        "blendgimp_auto_sync_detector",
-                                        ""
-                                    )
-                                )
-
-                                detector_label = (
-                                    "Hybrid (Fingerprint + GEGL)"
-                                    if detector_value
-                                    == "hybrid"
-                                    else (
-                                        "GEGL Damage"
-                                        if detector_value
-                                        == "gegl-damage"
-                                        else (
-                                            "Thumbnail Fallback"
-                                            if detector_value
-                                            == "thumbnail-fallback"
-                                            else detector_value
-                                        )
-                                    )
-                                )
-
-                                if detector_label:
-
-                                    image_box.label(
-                                        text=(
-                                            "Change Detector: "
-                                            f"{detector_label}"
-                                        ),
-                                        icon=(
-                                            "CHECKMARK"
-                                            if detector_value in {
-                                                "hybrid",
-                                                "gegl-damage"
-                                            }
-                                            else "INFO"
-                                        )
-                                    )
-
-                            sync_result = (
-                                get_texture_sync_result(
-                                    scene,
-                                    image_id
-                                )
-                            )
-
-                            if sync_result is not None:
-
-                                image_box.label(
-                                    text=(
-                                        "Blender Image: "
-                                        f"{sync_result.get('blender_image', '')}"
-                                    )
-                                )
-
-                                sync_transport = str(
-                                    sync_result.get(
-                                        "transport",
-                                        ""
-                                    )
-                                )
-
-                                if sync_transport:
-                                    if sync_transport == "dirty-rgba-binary":
-                                        transport_label = "Dirty RGBA Binary"
-                                    elif sync_transport == "dirty-rgba-json":
-                                        transport_label = "Dirty RGBA Base64"
-                                    elif sync_transport == "direct-rgba-binary":
-                                        transport_label = "Direct RGBA Binary"
-                                    elif sync_transport == "direct-rgba-json":
-                                        transport_label = "Direct RGBA Base64"
-                                    else:
-                                        transport_label = "PNG Fallback"
-
-                                    image_box.label(
-                                        text=(
-                                            "Transport: "
-                                            f"{transport_label}"
-                                        ),
-                                        icon=(
-                                            "CHECKMARK"
-                                            if sync_transport in {
-                                                "dirty-rgba-binary",
-                                                "dirty-rgba-json",
-                                                "direct-rgba-binary",
-                                                "direct-rgba-json"
-                                            }
-                                            else "INFO"
-                                        )
-                                    )
-
-                                    if (
-                                        sync_transport in {
-                                            "dirty-rgba-binary",
-                                            "dirty-rgba-json"
-                                        }
-                                        and int(
-                                            sync_result.get(
-                                                "dirty_width",
-                                                0
-                                            )
-                                        ) > 0
-                                    ):
-                                        image_box.label(
-                                            text=(
-                                                "Last Region: "
-                                                f"{sync_result.get('dirty_width')}x"
-                                                f"{sync_result.get('dirty_height')} "
-                                                f"@ {sync_result.get('dirty_x')},"
-                                                f"{sync_result.get('dirty_y')}"
-                                            )
-                                        )
-
-                                        image_box.label(
-                                            text=(
-                                                "Transferred: "
-                                                f"{sync_result.get('byte_length', 0):,} bytes"
-                                            )
-                                        )
-
-                                if sync_result.get(
-                                    "assigned",
-                                    False
-                                ):
-
-                                    image_box.label(
-                                        text=(
-                                            "Material: "
-                                            f"{sync_result.get('material', '')}"
-                                        ),
-                                        icon="CHECKMARK"
-                                    )
-
-                                elif sync_result.get(
-                                    "reason",
-                                    ""
-                                ):
-
-                                    image_box.label(
-                                        text=str(
-                                            sync_result.get(
-                                                "reason",
-                                                ""
-                                            )
-                                        ),
-                                        icon="INFO"
-                                    )
-
-                            layer_operator = (
-                                image_box.operator(
-                                    "blendgimp.get_image_layers",
-                                    text="Get Layers"
-                                )
-                            )
-
-                            layer_operator.image_id = (
-                                image_id
-                            )
-
-                            add_layer_operator = (
-                                image_box.operator(
-                                    "blendgimp.add_layer",
-                                    text="Add Layer"
-                                )
-                            )
-
-                            add_layer_operator.image_id = (
-                                image_id
-                            )
-
-                            create_group_operator = (
-                                image_box.operator(
-                                    "blendgimp.create_group",
-                                    text="Create Group"
-                                )
-                            )
-
-                            create_group_operator.image_id = (
-                                image_id
-                            )
-
-                            layer_result = (
-                                get_stored_layer_result(
-                                    scene,
-                                    image_id
-                                )
-                            )
-
-                            if layer_result is not None:
-
-                                image_box.separator()
-
-                                image_box.label(
-                                    text=(
-                                        "Layers: "
-                                        f"{layer_result.get('layer_count', 0)}"
-                                    )
-                                )
-
-                                draw_layer_stack_compact(
-                                    image_box,
-                                    layer_result.get(
-                                        "layers",
-                                        []
-                                    ),
-                                    image_id
-                                )
-
-                else:
-
-                    connection_box.label(
-                        text="No images are open in GIMP"
-                    )
-
-            connection_box.separator()
-
-            connection_box.operator(
-                "blendgimp.disconnect",
-                text="Disconnect"
-            )
-
+            # XCF open/save commands deliberately live under Image Editor >
+            # Image > BlendGimp XCF so file management does not consume the
+            # day-to-day production panel.
         else:
-
             connection_box.label(
-                text="Disconnected"
-            )
-
-            connection_box.operator(
-                "blendgimp.connect",
-                text="Connect to GIMP"
+                text="Start or reconnect GIMP using Engine above",
+                icon="INFO"
             )
 
 
@@ -9834,11 +9533,17 @@ classes = (
 
     BLENDGIMP_OT_get_images,
 
+    BLENDGIMP_OT_open_xcf,
+
     BLENDGIMP_OT_save_image,
 
     BLENDGIMP_OT_save_image_as,
 
     BLENDGIMP_OT_save_all_images,
+
+    BLENDGIMP_MT_image_xcf,
+
+    BLENDGIMP_OT_assign_active_image_to_material,
 
     BLENDGIMP_OT_activate_texture_owner,
 
@@ -10064,6 +9769,17 @@ def register():
                 "BLENDGIMP: "
                 "Direct GIMP Brush 3D Paint operator registered"
             )
+
+    # File operations belong with Blender's Image menu, not the production
+    # sidebar. Remove first to avoid duplicate entries during extension reload.
+    try:
+        bpy.types.IMAGE_MT_image.remove(draw_blendgimp_image_menu)
+    except Exception:
+        pass
+    try:
+        bpy.types.IMAGE_MT_image.append(draw_blendgimp_image_menu)
+    except Exception as exc:
+        print(f"BLENDGIMP: Could not register Image menu entries: {exc}")
 
     if blendgimp_exit_pre not in bpy.app.handlers.exit_pre:
         bpy.app.handlers.exit_pre.append(blendgimp_exit_pre)
@@ -10646,6 +10362,11 @@ def register():
 # ============================================================
 
 def unregister():
+
+    try:
+        bpy.types.IMAGE_MT_image.remove(draw_blendgimp_image_menu)
+    except Exception:
+        pass
 
     # --------------------------------------------------------
     # Stop lifecycle recovery before closing the connection.

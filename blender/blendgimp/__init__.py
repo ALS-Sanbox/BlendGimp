@@ -1,34 +1,46 @@
 # ============================================================
 # BlendGimp
 # Blender Extension Entry Point
-# Version: 0.4.2 development
+# Version: 0.5.3 — Phase 7.0 Usability / Production UI
 # ============================================================
 
+from .ui import preferences
 from .ui import main_panel
 from .ui import texture_editor
 from .ui import paint_tools
 
 
 def register():
+    # Phase 7.0 introduces real extension preferences. Register them before the
+    # runtime UI so configuration can be mirrored into the protected Phase 6
+    # Scene/runtime properties without changing the accepted engine pipeline.
+    preferences.register()
+
     # Existing engine / IPC / sync / 3D painting registration remains the owner
-    # of Phase 1-5 runtime state.
+    # of Phase 1-6 runtime state.
     main_panel.register()
 
-    # Phase 6.1 is a Blender-side artist UI layer over that existing state.
+    # BlendGimp Area / texture editor.
     texture_editor.register()
 
-    # Phase 6.5.2 compacts the GIMP layer stack into a native-feeling Blender
-    # panel while preserving 6.5.1 canvas polish and frozen paint architecture.
+    # Apply persistent user preferences only after all mirrored Scene
+    # properties exist (engine mode, automatic recovery, and Auto Paint).
+    preferences.apply_preferences_to_all_scenes()
+
+    # Frozen Phase 6 artist-workflow baseline. Phase 7.0 only reorganizes
+    # presentation/settings ownership; painting behavior stays protected.
     paint_tools.register()
 
-    print("BLENDGIMP: Extension registered successfully")
+    print(
+        "BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability / Production UI "
+        "registered successfully"
+    )
 
 
 def unregister():
-    # Remove Phase 6.1 headers/timer before the existing Scene properties and
-    # engine UI they observe are unregistered.
     paint_tools.unregister()
     texture_editor.unregister()
     main_panel.unregister()
+    preferences.unregister()
 
     print("BLENDGIMP: Extension unregistered")

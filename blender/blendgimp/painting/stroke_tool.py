@@ -15,6 +15,7 @@ from ..ipc.connection import (
     connection_manager,
     set_direct_paint_refresh_owner,
 )
+from ..core.tool_state import normalize_tool, tool_action_hint, tool_cursor, tool_label
 
 
 BLENDGIMP_DIRECT_PAINT_LAYER_NAME = "BlendGimp Paint"
@@ -2084,6 +2085,43 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
 
         if context.area is not None:
             context.area.tag_redraw()
+
+    def _rebind_active_layer(self, context, reason="stroke"):
+        """Rebind the persistent Object Paint owner to GIMP's current raster layer."""
+        from ..ui import main_panel as _blendgimp_main_panel
+        scene = context.scene
+        try:
+            target = _blendgimp_main_panel.resolve_gimp_paint_target(
+                scene, self.image_id, create_if_missing=True
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            self._set_status(context, message)
+            try:
+                self.report({"WARNING"}, message)
+            except Exception:
+                pass
+            print(f"BLENDGIMP: Object Paint target unavailable reason={reason}: {message}")
+            return None
+        new_layer_id = int(target["layer_id"])
+        old_layer_id = int(getattr(self, "_layer_id", -1))
+        if new_layer_id != old_layer_id:
+            if (
+                int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1))
+                == int(self.image_id)
+                and int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1))
+                != new_layer_id
+            ):
+                _blendgimp_main_panel.load_active_layer_buffer_from_gimp(
+                    scene, self.image_id, new_layer_id,
+                    clear_first=True, activate_target=False
+                )
+            self._layer_id = new_layer_id
+            print(
+                "BLENDGIMP: Object Paint active layer rebound "
+                f"{old_layer_id}->{new_layer_id} reason={reason}"
+            )
+        return new_layer_id
 
     def _acquire_refresh_owner(self):
         if not getattr(self, "_owns_refresh", False):
@@ -4320,6 +4358,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
         ).upper()
 
+        if self._rebind_active_layer(context, reason="fill") is None:
+            return False
         self._acquire_refresh_owner()
         started = time.perf_counter()
         response = connection_manager.bucket_fill(
@@ -4401,6 +4441,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             return False
 
         scene = context.scene
+        if self._rebind_active_layer(context, reason="gradient") is None:
+            return False
         self._acquire_refresh_owner()
         started = time.perf_counter()
         response = connection_manager.gradient_fill(
@@ -4461,6 +4503,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             return False
         x, y, face_index = sample
         scene = context.scene
+        if self._rebind_active_layer(context, reason="clone-source") is None:
+            return False
         scene.blendgimp_clone_source_set = True
         scene.blendgimp_clone_source_image_id = int(self.image_id)
         scene.blendgimp_clone_source_layer_id = int(self._layer_id)
@@ -4501,6 +4545,8 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             return False
         x, y, face_index = sample
         scene = context.scene
+        if self._rebind_active_layer(context, reason="heal-source") is None:
+            return False
         scene.blendgimp_heal_source_set = True
         scene.blendgimp_heal_source_image_id = int(self.image_id)
         scene.blendgimp_heal_source_layer_id = int(self._layer_id)
@@ -4538,8 +4584,10 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         context
     ):
         if self._stroke_id:
-            return
+            return True
 
+        if self._rebind_active_layer(context, reason="stroke") is None:
+            return False
         self._stroke_id = uuid.uuid4().hex
 
         tool = str(
@@ -4598,6 +4646,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         self._streamed_chunks = 0
         self._streamed_segments = 0
         self._streamed_points = 0
+        return True
 
     def _end_live_stroke(
         self,
@@ -4857,32 +4906,15 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 reason="before Object Paint GIMP tool",
                 fail_if_unsent=True,
             )
-            layer_response = connection_manager.resolve_active_raster_layer(
-                self.image_id,
-                BLENDGIMP_DIRECT_PAINT_LAYER_NAME,
-                create_if_missing=True
+            # Phase 6.5.4 RC Fix1: arming the persistent Object Paint owner
+            # must not query GIMP's layer tree while idle.  The authoritative
+            # selected raster layer is resolved by _rebind_active_layer() at
+            # the start of every stroke/Fill/Gradient/source-pick operation.
+            # Use the synchronized Blender-side layer ID only as an initial
+            # cache for status/setup.
+            resolved_layer_id = int(
+                getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)
             )
-
-            if bool(layer_response.get("created", False)):
-                baseline = connection_manager.consume_dirty_baseline(
-                    self.image_id
-                )
-                print(
-                    "BLENDGIMP: "
-                    f"Direct paint baselined new layer structural damage "
-                    f"for image ID {self.image_id}; "
-                    f"changed={bool(baseline.get('changed', False))}"
-                )
-
-            resolved_layer_id = int(layer_response["layer_id"])
-            if (
-                int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) == int(self.image_id)
-                and int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)) != resolved_layer_id
-            ):
-                _blendgimp_main_panel.load_active_layer_buffer_from_gimp(
-                    scene, self.image_id, resolved_layer_id,
-                    clear_first=True, activate_target=False
-                )
 
             # Phase 6 shared brush state is authoritative when available.
             # Fall back to Blender Texture Paint color for older files/builds.
@@ -4935,11 +4967,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             )
             return {"CANCELLED"}
 
-        self._layer_id = int(
-            layer_response[
-                "layer_id"
-            ]
-        )
+        self._layer_id = int(resolved_layer_id)
 
         if (
             getattr(
@@ -5158,19 +5186,11 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             self._brush_name
         )
 
+        self._active_tool = normalize_tool(self._active_tool)
         self._set_status(
             context,
-            (
-                "Auto Object Fill — LMB fill"
-                if self._active_tool == "FILL"
-                else "Auto Object Gradient — LMB drag start/end"
-                if self._active_tool == "GRADIENT"
-                else "Auto Object Clone — Ctrl+LMB source, LMB clone"
-                if self._active_tool == "CLONE"
-                else "Auto Object Heal — Ctrl+LMB source, LMB heal"
-                if self._active_tool == "HEAL"
-                else "Auto Object Paint — LMB paint"
-            )
+            f"Auto Object Paint — {tool_label(self._active_tool)} — "
+            f"{tool_action_hint(self._active_tool)}",
         )
 
         context.window_manager.modal_handler_add(
@@ -5190,7 +5210,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             f"Direct GIMP 3D Paint started for image ID "
             f"{self.image_id}, layer ID {self._layer_id}, "
             f"tool={self._active_tool}, "
-            f"layer_source={layer_response.get('source', 'selected')}, "
+            f"layer_source=idle-cache, "
             f"brush={self._brush_name}, size={self._brush_size:.1f}, "
             f"front_faces_only={self._front_faces_only}, "
             f"normal_angle_enabled={self._normal_angle_enabled}, "
@@ -5281,28 +5301,18 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
         # and waiting for the timer to create a replacement. The old restart
         # gap allowed Blender's native Texture Paint to receive viewport clicks
         # between owners and made Object Paint feel like it switched modes.
-        requested_tool = str(getattr(scene, "blendgimp_paint_tool", self._active_tool)).upper()
+        requested_tool = normalize_tool(getattr(scene, "blendgimp_paint_tool", self._active_tool))
         if not self._painting and requested_tool != self._active_tool:
             previous_tool = self._active_tool
             self._active_tool = requested_tool
             self._gradient_start_sample = None
-            action_hint = (
-                "LMB fill"
-                if requested_tool == "FILL"
-                else "LMB drag start/end"
-                if requested_tool == "GRADIENT"
-                else "Ctrl+LMB source, LMB clone"
-                if requested_tool == "CLONE"
-                else "Ctrl+LMB source, LMB heal"
-                if requested_tool == "HEAL"
-                else "LMB paint"
-            )
             self._set_status(
                 context,
-                f"Auto Object Paint — {requested_tool.title()} — {action_hint}",
+                f"Auto Object Paint — {tool_label(requested_tool)} — "
+                f"{tool_action_hint(requested_tool)}",
             )
             print(
-                "BLENDGIMP: Phase 6.3.7 Object Paint live tool switch "
+                "BLENDGIMP: Phase 6.5.3 Object Paint live tool switch "
                 f"{previous_tool}->{requested_tool}; owner preserved"
             )
 
@@ -5327,7 +5337,7 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 pass
             return {"PASS_THROUGH"}
 
-        if event.type == "MOUSEMOVE":
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
             try:
                 area = stored_area
                 over_area = bool(
@@ -5337,10 +5347,12 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 )
                 if over_area or self._painting:
                     cursor = (
-                        "CROSSHAIR"
-                        if self._active_tool in {"FILL", "GRADIENT"}
-                        else "PAINT_BRUSH"
-                    ) if (inside_window or self._painting) else "DEFAULT"
+                        tool_cursor(
+                            self._active_tool,
+                            ctrl=bool(getattr(event, "ctrl", False)),
+                        )
+                        if (inside_window or self._painting) else "DEFAULT"
+                    )
                     context.window.cursor_modal_set(cursor)
             except Exception:
                 pass
@@ -5354,7 +5366,11 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
             if self._painting:
                 self._painting = False
                 self._abort_live_stroke()
-            self._set_status(context, "Current operation ended — auto Object Paint ready")
+            self._set_status(
+                context,
+                f"Auto Object Paint — {tool_label(self._active_tool)} — "
+                f"{tool_action_hint(self._active_tool)}",
+            )
             return {"RUNNING_MODAL"}
 
         if event.type == "RIGHTMOUSE" and event.value == "PRESS":
@@ -5566,9 +5582,11 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 if point_added:
 
                     try:
-                        self._begin_live_stroke(
+                        if not self._begin_live_stroke(
                             context
-                        )
+                        ):
+                            self._painting = False
+                            return {"RUNNING_MODAL"}
                     except Exception as exc:
 
                         self._painting = False
@@ -5621,9 +5639,11 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                     if point_added:
 
                         try:
-                            self._begin_live_stroke(
+                            if not self._begin_live_stroke(
                                 context
-                            )
+                            ):
+                                self._painting = False
+                                return {"RUNNING_MODAL"}
                         except Exception as exc:
 
                             self._finish(
@@ -5794,9 +5814,11 @@ class BLENDGIMP_OT_direct_gimp_brush_paint(
                 try:
 
                     if self._stroke_id is None:
-                        self._begin_live_stroke(
+                        if not self._begin_live_stroke(
                             context
-                        )
+                        ):
+                            self._painting = False
+                            return {"RUNNING_MODAL"}
 
                     self._flush_live_chunks(
                         context,

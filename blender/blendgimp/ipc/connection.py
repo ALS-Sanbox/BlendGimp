@@ -105,7 +105,7 @@ def get_direct_paint_refresh_owner():
     snapshot["owners"] = dict(_DIRECT_PAINT_REFRESH_RUNTIME.get("owners", {}))
     return snapshot
 
-BLENDGIMP_VERSION = "0.1.0"
+BLENDGIMP_VERSION = "0.5.3"
 
 SOCKET_TIMEOUT = 2.0
 EXPORT_COMPOSITE_TIMEOUT = 30.0
@@ -115,6 +115,7 @@ GET_IMAGE_DIRTY_PIXELS_TIMEOUT = 30.0
 ENGINE_SHUTDOWN_TIMEOUT = 5.0
 CREATE_IMAGE_TIMEOUT = 30.0
 SAVE_IMAGE_TIMEOUT = 60.0
+OPEN_XCF_TIMEOUT = 60.0
 
 
 class GimpImageNotFoundError(RuntimeError):
@@ -139,6 +140,7 @@ class BlendGimpConnection:
         PING       -> PONG
         STATUS     -> STATUS
         CREATE_IMAGE     -> IMAGE_CREATED
+        OPEN_XCF         -> XCF_OPENED
         SAVE_IMAGE       -> IMAGE_SAVED
         GET_IMAGES       -> IMAGES
         GET_IMAGE_LAYERS    -> IMAGE_LAYERS
@@ -3204,6 +3206,46 @@ class BlendGimpConnection:
             raise RuntimeError(
                 "Unexpected SHUTDOWN_ENGINE response: "
                 f"{response.get('type')}"
+            )
+
+        return response
+
+
+    # ========================================================
+    # OPEN NATIVE XCF DOCUMENT
+    # ========================================================
+
+    def open_xcf(
+        self,
+        path
+    ):
+        """Open a native XCF document in the persistent GIMP engine."""
+
+        path = str(path or "").strip()
+        if not path:
+            raise ValueError("Choose an XCF file to open")
+
+        response = self.request(
+            {
+                "type": "OPEN_XCF",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "path": path,
+                "request_id": self._next_request_id(
+                    "open-xcf"
+                ),
+            },
+            timeout=OPEN_XCF_TIMEOUT
+        )
+
+        self._validate_write_response(
+            response,
+            expected_type="XCF_OPENED"
+        )
+
+        if int(response.get("image_id", -1)) < 0:
+            raise RuntimeError(
+                "GIMP returned an invalid image ID for OPEN_XCF"
             )
 
         return response

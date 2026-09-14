@@ -22,6 +22,7 @@ import bpy
 import time
 
 from ..ipc.connection import connection_manager
+from . import preferences as blendgimp_preferences
 
 
 MODE_TEXTURE = "TEXTURE"
@@ -806,7 +807,7 @@ def _auto_pointer_routing_update(_self, context):
 
 def _ensure_auto_pointer_routing(context):
     scene = getattr(context, "scene", None)
-    if scene is None or not bool(getattr(scene, "blendgimp_auto_pointer_routing", True)):
+    if scene is None or not blendgimp_preferences.auto_paint_enabled(context=context, scene=scene):
         return
     if not connection_manager.is_connected():
         return
@@ -1636,7 +1637,7 @@ def register():
             persistent=True,
         )
 
-    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel + automatic pointer routing registered")
+    print("BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability texture editor registered")
 
 
 def unregister():
@@ -1685,4 +1686,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: Phase 6.5.2 Native Layer Panel + automatic pointer routing unregistered")
+    print("BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability texture editor unregistered")
