@@ -4,10 +4,9 @@ BlendGimp uses Blender's existing Image Editor and 3D View as its artist-facing
 texture and object painting surfaces.  GIMP remains the authoritative raster
 engine while Blender owns the viewport, UVs, materials, and interaction shell.
 
-0.5.18 retires the visible "BlendGimp Area" activation/mode-switch workflow.
-The internal area markers remain only as routing ownership metadata so the
-accepted Phase 6 automatic pointer/modal architecture does not need to change.
-Eligible native editors are enrolled automatically by the texture-editor timer.
+Native Image Editors and 3D Views are enrolled automatically for BlendGimp
+routing. Internal area markers exist only as private routing-ownership metadata
+so the accepted Phase 6 automatic pointer/modal architecture remains intact.
 """
 
 import bpy
@@ -23,6 +22,7 @@ except Exception:  # Blender-only runtime dependency
     batch_for_shader = None
 
 from ..ipc.connection import connection_manager, set_direct_paint_refresh_owner
+from ..core.build_info import DISPLAY_NAME
 from . import preferences as blendgimp_preferences
 
 
@@ -100,6 +100,31 @@ _SCREEN_MODE_PREFIX = "blendgimp_area_mode_"
 _SCREEN_PREV_TYPE_PREFIX = "blendgimp_area_prev_type_"
 _SCREEN_PREV_UI_TYPE_PREFIX = "blendgimp_area_prev_ui_type_"
 _SCREEN_ROUTING_GENERATION_PREFIX = "blendgimp_area_route_generation_"
+
+
+def _reset_texture_editor_runtime_state():
+    """Reset transient routing/selection caches without touching saved data."""
+    _AUTO_ROUTER_COOLDOWNS.clear()
+    _RUNTIME_AREA_MODES.clear()
+    _RUNTIME_AREA_ENABLED.clear()
+    _AREA_RELEASE_SERIALS.clear()
+    _ROUTING_GENERATIONS.clear()
+    _SELECTION_OUTLINE_CACHE.clear()
+    _SELECTION_FREE_PREVIEW.update(
+        {"active": False, "area_ptr": 0, "operation": "PENDING", "points": [], "hover": None}
+    )
+    _SELECTION_DRAG_PREVIEW.update(
+        {
+            "active": False,
+            "area_ptr": 0,
+            "shape": "RECTANGLE",
+            "operation": "REPLACE",
+            "x1": 0.0,
+            "y1": 0.0,
+            "x2": 0.0,
+            "y2": 0.0,
+        }
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -653,7 +678,7 @@ def _set_active_texture(scene, image_id):
 
 
 # -----------------------------------------------------------------------------
-# BlendGimp Area host configuration
+# Managed editor routing configuration
 # -----------------------------------------------------------------------------
 
 
@@ -733,83 +758,13 @@ def _configure_texture_area(area, scene, image=None):
     area.tag_redraw()
 
 
-def _configure_object_area(area, _scene):
-    if area is None:
-        return
-    if area.type != "VIEW_3D":
-        area.type = "VIEW_3D"
-
-    space = area.spaces.active
-    _set_if_present(space, "show_region_ui", True)
-    area.tag_redraw()
-
-
-def _switch_area_mode(context, mode):
-    area = context.area
-    screen = context.screen
-    scene = context.scene
-
-    if area is None or screen is None:
-        return False
-
-    logical_index = _screen_area_index(screen, area)
-    if logical_index < 0:
-        return False
-    old_key = _runtime_area_key(screen, area)
-
-    previous_mode = _area_mode(screen, area) if _is_blendgimp_area(screen, area) else ""
-    if previous_mode and previous_mode != mode:
-        request_blendgimp_paint_release(
-            scene, "BlendGimp area mode changed", screen=screen, area=area
-        )
-
-    if not _is_blendgimp_area(screen, area):
-        if not _enable_blendgimp_area(screen, area, mode):
-            return False
-    else:
-        _set_area_mode(screen, area, mode)
-
-    image = _find_blendgimp_image(scene.blendgimp_texture_editor_image_id)
-    if scene.blendgimp_texture_editor_follow_active:
-        image = _set_active_texture(scene, _resolve_follow_image_id(context))
-
-    if mode == MODE_TEXTURE:
-        _configure_texture_area(area, scene, image=image)
-        scene.blendgimp_texture_editor_status = (
-            f"Texture Paint — {image.name}" if image else "Texture Paint — no active texture"
-        )
-    else:
-        _configure_object_area(area, scene)
-        scene.blendgimp_texture_editor_status = (
-            f"Object Paint — {image.name}" if image else "Object Paint — no active texture"
-        )
-
-    # Blender can replace the Area RNA pointer when its editor type changes.
-    # Rebind runtime metadata to the live Area now occupying the same logical
-    # Screen slot and retire the pre-switch pointer cache.
-    try:
-        live_area = screen.areas[logical_index]
-    except Exception:
-        live_area = area
-    live_key = _runtime_area_key(screen, live_area)
-    if old_key is not None and old_key != live_key:
-        _RUNTIME_AREA_ENABLED.discard(old_key)
-        _RUNTIME_AREA_MODES.pop(old_key, None)
-        _AREA_RELEASE_SERIALS.pop(old_key, None)
-    if live_area is not None:
-        _set_area_mode(screen, live_area, mode)
-
-    scene.blendgimp_area_last_mode = mode
-    return True
-
-
 def _ensure_default_native_areas(context):
     """Silently enroll normal Blender editors for BlendGimp routing.
 
-    This replaces the old user-facing "Use Area as BlendGimp" workflow while
-    preserving the accepted area-scoped modal ownership implementation.  At
-    most one Image Editor and one 3D View are enrolled per screen by default.
-    Existing saved markers are respected.
+    Enroll normal Blender editors while preserving the accepted area-scoped
+    modal ownership implementation. At most one Image Editor and one 3D View
+    are enrolled per screen by default. Existing saved routing markers are
+    respected.
     """
     wm = getattr(bpy.context, "window_manager", None)
     if wm is None:
@@ -2162,74 +2117,6 @@ class BLENDGIMP_OT_selection_modify(bpy.types.Operator):
 # -----------------------------------------------------------------------------
 
 
-class BLENDGIMP_OT_use_area(bpy.types.Operator):
-    bl_idname = "blendgimp.use_area"
-    bl_label = "Use Area as BlendGimp (Legacy)"
-    bl_description = "Legacy compatibility operator; native editors are enrolled automatically"
-    bl_options = {"INTERNAL"}
-
-    mode: bpy.props.EnumProperty(
-        name="BlendGimp Mode",
-        items=(
-            (MODE_TEXTURE, "Texture Paint", "2D GIMP-backed texture canvas", "IMAGE_DATA", 0),
-            (MODE_OBJECT, "Object Paint", "Paint on the 3D object through GIMP", "OBJECT_DATA", 1),
-        ),
-        default=MODE_TEXTURE,
-    )
-
-    @classmethod
-    def poll(cls, context):
-        return context.area is not None and context.area.type not in {"TOPBAR", "STATUSBAR"}
-
-    def execute(self, context):
-        if not _switch_area_mode(context, self.mode):
-            self.report({"ERROR"}, "Could not initialize this area for BlendGimp")
-            return {"CANCELLED"}
-
-        label = "Texture Paint" if self.mode == MODE_TEXTURE else "Object Paint"
-        self.report({"INFO"}, f"BlendGimp Area: {label}")
-        return {"FINISHED"}
-
-
-class BLENDGIMP_OT_switch_area_mode(bpy.types.Operator):
-    bl_idname = "blendgimp.switch_area_mode"
-    bl_label = "Switch BlendGimp Mode"
-    bl_description = "Switch this BlendGimp area between Texture Paint and Object Paint"
-
-    mode: bpy.props.EnumProperty(
-        items=(
-            (MODE_TEXTURE, "Texture Paint", "2D GIMP-backed texture painting"),
-            (MODE_OBJECT, "Object Paint", "3D object surface painting"),
-        ),
-        default=MODE_TEXTURE,
-    )
-
-    @classmethod
-    def poll(cls, context):
-        return _context_is_blendgimp_area(context)
-
-    def execute(self, context):
-        if not _switch_area_mode(context, self.mode):
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class BLENDGIMP_OT_disable_area(bpy.types.Operator):
-    bl_idname = "blendgimp.disable_area"
-    bl_label = "Disable BlendGimp Area"
-    bl_description = "Return this area to the editor type it used before BlendGimp"
-
-    @classmethod
-    def poll(cls, context):
-        return _context_is_blendgimp_area(context)
-
-    def execute(self, context):
-        request_blendgimp_paint_release(context.scene, "BlendGimp Area disabled", screen=context.screen, area=context.area)
-        _disable_blendgimp_area(context.screen, context.area, restore=True)
-        self.report({"INFO"}, "BlendGimp Area disabled")
-        return {"FINISHED"}
-
-
 class BLENDGIMP_OT_use_blender_brushes(bpy.types.Operator):
     bl_idname = "blendgimp.use_blender_brushes"
     bl_label = "Use Blender Brushes"
@@ -2428,34 +2315,6 @@ class BLENDGIMP_OT_texture_view_100(bpy.types.Operator):
 # -----------------------------------------------------------------------------
 # UI helpers
 # -----------------------------------------------------------------------------
-
-
-def _draw_mode_switch(layout, context, compact=False):
-    screen = context.screen
-    area = context.area
-    current = _area_mode(screen, area)
-
-    row = layout.row(align=True)
-    row.operator_context = "INVOKE_DEFAULT"
-
-    op = row.operator(
-        "blendgimp.switch_area_mode",
-        text="Texture Paint",
-        icon="IMAGE_DATA",
-        depress=(current == MODE_TEXTURE),
-    )
-    op.mode = MODE_TEXTURE
-
-    op = row.operator(
-        "blendgimp.switch_area_mode",
-        text="Object Paint",
-        icon="OBJECT_DATA",
-        depress=(current == MODE_OBJECT),
-    )
-    op.mode = MODE_OBJECT
-
-    if compact:
-        row.operator("blendgimp.disable_area", text="", icon="X")
 
 
 def _draw_active_texture(layout, context, show_manual=True):
@@ -2663,125 +2522,6 @@ def _draw_selection_controls(layout, context):
     else:
         box.label(text="Hold Shift/Ctrl before the first canvas click to combine selections")
 
-def _draw_object_paint_controls(layout, context, image):
-    scene = context.scene
-
-    paint = layout.box()
-    paint.label(text="Object Paint", icon="BRUSH_DATA")
-
-    if image is None:
-        paint.label(text="Create or synchronize a texture first", icon="INFO")
-        return
-
-    image_id = scene.blendgimp_texture_editor_image_id
-    direct_active = bool(
-        hasattr(scene, "blendgimp_direct_paint_active")
-        and scene.blendgimp_direct_paint_active
-        and int(getattr(scene, "blendgimp_direct_paint_image_id", -1)) == image_id
-    )
-
-    if direct_active:
-        paint.label(text="Painting ACTIVE — LMB paint • Esc/RMB exit", icon="CHECKMARK")
-    elif hasattr(bpy.types, "BLENDGIMP_OT_direct_gimp_brush_paint"):
-        op = paint.operator(
-            "blendgimp.direct_gimp_brush_paint",
-            text="Start Object Paint",
-            icon="BRUSH_DATA",
-        )
-        op.image_id = int(image_id)
-        op.image_width = int(image.size[0])
-        op.image_height = int(image.size[1])
-    else:
-        paint.label(text="3D paint operator unavailable — restart Blender", icon="ERROR")
-
-    brush_name = str(getattr(scene, "blendgimp_direct_paint_brush", "") or "")
-    if brush_name:
-        paint.label(text=f"GIMP Brush: {brush_name}")
-
-    protection = layout.box()
-    protection.label(text="Surface Projection", icon="MODIFIER")
-
-    if hasattr(scene, "blendgimp_direct_paint_projection_mesh"):
-        protection.prop(scene, "blendgimp_direct_paint_projection_mesh", text="Projection Mesh")
-    if hasattr(scene, "blendgimp_direct_paint_occlusion_mode"):
-        protection.prop(scene, "blendgimp_direct_paint_occlusion_mode", text="Surface Mode")
-    if hasattr(scene, "blendgimp_direct_paint_footprint_protection"):
-        protection.prop(
-            scene,
-            "blendgimp_direct_paint_footprint_protection",
-            text="Protect Brush Footprint",
-        )
-    if hasattr(scene, "blendgimp_direct_paint_front_faces_only"):
-        protection.prop(scene, "blendgimp_direct_paint_front_faces_only", text="Front Faces Only")
-
-    protection.label(text="Uses existing modifier-aware/seam-safe Phase 4 projection")
-
-
-# -----------------------------------------------------------------------------
-# Header additions
-# -----------------------------------------------------------------------------
-
-
-def _draw_blendgimp_header(self, context):
-    area = getattr(context, "area", None)
-    screen = getattr(context, "screen", None)
-    if area is None or screen is None:
-        return
-
-    layout = self.layout
-
-    if not _is_blendgimp_area(screen, area):
-        if getattr(context.scene, "blendgimp_show_area_header_launcher", True):
-            layout.separator()
-            op = layout.operator(
-                "blendgimp.use_area",
-                text="BlendGimp",
-                icon="BRUSH_DATA",
-            )
-            op.mode = MODE_TEXTURE if area.type == "IMAGE_EDITOR" else MODE_OBJECT
-        return
-
-    layout.separator()
-    layout.label(text="BlendGimp", icon="BRUSH_DATA")
-    _draw_mode_switch(layout, context, compact=True)
-
-
-# -----------------------------------------------------------------------------
-# Panels — launchers
-# -----------------------------------------------------------------------------
-
-
-class _BLENDGIMP_PT_area_launcher_base:
-    bl_label = "BlendGimp Area"
-    bl_region_type = "UI"
-    bl_category = "BlendGimp"
-    bl_options = {"DEFAULT_CLOSED"}
-
-    @classmethod
-    def poll(cls, context):
-        return False
-
-    def draw(self, _context):
-        layout = self.layout
-        layout.label(text="Use this editor area for BlendGimp.")
-        row = layout.row(align=True)
-        op = row.operator("blendgimp.use_area", text="Texture Paint", icon="IMAGE_DATA")
-        op.mode = MODE_TEXTURE
-        op = row.operator("blendgimp.use_area", text="Object Paint", icon="OBJECT_DATA")
-        op.mode = MODE_OBJECT
-        layout.label(text="Tip: F3 → 'Use Area as BlendGimp' works from other editors.")
-
-
-class BLENDGIMP_PT_area_launcher_image(_BLENDGIMP_PT_area_launcher_base, bpy.types.Panel):
-    bl_idname = "BLENDGIMP_PT_area_launcher_image"
-    bl_space_type = "IMAGE_EDITOR"
-
-
-class BLENDGIMP_PT_area_launcher_view3d(_BLENDGIMP_PT_area_launcher_base, bpy.types.Panel):
-    bl_idname = "BLENDGIMP_PT_area_launcher_view3d"
-    bl_space_type = "VIEW_3D"
-
-
 # -----------------------------------------------------------------------------
 # Panels — Texture Paint mode
 # -----------------------------------------------------------------------------
@@ -2865,9 +2605,6 @@ classes = (
     BLENDGIMP_OT_selection_free,
     BLENDGIMP_OT_selection_point,
     BLENDGIMP_OT_selection_modify,
-    BLENDGIMP_OT_use_area,
-    BLENDGIMP_OT_switch_area_mode,
-    BLENDGIMP_OT_disable_area,
     BLENDGIMP_OT_use_blender_brushes,
     BLENDGIMP_OT_texture_editor_refresh,
     BLENDGIMP_OT_texture_editor_set_image,
@@ -2885,12 +2622,7 @@ classes = (
 
 def register():
     global _SELECTION_DRAW_HANDLER
-    _AUTO_ROUTER_COOLDOWNS.clear()
-    _RUNTIME_AREA_MODES.clear()
-    _RUNTIME_AREA_ENABLED.clear()
-    _AREA_RELEASE_SERIALS.clear()
-    _SELECTION_FREE_PREVIEW.update({"active": False, "area_ptr": 0, "points": [], "hover": None})
-    _SELECTION_DRAG_PREVIEW.update({"active": False, "area_ptr": 0, "shape": "RECTANGLE", "x1": 0.0, "y1": 0.0, "x2": 0.0, "y2": 0.0})
+    _reset_texture_editor_runtime_state()
 
     for cls in classes:
         bpy.utils.register_class(cls)
@@ -2954,7 +2686,7 @@ def register():
         update=_texture_editor_property_update,
     )
     bpy.types.Scene.blendgimp_texture_editor_status = bpy.props.StringProperty(
-        name="BlendGimp Area Status",
+        name="BlendGimp Texture Status",
         default="",
         options={"SKIP_SAVE"},
     )
@@ -3033,15 +2765,6 @@ def register():
     bpy.types.Scene.blendgimp_selection_drag_y1 = bpy.props.FloatProperty(default=0.0, options={"SKIP_SAVE"})
     bpy.types.Scene.blendgimp_selection_drag_x2 = bpy.props.FloatProperty(default=0.0, options={"SKIP_SAVE"})
     bpy.types.Scene.blendgimp_selection_drag_y2 = bpy.props.FloatProperty(default=0.0, options={"SKIP_SAVE"})
-    bpy.types.Scene.blendgimp_area_last_mode = bpy.props.EnumProperty(
-        name="BlendGimp Area Mode",
-        items=(
-            (MODE_TEXTURE, "Texture Paint", "2D GIMP-backed texture canvas"),
-            (MODE_OBJECT, "Object Paint", "3D surface painting"),
-        ),
-        default=MODE_TEXTURE,
-        options={"SKIP_SAVE"},
-    )
     bpy.types.Scene.blendgimp_auto_pointer_routing = bpy.props.BoolProperty(
         name="Automatic Paint Routing",
         description=(
@@ -3051,8 +2774,6 @@ def register():
         default=True,
         update=_auto_pointer_routing_update,
     )
-
-    # 0.5.18: the old BlendGimp Area header launcher is intentionally retired.
 
     if _SELECTION_DRAW_HANDLER is None:
         try:
@@ -3070,26 +2791,12 @@ def register():
             persistent=True,
         )
 
-    print("BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys texture editor registered")
+    print(f"BLENDGIMP: {DISPLAY_NAME} texture editor registered")
 
 
 def unregister():
     global _SELECTION_DRAW_HANDLER
-    _AUTO_ROUTER_COOLDOWNS.clear()
-    _RUNTIME_AREA_MODES.clear()
-    _RUNTIME_AREA_ENABLED.clear()
-    _AREA_RELEASE_SERIALS.clear()
-    _SELECTION_FREE_PREVIEW.update({"active": False, "area_ptr": 0, "points": [], "hover": None})
-    _SELECTION_DRAG_PREVIEW.update({"active": False, "area_ptr": 0, "shape": "RECTANGLE", "x1": 0.0, "y1": 0.0, "x2": 0.0, "y2": 0.0})
-
-    try:
-        bpy.types.IMAGE_HT_header.remove(_draw_blendgimp_header)
-    except Exception:
-        pass
-    try:
-        bpy.types.VIEW3D_HT_header.remove(_draw_blendgimp_header)
-    except Exception:
-        pass
+    _reset_texture_editor_runtime_state()
 
     if _SELECTION_DRAW_HANDLER is not None:
         try:
@@ -3128,7 +2835,6 @@ def unregister():
         "blendgimp_selection_active",
         "blendgimp_selection_overlay",
         "blendgimp_auto_pointer_routing",
-        "blendgimp_area_last_mode",
         "blendgimp_texture_editor_status",
         "blendgimp_texture_editor_active_face_highlight",
         "blendgimp_texture_editor_uv_edge_style",
@@ -3150,4 +2856,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print("BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys texture editor unregistered")
+    print(f"BLENDGIMP: {DISPLAY_NAME} texture editor unregistered")

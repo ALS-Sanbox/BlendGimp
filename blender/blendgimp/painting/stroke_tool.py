@@ -18,8 +18,6 @@ from ..ipc.connection import (
 from ..core.tool_state import normalize_tool, tool_action_hint, tool_cursor, tool_label
 
 
-BLENDGIMP_DIRECT_PAINT_LAYER_NAME = "BlendGimp Paint"
-
 # Live chunking balances interaction latency against synchronous IPC overhead.
 # GIMP Auto Sync can observe the raster while the button remains down.
 LIVE_STROKE_CHUNK_POINTS = 16

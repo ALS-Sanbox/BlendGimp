@@ -1,4 +1,4 @@
-"""BlendGimp 0.5.18 — production preferences and diagnostics.
+"""BlendGimp production preferences and diagnostics.
 
 Phase 7.0 keeps production painting controls in the artist-facing panels and
 moves configuration, setup, maintenance, and diagnostics into Blender
@@ -9,10 +9,8 @@ the frozen Phase 6 engine and paint code do not need an architectural rewrite.
 import bpy
 
 from ..core import gimp_manager
+from ..core.build_info import VERSION as BLENDGIMP_VERSION, BUILD_ID
 from ..ipc.connection import connection_manager
-
-BLENDGIMP_VERSION = "0.5.18"
-BUILD_ID = "7.2-real-brush-preview-hotkeys"
 
 # AddonPreferences must use the root add-on package id. When installed as a
 # Blender Extension this is normally something like

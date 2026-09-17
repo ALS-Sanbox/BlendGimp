@@ -3,6 +3,8 @@ import socket
 import threading
 from functools import wraps
 
+from ..core.build_info import VERSION as BLENDGIMP_VERSION, PROTOCOL_VERSION
+
 
 # ============================================================
 # BlendGimp IPC
@@ -28,7 +30,6 @@ def _serialized_io(method):
 HOST = "127.0.0.1"
 PORT = 8765
 
-PROTOCOL_VERSION = 1
 
 # ---------------------------------------------------------------------------
 # Cross-module direct-paint refresh ownership
@@ -99,13 +100,6 @@ def direct_paint_owns_refresh(
     target = int(image_id)
     return any(int(value) == target for value in owners.values())
 
-
-def get_direct_paint_refresh_owner():
-    snapshot = dict(_DIRECT_PAINT_REFRESH_RUNTIME)
-    snapshot["owners"] = dict(_DIRECT_PAINT_REFRESH_RUNTIME.get("owners", {}))
-    return snapshot
-
-BLENDGIMP_VERSION = "0.5.18"
 
 SOCKET_TIMEOUT = 2.0
 EXPORT_COMPOSITE_TIMEOUT = 30.0

@@ -17,7 +17,8 @@ import math
 import gi
 gi.require_version("Gimp", "3.0")
 gi.require_version("Gegl", "0.4")
-from gi.repository import Gimp, GLib, Gio, Gegl
+gi.require_version("Babl", "0.1")
+from gi.repository import Gimp, GLib, Gio, Gegl, Babl
 
 
 # -----------------------------------------------------------------------------
@@ -28,7 +29,7 @@ PLUGIN_PROC = "extension-blendgimp"
 HOST = "127.0.0.1"
 PORT = 8765
 PROTOCOL_VERSION = 1
-BLENDGIMP_VERSION = "0.5.18"
+BLENDGIMP_VERSION = "0.5.21"
 
 # One generated token per open GIMP image ID for the lifetime of this
 # persistent BlendGimp plug-in session. This keeps refresh paths stable while
@@ -3048,7 +3049,15 @@ def gimp_get_brush_preview(max_size=256):
         brush_name = str(brush)
 
     max_size = max(32, min(512, int(max_size or 256)))
-    mask_buffer = brush.get_mask(max_size, max_size, None)
+
+    # GIMP 3.2.4 documents the Babl format as optional at the C API level,
+    # but PyGObject's generated Brush.get_mask() binding rejects None for
+    # argument 3.  Pass an explicit single-channel 8-bit Babl format so the
+    # request works reliably in the bundled Windows Python runtime.
+    mask_format = Babl.format("Y u8")
+    if mask_format is None:
+        raise RuntimeError("Babl could not create Y u8 brush-mask format")
+    mask_buffer = brush.get_mask(max_size, max_size, mask_format)
     if mask_buffer is None:
         raise RuntimeError(f"GIMP did not return a mask for brush: {brush_name}")
 

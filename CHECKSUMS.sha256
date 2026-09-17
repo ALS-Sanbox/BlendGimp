@@ -1,2 +1,5 @@
-b1e02d714ee6fe6bf9c7405bda4d95e427aaf84d7afc5867b6481161f028e21d  packages/BlendGimp-0.5.3-Phase7.0-IMAGE-MATERIAL-UI-Blender-Extension.zip
-5f345986dfadcb855f82dd6cf3d84779f92da65a4a48f60f001e70a1b9973258  packages/BlendGimp-0.5.3-Phase7.0-IMAGE-MATERIAL-UI-GIMP-Component.zip
+026c3ae7a0f5cd097faa8b4cfc6e514357c78cabb05cd3cedc108cd531513090  packages/BlendGimp-0.5.21-Phase7.2-CODE-CLEANUP-COMPLETE-Blender-Extension.zip
+292a7be31b1add3aa995c099572ac37afc6ee01675080ca94e63c13cb9f4bb86  packages/BlendGimp-0.5.21-Phase7.2-CODE-CLEANUP-COMPLETE-GIMP-Component.zip
+937a1f38ca615415ce3575fc4a8af79b5baa59a3c7f3d1b3b507451bef4c88ec  blender/blendgimp/blender_manifest.toml
+54ca74a2a722798c102169491eb05d06aa8c6b23f95c329e13998e7ebe5f7080  blender/blendgimp/core/build_info.py
+849808c1e94bea9ac3d04c68be78ddc744e4e65963a2ebc600c4bdf5ef4dba47  gimp/blendgimp/blendgimp.py

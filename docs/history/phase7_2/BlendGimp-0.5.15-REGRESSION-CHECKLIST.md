@@ -1,0 +1,22 @@
+# BlendGimp 0.5.15 — Regression Checklist
+
+- [ ] Blender manifest reports 0.5.15
+- [ ] Blender IPC reports 0.5.15
+- [ ] GIMP component reports 0.5.15
+- [ ] Build reports `7.2-by-color-reliability`
+- [ ] No visible blank Combine Mode enum/buttons
+- [ ] No modifier = Replace
+- [ ] Shift = Add
+- [ ] Ctrl = Subtract
+- [ ] Shift+Ctrl = Intersect
+- [ ] Existing selection stays visible during Add/Subtract/Intersect Rectangle/Ellipse drag
+- [ ] Existing selection stays visible during combined Free Select construction
+- [ ] Fuzzy Select completes and shows mask contour
+- [ ] Select by Color completes and shows disconnected mask contours
+- [ ] Contour extraction failure does not fail GIMP selection creation
+- [ ] Rectangle/Ellipse dotted outlines remain correct
+- [ ] Invert keeps correct inner/outer outline
+- [ ] Free Select double-click still commits
+- [ ] Group collapse/expand remains correct
+- [ ] Color Tag swatches remain visible
+- [ ] Texture Paint and Object Paint regression pass

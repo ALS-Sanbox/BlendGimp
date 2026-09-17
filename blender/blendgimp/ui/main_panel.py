@@ -3,7 +3,6 @@ import json
 import os
 import time
 import base64
-import tempfile
 import re
 from bpy.app.handlers import persistent
 
@@ -13,6 +12,7 @@ except Exception:
     bpy_previews = None
 
 from ..core import gimp_manager
+from ..core.build_info import DISPLAY_NAME
 from . import preferences as blendgimp_preferences
 from ..ipc.connection import (
     connection_manager,
@@ -2034,27 +2034,6 @@ def apply_active_layer_buffer_response(scene, image_id, layer_id, response, *, c
     if activate_target:
         _ensure_active_layer_paint_node(bpy.context, composite, buffer_image, image_id)
     return buffer_image
-
-
-def refresh_active_layer_buffer_region(scene, image_id, layer_id, dirty_response):
-    """Patch the reusable working image from the actual GIMP layer after a GIMP edit."""
-    if not bool(getattr(scene, "blendgimp_blender_paint_sync_enabled", False)):
-        return None
-    if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) != int(image_id):
-        return None
-    if int(getattr(scene, "blendgimp_blender_paint_sync_layer_id", -1)) != int(layer_id):
-        return None
-    if not dirty_response or not bool(dirty_response.get("changed", False)):
-        return None
-    region = (
-        int(dirty_response.get("x", 0)), int(dirty_response.get("y", 0)),
-        int(dirty_response.get("region_width", 0)), int(dirty_response.get("region_height", 0)),
-    )
-    if region[2] <= 0 or region[3] <= 0:
-        return None
-    return load_active_layer_buffer_from_gimp(
-        scene, image_id, layer_id, region=region, clear_first=False, activate_target=False
-    )
 
 
 def update_blender_paint_sync_baseline(
@@ -6413,17 +6392,6 @@ def _resolve_active_blender_image(context, image_id=None):
     return None
 
 
-def _stored_gimp_image_name(scene, image_id):
-    try:
-        image_id = int(image_id)
-        for item in get_stored_images(scene):
-            if int(item.get("id", -1)) == image_id:
-                return str(item.get("name", "") or "")
-    except Exception:
-        pass
-    return ""
-
-
 # ============================================================
 # CREATE BLENDER-OWNED GIMP IMAGE
 # ============================================================
@@ -10234,7 +10202,7 @@ class BLENDGIMP_PT_main_panel(
         # ====================================================
 
         layout.label(
-            text="BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys"
+            text=DISPLAY_NAME
         )
 
         layout.separator()

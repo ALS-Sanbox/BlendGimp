@@ -1,15 +1,23 @@
-# BlendGimp 0.5.3 Package Contents
+# BlendGimp 0.5.21 Package Contents
 
-Canonical release: **0.5.3 / `7.0-image-material-ui`**.
+## Blender Extension ZIP
 
-- `packages/BlendGimp-0.5.3-Phase7.0-IMAGE-MATERIAL-UI-Blender-Extension.zip` — Blender-installable extension
-- `packages/BlendGimp-0.5.3-Phase7.0-IMAGE-MATERIAL-UI-GIMP-Component.zip` — matching GIMP component
-- `blender/blendgimp/` — complete Blender source
-- `gimp/blendgimp/` — complete GIMP component source
-- `docs/BlendGimp-0.5.3-USABILITY-UPDATE.md — Image & Material UI changes`
-- `docs/BlendGimp-0.5.3-ROADMAP.md`
-- `docs/BlendGimp-0.5.3-PHASE7.1-START.md`
-- `docs/BlendGimp-0.5.3-REGRESSION-CHECKLIST.md`
-- `docs/archive/` — frozen 0.5.0 Phase 6 reference documents
-- `VERSION.md` — canonical version/build identity
-- `CHECKSUMS.sha256` — package hashes
+Production-only payload:
+
+- `blendgimp/__init__.py`
+- `blendgimp/blender_manifest.toml`
+- `blendgimp/core/`
+- `blendgimp/ipc/`
+- `blendgimp/painting/`
+- `blendgimp/ui/`
+- UI icon assets
+
+The installed extension intentionally excludes `tests/`, historical docs, source-release scripts, and `buildaddon.bat`.
+
+## GIMP Component ZIP
+
+- `blendgimp/blendgimp.py`
+
+## Full Source ZIP
+
+Contains the Blender source, GIMP component, current documentation, archived development notes, release tests, checksums, and the two installable component ZIPs.

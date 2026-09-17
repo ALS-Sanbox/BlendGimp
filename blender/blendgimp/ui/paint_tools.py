@@ -6,6 +6,7 @@ preview/cursor, and progressively replaces that preview with synchronized GIMP
 pixels as they arrive.
 """
 
+import array
 import base64
 import json
 import math
@@ -29,21 +30,18 @@ except Exception:
     batch_for_shader = None
 
 from ..ipc.connection import connection_manager, set_direct_paint_refresh_owner
+from ..core.build_info import BUILD_ID, DISPLAY_NAME
 from ..core.tool_state import tool_action_hint, tool_cursor, tool_label, normalize_tool
 from . import main_panel
 from . import texture_editor
 from . import preferences as blendgimp_preferences
 
-BUILD_ID = "7.2-real-brush-preview-hotkeys"
 
 
 LIVE_REFRESH_INTERVAL = 0.125  # Throttled authoritative GIMP updates while LMB is down.
 STROKE_STREAM_INTERVAL = 0.050
 STROKE_MIN_BATCH_POINTS = 32
 STROKE_MAX_BATCH_POINTS = 96
-COMMIT_ROWS_PER_TICK = 48
-COMMIT_IMMEDIATE_MAX_BYTES = 512 * 1024
-BRUSH_FALLBACK_LAYER_NAME = "BlendGimp Paint"
 
 _STATE_SYNCING = False
 _BRUSH_NAMES = []
@@ -334,9 +332,22 @@ def _brush_preview_gpu_texture(entry):
         width = int(entry["width"])
         height = int(entry["height"])
         rgba = entry["rgba"]
-        data = gpu.types.Buffer("UBYTE", len(rgba), rgba)
-        texture = gpu.types.GPUTexture((width, height), format="RGBA8", data=data)
+        # Blender 5.2's GPUTexture constructor accepts initialization data
+        # through a FLOAT gpu.types.Buffer.  The old UBYTE upload reached the
+        # cache correctly but failed at GPUTexture.__new__ at runtime.  Keep
+        # the authoritative/cached mask as bytes and lazily normalize it only
+        # once for the non-authoritative preview texture.
+        float_rgba = entry.get("float_rgba")
+        if float_rgba is None:
+            float_rgba = array.array("f", (value / 255.0 for value in rgba))
+            entry["float_rgba"] = float_rgba
+        data = gpu.types.Buffer("FLOAT", len(float_rgba), float_rgba)
+        texture = gpu.types.GPUTexture((width, height), format="RGBA16F", data=data)
         entry["texture"] = texture
+        print(
+            "BLENDGIMP: GPU GIMP brush preview texture ready "
+            f"brush={entry.get('brush_name', '')} mask={width}x{height} format=RGBA16F"
+        )
         return texture
     except Exception as exc:
         if not entry.get("texture_error_logged", False):
@@ -3443,7 +3454,7 @@ def register():
         name="Show Surface Projection",
         default=False,
     )
-    print(f"BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys registered — build {BUILD_ID}")
+    print(f"BLENDGIMP: {DISPLAY_NAME} registered — build {BUILD_ID}")
 
 
 def unregister():
@@ -3509,4 +3520,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print(f"BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys unregistered — build {BUILD_ID}")
+    print(f"BLENDGIMP: {DISPLAY_NAME} unregistered — build {BUILD_ID}")
