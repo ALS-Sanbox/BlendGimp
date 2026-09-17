@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set PACKAGE=BlendGimp-0.5.3-Phase7.0-IMAGE-MATERIAL-UI-Blender-Extension.zip
+set PACKAGE=BlendGimp-0.5.18-Phase7.2-REAL-BRUSH-PREVIEW-HOTKEYS-Blender-Extension.zip
 
 if exist "%PACKAGE%" del /f /q "%PACKAGE%"
 

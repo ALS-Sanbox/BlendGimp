@@ -1,7 +1,7 @@
 # ============================================================
 # BlendGimp
 # Blender Extension Entry Point
-# Version: 0.5.3 — Phase 7.0 Usability / Production UI
+# Version: 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys
 # ============================================================
 
 from .ui import preferences
@@ -20,19 +20,19 @@ def register():
     # of Phase 1-6 runtime state.
     main_panel.register()
 
-    # BlendGimp Area / texture editor.
+    # Native Image Editor / 3D View integration.
     texture_editor.register()
 
     # Apply persistent user preferences only after all mirrored Scene
     # properties exist (engine mode, automatic recovery, and Auto Paint).
     preferences.apply_preferences_to_all_scenes()
 
-    # Frozen Phase 6 artist-workflow baseline. Phase 7.0 only reorganizes
-    # presentation/settings ownership; painting behavior stays protected.
+    # Frozen Phase 6 artist-workflow baseline remains protected while Phase 7.1
+    # adds native GIMP layer masks to the production layer workflow.
     paint_tools.register()
 
     print(
-        "BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability / Production UI "
+        "BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys "
         "registered successfully"
     )
 

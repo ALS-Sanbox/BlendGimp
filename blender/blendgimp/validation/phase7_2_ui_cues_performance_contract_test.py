@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import ast
+import sys
+
+ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parents[1]).resolve()
+checks = []
+
+
+def check(name, cond):
+    ok = bool(cond)
+    checks.append((name, ok))
+    print(("PASS" if ok else "FAIL") + ": " + name)
+    return ok
+
+
+def text(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
+manifest = text("blender_manifest.toml")
+init = text("__init__.py")
+main = text("ui/main_panel.py")
+paint = text("ui/paint_tools.py")
+tex = text("ui/texture_editor.py")
+prefs = text("ui/preferences.py")
+stroke = text("painting/stroke_tool.py")
+ipc = text("ipc/connection.py")
+mgr = text("core/gimp_manager.py")
+tool = text("core/tool_state.py")
+gimp = (ROOT.parents[1] / "gimp" / "blendgimp" / "blendgimp.py").read_text(encoding="utf-8")
+
+# 0.5.9 Phase 7.2 release identity
+check("manifest version 0.5.9", 'version = "0.5.9"' in manifest)
+check("IPC version 0.5.9", 'BLENDGIMP_VERSION = "0.5.9"' in ipc)
+check("UI cues/performance build id", 'BUILD_ID = "7.2-ui-cues-performance"' in paint)
+check("entry point identifies 0.5.9", '0.5.9 — Phase 7.2 UI Cues + Performance' in init)
+check("main panel identifies Phase 7.2", 'BlendGimp 0.5.9 — Phase 7.2 UI Cues + Performance' in main)
+
+# Phase 7.0 preferences / clutter relocation
+check("AddonPreferences exists", 'class BLENDGIMP_Preferences(bpy.types.AddonPreferences)' in prefs)
+check("engine mode is a preference", 'engine_mode: bpy.props.EnumProperty' in prefs)
+check("Auto Paint is a preference", 'auto_paint: bpy.props.BoolProperty' in prefs)
+check("automatic recovery is a preference", 'automatic_recovery: bpy.props.BoolProperty' in prefs)
+check("Detect GIMP remains in Preferences", '"blendgimp.detect_gimp"' in prefs)
+check("Check GIMP Process remains in Preferences", '"blendgimp.check_gimp"' in prefs)
+check("Advanced diagnostics moved to Preferences", 'show_advanced_diagnostics: bpy.props.BoolProperty' in prefs)
+check("Preferences registered first", 'preferences.register()' in init and 'preferences.apply_preferences_to_all_scenes()' in init)
+check("Preferences open shortcut", 'bl_idname = "blendgimp.open_preferences"' in prefs)
+
+panel_start = main.index("class BLENDGIMP_PT_main_panel")
+panel_end = main.index("# ============================================================\n# CLASSES", panel_start)
+panel_draw = main[panel_start:panel_end]
+check("production panel has no Detect GIMP button", '"blendgimp.detect_gimp"' not in panel_draw)
+check("production panel has no Check Process button", '"blendgimp.check_gimp"' not in panel_draw)
+check("production panel does not edit engine mode", '"blendgimp_engine_mode",\n            text="Mode"' not in panel_draw)
+check("production panel has compact engine status", 'text="Engine"' in panel_draw and 'blendgimp.open_preferences' in panel_draw)
+check("production panel renamed Image & Material", 'text="Image & Material"' in panel_draw)
+check("compact panel shows Active Material", 'text="Active Material"' in panel_draw)
+check("compact panel shows Active Image", 'text="Active Image"' in panel_draw)
+check("Active Image uses native datablock selector", 'template_ID(' in panel_draw and '"blendgimp_active_image"' in panel_draw)
+check("Active Image native selector can open Blender images", 'open="image.open"' in panel_draw)
+check("Active Image pointer property exists", 'blendgimp_active_image = (' in main and 'bpy.props.PointerProperty(' in main and 'type=bpy.types.Image' in main)
+check("Active Image selection update callback exists", 'def _active_image_datablock_update' in main and 'update=_active_image_datablock_update' in main)
+check("GIMP-backed selection pins texture editor", 'texture_editor._set_active_texture(scene, image_id)' in main and 'blendgimp_texture_editor_follow_active = False' in main)
+check("ordinary Blender image is explicitly marked unlinked", 'Selected image is not linked to BlendGimp' in panel_draw)
+check("active-image ownership retirement helper exists", 'def _retire_active_image_runtime' in main)
+check("image switch releases direct refresh ownership", 'set_direct_paint_refresh_owner(False)' in main)
+check("image switch clears stale layer-buffer IDs", 'blendgimp_blender_paint_sync_image_id = -1' in main and 'blendgimp_blender_paint_sync_layer_id = -1' in main)
+check("active texture repairs mismatched sync owner", 'runtime_rebind_needed = image_id >= 0 and sync_image_id != image_id' in tex)
+check("active image rebind loads target layer", 'Active Image ownership rebound' in tex and 'load_active_layer_buffer_from_gimp' in tex)
+check("Auto Sync follows explicit Active Image", 'def _retarget_auto_sync_to_image' in main and 'Active Image Auto Sync retargeted' in main)
+check("live patch rejects mismatched image/layer owner", 'Active Layer Buffer live patch skipped' in main and 'sync_image_id != int(self.image_id)' in main)
+check("manual image selection is strongest resolver signal", 'strongest explicit user choice' in main and 'return _image_gimp_id(selected_image)' in main)
+check("new textures populate native image selector", '_set_active_image_datablock(scene, blender_image)' in main)
+check("compact panel has Create Image", 'text="Create Image"' in panel_draw)
+check("compact panel has Refresh From GIMP", 'text="Refresh From GIMP"' in panel_draw)
+check("compact panel has Assign to Material", 'text="Assign to Material"' in panel_draw)
+check("Open XCF removed from production panel", '"blendgimp.open_xcf"' not in panel_draw)
+check("Save All XCF removed from production panel", '"blendgimp.save_all_images"' not in panel_draw)
+check("Refresh image-list removed from production panel", '"blendgimp.get_images"' not in panel_draw)
+check("Disconnect removed from Image & Material panel", '"blendgimp.disconnect"' not in panel_draw)
+check("Create Image uses properties dialog", 'invoke_props_dialog(' in main and 'title="Create BlendGimp Image"' in main)
+check("Create dialog confirm says Create", 'confirm_text="Create"' in main)
+check("Image menu XCF submenu exists", 'class BLENDGIMP_MT_image_xcf' in main)
+check("Image menu hook registered", 'IMAGE_MT_image.append(draw_blendgimp_image_menu)' in main)
+check("Image menu hook unregistered", 'IMAGE_MT_image.remove(draw_blendgimp_image_menu)' in main)
+check("Image menu invokes file selectors", 'layout.operator_context = "INVOKE_DEFAULT"' in main)
+check("Image menu has Open XCF", 'text="Open XCF..."' in main)
+check("Image menu has Save XCF", 'text="Save XCF"' in main and 'text="Save XCF As..."' in main)
+check("Image menu has Save All XCF", 'text="Save All XCF"' in main)
+check("Start GIMP available without prior detection", 'start_cell.operator(' in panel_draw and '"blendgimp.launch_gimp"' in panel_draw)
+check("Start GIMP uses active accent treatment", 'depress=True' in panel_draw)
+check("Stop GIMP uses alert/red treatment", 'stop_cell.alert = True' in panel_draw)
+check("Reconnect remains neutral contextual action", '"blendgimp.connect"' in panel_draw and 'reconnect_cell.enabled' in panel_draw)
+check("Start performs automatic detection", 'detect_gimp_for_scene(scene)' in main and 'if not gimp_path or not os.path.isfile(gimp_path)' in main)
+check("manual detection shares automatic helper", 'detected, gimp_path, version = detect_gimp_for_scene(scene)' in main)
+check("Preferences explain automatic detection", 'Detection also runs automatically when Start GIMP is pressed.' in prefs)
+check("Preferences Start is always rendered", 'start_cell.operator(' in prefs and '"blendgimp.launch_gimp"' in prefs)
+check("Preferences Stop uses alert/red treatment", 'stop_cell.alert = True' in prefs)
+
+summary_start = paint.index("def _draw_session_summary")
+summary_end = paint.index("def _draw_layer_controls", summary_start)
+summary_draw = paint[summary_start:summary_end]
+check("Auto Paint removed from paint session panel", 'text="Auto Paint"' not in summary_draw)
+check("old paint diagnostics panel removed", 'def _draw_diagnostics' not in paint)
+
+# Frozen Phase 6 texture canvas / UV presentation remains present
+check("Fit Image", 'bl_idname = "blendgimp.texture_view_fit"' in tex)
+check("100 percent", 'bl_idname = "blendgimp.texture_view_100"' in tex)
+check("presentation controls", 'blendgimp_texture_editor_display_channels' in tex)
+check("UV islands", 'blendgimp_texture_editor_show_islands' in tex)
+check("UV opacity", 'blendgimp_texture_editor_uv_opacity' in tex)
+check("active-face highlight", 'blendgimp_texture_editor_active_face_highlight' in tex)
+
+# Phase 7.0 layer-panel usability pass
+layer_fn_start = main.index("def draw_layer_stack_compact")
+layer_fn_end = main.index("# ============================================================\n# DETECT GIMP", layer_fn_start)
+layer_draw = main[layer_fn_start:layer_fn_end]
+check("layer stack shows visibility first", 'blendgimp.set_layer_visibility' in layer_draw and 'icon="HIDE_OFF" if visible else "HIDE_ON"' in layer_draw)
+check("layer stack shows per-row opacity", 'text=f"{opacity:.0f}%"' in layer_draw)
+check("layer toolbar has Add and Group", 'icon="ADD"' in layer_draw and 'icon="NEWFOLDER"' in layer_draw)
+check("layer toolbar has Duplicate and Delete", 'icon="DUPLICATE"' in layer_draw and 'icon="X"' in layer_draw)
+check("layer toolbar has reorder controls", 'icon="TRIA_UP"' in layer_draw and 'icon="TRIA_DOWN"' in layer_draw)
+check("selected layer properties are consolidated", 'text="Blend"' in layer_draw and 'text="Opacity"' in layer_draw and 'text="Locks"' in layer_draw)
+check("selected layer actions keep Rename Move Merge", 'text="Rename"' in layer_draw and 'text="Move…"' in layer_draw and 'text="Merge Down"' in layer_draw)
+
+# Phase 7.1 native GIMP layer-mask foundation
+check("GIMP component version 0.5.9", 'BLENDGIMP_VERSION = "0.5.9"' in gimp)
+for field in ("has_mask", "mask_id", "mask_name", "mask_apply", "mask_edit", "mask_show"):
+    check("layer snapshot exposes " + field, f'"{field}"' in gimp)
+check("GIMP creates native masks", 'layer.create_mask(' in gimp and 'layer.add_mask(mask)' in gimp)
+check("GIMP mask initialization types", 'Gimp.AddMaskType.WHITE' in gimp and 'Gimp.AddMaskType.BLACK' in gimp and 'Gimp.AddMaskType.SELECTION' in gimp)
+check("GIMP layer-mask edit state", 'def gimp_set_layer_mask_edit' in gimp and 'layer.set_edit_mask' in gimp)
+check("GIMP layer-mask enable state", 'def gimp_set_layer_mask_apply' in gimp and 'layer.set_apply_mask' in gimp)
+check("GIMP mask-only display state", 'def gimp_set_layer_mask_show' in gimp and 'layer.set_show_mask' in gimp)
+check("GIMP applies masks", 'Gimp.MaskApplyMode.APPLY' in gimp)
+check("GIMP discards masks", 'Gimp.MaskApplyMode.DISCARD' in gimp)
+for command in ("ADD_LAYER_MASK", "SET_LAYER_MASK_EDIT", "SET_LAYER_MASK_APPLY", "SET_LAYER_MASK_SHOW", "REMOVE_LAYER_MASK"):
+    check("GIMP dispatcher " + command, f'message_type == "{command}"' in gimp)
+check("IPC add layer mask", 'def add_layer_mask(' in ipc and '"ADD_LAYER_MASK"' in ipc)
+check("IPC switch layer/mask target", 'def set_layer_mask_edit(' in ipc and '"SET_LAYER_MASK_EDIT"' in ipc)
+check("IPC enable layer mask", 'def set_layer_mask_apply(' in ipc and '"SET_LAYER_MASK_APPLY"' in ipc)
+check("IPC show layer mask", 'def set_layer_mask_show(' in ipc and '"SET_LAYER_MASK_SHOW"' in ipc)
+check("IPC remove layer mask", 'def remove_layer_mask(' in ipc and '"REMOVE_LAYER_MASK"' in ipc)
+check("Blender Add Mask operator", 'bl_idname = "blendgimp.add_layer_mask"' in main)
+check("Blender Layer Mask edit operator", 'bl_idname = "blendgimp.set_layer_mask_edit"' in main)
+check("Blender Layer Mask enable operator", 'bl_idname = "blendgimp.set_layer_mask_apply"' in main)
+check("Blender Mask View operator", 'bl_idname = "blendgimp.set_layer_mask_show"' in main)
+check("Blender remove/apply mask operator", 'bl_idname = "blendgimp.remove_layer_mask"' in main)
+check("Layer stack indicates masks", 'icon="MOD_MASK"' in layer_draw and 'text="M"' in layer_draw)
+check("Layer details expose Layer/Mask target", 'text="Layer"' in layer_draw and 'text="Mask"' in layer_draw and 'text="Layer Mask"' in layer_draw)
+check("Layer details expose Enabled and Mask View", 'text="Enabled"' in layer_draw and 'text="Mask View"' in layer_draw)
+check("Layer details expose Apply/Delete Mask", 'text="Apply Mask"' in layer_draw and 'text="Delete Mask"' in layer_draw)
+check("Layer-mask switch flushes pending Blender paint", 'def _retire_layer_edit_runtime' in main and 'flush_blender_paint_changes' in main)
+check("Layer-mask switch releases paint routing", 'request_blendgimp_paint_release' in main and 'set_direct_paint_refresh_owner(False)' in main)
+check("Layer-mask switch reloads active buffer", 'def _reload_layer_or_mask_buffer' in main and 'load_active_layer_buffer_from_gimp' in main)
+check("GIMP selects editable mask drawable", 'def _gimp_layer_edit_drawable' in gimp and 'return mask, "MASK"' in gimp)
+check("paint stroke redirects to mask drawable", '_call_gimp_stroke_tool(tool, drawable, coordinates)' in gimp)
+check("Fill redirects to mask drawable", 'success = drawable.edit_bucket_fill(' in gimp)
+check("Gradient redirects to mask drawable", 'success = drawable.edit_gradient_fill(' in gimp)
+check("raw layer buffer follows layer/mask edit target", 'buffer = drawable.get_buffer()' in gimp and 'target_kind' in gimp)
+check("Blender-originated pixel writes follow layer/mask edit target", 'shadow = drawable.get_shadow_buffer()' in gimp and 'drawable.merge_shadow' in gimp)
+check("streamed strokes reject target changes mid-stroke", 'Layer/mask paint target changed while streaming' in gimp)
+
+# Phase 7.1.2 advanced layer operations
+check("snapshot exposes color tags", '"color_tag"' in gimp and '_gimp_color_tag_name' in gimp)
+check("snapshot exposes visibility lock", '"lock_visibility"' in gimp and 'get_lock_visibility' in gimp)
+check("GIMP merge visible helper", 'def gimp_merge_visible_layers' in gimp and 'merge_visible_layers(Gimp.MergeType.EXPAND_AS_NECESSARY)' in gimp)
+check("GIMP flatten helper", 'def gimp_flatten_image' in gimp and 'image.flatten()' in gimp)
+check("GIMP duplicate group helper", 'def gimp_duplicate_group' in gimp and 'not layer.is_group()' in gimp)
+check("GIMP color-tag helper", 'def gimp_set_layer_color_tag' in gimp and 'layer.set_color_tag' in gimp)
+check("GIMP visibility lock", 'lock_type == "VISIBILITY"' in gimp and 'layer.set_lock_visibility' in gimp)
+for command in ("MERGE_VISIBLE_LAYERS", "FLATTEN_IMAGE", "DUPLICATE_GROUP", "SET_LAYER_COLOR_TAG"):
+    check("GIMP dispatcher " + command, f'message_type == "{command}"' in gimp)
+check("IPC merge visible", 'def merge_visible_layers(' in ipc and '"MERGE_VISIBLE_LAYERS"' in ipc)
+check("IPC flatten image", 'def flatten_image(' in ipc and '"FLATTEN_IMAGE"' in ipc)
+check("IPC duplicate group", 'def duplicate_group(' in ipc and '"DUPLICATE_GROUP"' in ipc)
+check("IPC color tag", 'def set_layer_color_tag(' in ipc and '"SET_LAYER_COLOR_TAG"' in ipc)
+check("IPC visibility lock allowed", '"VISIBILITY"' in ipc and 'CONTENT, POSITION, VISIBILITY, or ALPHA' in ipc)
+check("Blender duplicate group operator", 'bl_idname = "blendgimp.duplicate_group"' in main)
+check("Blender merge visible operator", 'bl_idname = "blendgimp.merge_visible_layers"' in main)
+check("Blender flatten operator", 'bl_idname = "blendgimp.flatten_image"' in main)
+check("Blender color-tag operator", 'bl_idname = "blendgimp.set_layer_color_tag"' in main)
+check("Layer panel exposes Merge Visible", 'text="Merge Visible"' in layer_draw)
+check("Layer panel exposes Flatten Image", 'text="Flatten Image"' in layer_draw)
+check("Layer panel uses group-aware duplication", '"blendgimp.duplicate_group" if is_group else "blendgimp.duplicate_layer"' in layer_draw)
+check("Layer panel exposes Color Tag", 'text="Color Tag"' in layer_draw and 'BLENDGIMP_COLOR_TAG_ITEMS' in main)
+check("Layer panel exposes visibility lock", '("VISIBILITY", "Visibility", "lock_visibility")' in layer_draw)
+check("destructive layer ops retire paint ownership", '_retire_layer_edit_runtime(scene, "merge visible layers")' in main and '_retire_layer_edit_runtime(scene, "flatten image")' in main)
+check("destructive layer ops republish composite", 'synchronize_gimp_composite(' in main and 'dirty_only=True' in main)
+check("mask status uses ASCII-safe text", 'Layer mask added - editing mask' in main and 'Layer mask added — editing mask' not in main)
+
+# Phase 7.2 selection foundation
+check("GIMP selection state helper", 'def gimp_get_selection_state' in gimp and 'Gimp.Selection.bounds' in gimp and 'Gimp.Selection.is_empty' in gimp)
+check("GIMP rectangle selection", 'def gimp_select_rectangle' in gimp and 'image.select_rectangle(Gimp.ChannelOps.REPLACE' in gimp)
+check("GIMP ellipse selection", 'def gimp_select_ellipse' in gimp and 'image.select_ellipse(Gimp.ChannelOps.REPLACE' in gimp)
+check("GIMP select all", 'def gimp_select_all' in gimp and 'Gimp.Selection.all(image)' in gimp)
+check("GIMP deselect", 'def gimp_select_none' in gimp and 'Gimp.Selection.none(image)' in gimp)
+check("GIMP invert selection", 'def gimp_select_invert' in gimp and 'Gimp.Selection.invert(image)' in gimp)
+for command in ("GET_SELECTION_STATE", "SELECT_RECTANGLE", "SELECT_ELLIPSE", "SELECT_ALL", "SELECT_NONE", "SELECT_INVERT"):
+    check("GIMP selection dispatcher " + command, f'message_type == "{command}"' in gimp or f'"{command}"' in gimp)
+check("IPC selection state", 'def get_selection_state(' in ipc and '"GET_SELECTION_STATE"' in ipc)
+check("IPC rectangle selection", 'def select_rectangle(' in ipc and '"SELECT_RECTANGLE"' in ipc)
+check("IPC ellipse selection", 'def select_ellipse(' in ipc and '"SELECT_ELLIPSE"' in ipc)
+check("IPC select all", 'def select_all(' in ipc and '"SELECT_ALL"' in ipc)
+check("IPC deselect", 'def select_none(' in ipc and '"SELECT_NONE"' in ipc)
+check("IPC invert", 'def select_invert(' in ipc and '"SELECT_INVERT"' in ipc)
+check("Blender selection action operator", 'bl_idname = "blendgimp.selection_action"' in tex)
+check("Blender drag selection operator", 'bl_idname = "blendgimp.selection_drag"' in tex)
+check("Rectangle and Ellipse buttons", 'text="Rectangle"' in tex and 'text="Ellipse"' in tex)
+check("All Deselect Invert buttons", 'text="All"' in tex and 'text="Deselect"' in tex and 'text="Invert"' in tex)
+check("selection overlay draw handler", 'SpaceImageEditor.draw_handler_add' in tex and '_draw_selection_overlay' in tex)
+check("selection overlay scene toggle", 'blendgimp_selection_overlay' in tex and 'text="Selection Overlay"' in tex)
+check("selection drag pauses auto paint routing", 'blendgimp_selection_interaction_active' in tex and '_ensure_auto_pointer_routing' in tex)
+check("selection drag uses Image Editor coordinates", 'region.view2d.region_to_view' in tex and 'blendgimp_selection_drag_x1' in tex)
+check("selection state is image-specific", 'blendgimp_selection_image_id' in tex and 'Selection state is GIMP-image-specific' in tex)
+check("selection bounds are shown in UI", 'text=f"Bounds: {x1}, {y1}  to  {x2}, {y2}"' in tex)
+
+# 0.5.9 color-tag UI visibility + selection responsiveness regression
+check("color-tag stack badge", 'display_name = name if color_tag == "NONE" else f"{name} [{color_label}]"' in main)
+check("color-tag stack uses visible display name", '+ display_name' in layer_draw)
+check("color-tag round-trip still refreshes layer snapshot", 'refresh_layer_result(scene, self.image_id)' in main and 'Layer ID {self.layer_id} color tag={actual}' in main)
+check("custom Color Tag previews registered", '_register_color_tag_previews()' in main and 'bpy_previews.new()' in main)
+for _tag_file in ("tag_blue.png", "tag_green.png", "tag_yellow.png", "tag_orange.png", "tag_brown.png", "tag_red.png", "tag_violet.png", "tag_gray.png"):
+    check("Color Tag icon asset " + _tag_file, (ROOT / "ui" / "icons" / "color_tags" / _tag_file).is_file())
+check("custom Color Tag previews unregistered", '_unregister_color_tag_previews()' in main and 'bpy_previews.remove(collection)' in main)
+check("Color Tag stack has actual swatch icon", 'tag_icon_value = blendgimp_color_tag_icon_value(color_tag)' in layer_draw and 'icon_value=tag_icon_value' in layer_draw)
+check("Color Tag swatch has text fallback", 'text="" if tag_icon_value else color_label[:1]' in layer_draw)
+check("Color Tag change forces redraw", 'tag_texture_views_for_redraw(context)' in main)
+check("selection buttons visibly depress", 'depress=bool(interaction_active and armed_shape == "RECTANGLE")' in tex and 'depress=bool(interaction_active and armed_shape == "ELLIPSE")' in tex)
+check("selection mode has explicit ACTIVE cue", 'Select ACTIVE - drag on canvas' in tex and 'icon="RADIOBUT_ON"' in tex)
+check("armed selection passes UI events through", 'return {"PASS_THROUGH"}' in tex and 'Armed selection mode should not make the rest of Blender' in tex)
+check("drag preview uses module memory", '_SELECTION_DRAG_PREVIEW' in tex and 'Live movement stays' in tex)
+check("drag preview limits redraw to 60Hz", '_SELECTION_PREVIEW_REDRAW_INTERVAL = 1.0 / 60.0' in tex)
+check("drag preview redraw is canvas-local", 'def _tag_selection_preview_redraw' in tex and 'region.tag_redraw()' in tex)
+check("mouse move avoids Scene RNA writes", 'if event.type == "MOUSEMOVE" and self._started:' in tex and '_SELECTION_DRAG_PREVIEW["x2"] = point[0]' in tex)
+check("selection shader is cached", '_SELECTION_SHADER' in tex and 'if _SELECTION_SHADER is None' in tex)
+check("runtime logs optimized selection mode", 'preview=local-60hz scene_rna=commit-only' in tex)
+
+# Frozen Phase 6 layers remain present
+for name, marker in [
+    ("active layer", 'bl_idname = "blendgimp.set_active_layer"'),
+    ("visibility", 'bl_idname = "blendgimp.set_layer_visibility"'),
+    ("opacity", 'bl_idname = "blendgimp.set_layer_opacity"'),
+    ("rename", 'bl_idname = "blendgimp.rename_layer"'),
+    ("duplicate", 'bl_idname = "blendgimp.duplicate_layer"'),
+    ("delete", 'bl_idname = "blendgimp.delete_layer"'),
+    ("reorder", 'bl_idname = "blendgimp.reorder_layer"'),
+    ("move", 'bl_idname = "blendgimp.move_layer"'),
+    ("group", 'bl_idname = "blendgimp.create_group"'),
+    ("merge down", 'bl_idname = "blendgimp.merge_layer_down"'),
+    ("blend mode", 'bl_idname = "blendgimp.set_layer_mode"'),
+]:
+    check("layer " + name, marker in main)
+check("layer locks", 'blendgimp.set_layer_lock' in main)
+
+# Frozen Phase 6 tools remain present
+for label, marker in [
+    ("Paintbrush", "PAINTBRUSH"),
+    ("Pencil", "PENCIL"),
+    ("Eraser", "ERASER"),
+    ("Airbrush", "AIRBRUSH"),
+    ("Fill", "FILL"),
+    ("Gradient", "GRADIENT"),
+    ("Smudge", "SMUDGE"),
+    ("Clone", "CLONE"),
+    ("Heal", "HEAL"),
+]:
+    check(label + " tool", marker in tool and marker in paint)
+check("GIMP dynamics", 'def get_dynamics(' in ipc and 'def set_dynamics(' in ipc and 'def set_dynamics_enabled(' in ipc)
+
+# Routing/input and pressure baseline remains present
+check("routing generation registry", '_ROUTING_GENERATIONS' in tex)
+check("Auto Paint preference drives router", 'blendgimp_preferences.auto_paint_enabled' in tex)
+check("Texture live tool switch", 'Texture Paint live tool switch' in paint)
+check("Object live tool switch", 'Object Paint live tool switch' in stroke)
+check("2D pressure capture", 'getattr(event, "pressure"' in paint)
+check("3D pressure capture", 'getattr(event, "pressure"' in stroke)
+
+# Frozen performance / projection architecture remains present
+check("2D async worker", 'async' in paint.lower() and 'worker' in paint.lower())
+check("bulk foreach_set", 'foreach_set' in main or 'foreach_set' in paint)
+check("Object GPU invalidation", 'gpu_invalidated' in main)
+check("Auto Sync ownership 2D", 'acquired Auto Sync refresh ownership' in paint)
+check("Auto Sync ownership 3D", 'Object Paint acquired Auto Sync refresh ownership' in stroke)
+check("stroke protocol", 'BEGIN_PAINT_STROKE' in ipc and 'END_PAINT_STROKE' in ipc)
+check("modifier-aware projection", 'projection_mesh' in stroke and 'projection_fallbacks' in stroke and 'topology_changed' in stroke)
+check("footprint protection", 'footprint_protection' in stroke and 'footprint_safe_ratio' in stroke)
+check("seam protection", 'seam_suppressed' in stroke and 'uv_splits' in stroke)
+
+# Persistence / engine lifecycle remains present
+check("Create image", 'CREATE_IMAGE' in ipc and 'bl_idname = "blendgimp.create_image"' in main)
+check("Save XCF", 'bl_idname = "blendgimp.save_image"' in main)
+check("Save As XCF", 'bl_idname = "blendgimp.save_image_as"' in main)
+check("Save All XCF", 'bl_idname = "blendgimp.save_all_images"' in main)
+check("Open XCF", 'OPEN_XCF' in ipc or 'open_xcf' in ipc.lower())
+check("dirty exit recovery", '_save_dirty_images_for_exit' in main)
+check("headless mode", 'ENGINE_MODE_HEADLESS' in mgr)
+check("visible debug fallback", 'ENGINE_MODE_VISIBLE_DEBUG' in mgr)
+check("protocol remains v1", 'PROTOCOL_VERSION = 1' in ipc)
+check("no legacy row writes", '.pixels[' not in paint and '.pixels[' not in stroke)
+
+syntax_ok = True
+for p in ROOT.rglob("*.py"):
+    if "__pycache__" in p.parts:
+        continue
+    try:
+        ast.parse(p.read_text(encoding="utf-8"), filename=str(p))
+    except Exception as exc:
+        syntax_ok = False
+        print("SYNTAX:", p, exc)
+check("all Python parses", syntax_ok)
+check("no cache files", not any(p.suffix == ".pyc" or p.name == "__pycache__" for p in ROOT.rglob("*")))
+
+failed = [name for name, ok in checks if not ok]
+print(f"\nRESULT: {len(checks) - len(failed)}/{len(checks)} PASS")
+if failed:
+    print("FAILED:")
+    for name in failed:
+        print(" -", name)
+    raise SystemExit(1)

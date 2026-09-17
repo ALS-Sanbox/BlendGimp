@@ -105,7 +105,7 @@ def get_direct_paint_refresh_owner():
     snapshot["owners"] = dict(_DIRECT_PAINT_REFRESH_RUNTIME.get("owners", {}))
     return snapshot
 
-BLENDGIMP_VERSION = "0.5.3"
+BLENDGIMP_VERSION = "0.5.18"
 
 SOCKET_TIMEOUT = 2.0
 EXPORT_COMPOSITE_TIMEOUT = 30.0
@@ -147,6 +147,11 @@ class BlendGimpConnection:
         SET_ACTIVE_LAYER    -> ACTIVE_LAYER_SET
         SET_LAYER_VISIBILITY -> LAYER_VISIBILITY_SET
         SET_LAYER_OPACITY   -> LAYER_OPACITY_SET
+        ADD_LAYER_MASK      -> LAYER_MASK_ADDED
+        SET_LAYER_MASK_EDIT -> LAYER_MASK_EDIT_SET
+        SET_LAYER_MASK_APPLY-> LAYER_MASK_APPLY_SET
+        SET_LAYER_MASK_SHOW -> LAYER_MASK_SHOW_SET
+        REMOVE_LAYER_MASK   -> LAYER_MASK_REMOVED
         ADD_LAYER           -> LAYER_ADDED
         DELETE_LAYER        -> LAYER_DELETED
         RENAME_LAYER        -> LAYER_RENAMED
@@ -155,6 +160,10 @@ class BlendGimpConnection:
         MOVE_LAYER          -> LAYER_MOVED
         CREATE_GROUP        -> GROUP_CREATED
         MERGE_LAYER_DOWN    -> LAYER_MERGED_DOWN
+        MERGE_VISIBLE_LAYERS -> VISIBLE_LAYERS_MERGED
+        FLATTEN_IMAGE       -> IMAGE_FLATTENED
+        DUPLICATE_GROUP     -> GROUP_DUPLICATED
+        SET_LAYER_COLOR_TAG -> LAYER_COLOR_TAG_SET
         SET_LAYER_LOCK      -> LAYER_LOCK_SET
         SET_LAYER_MODE      -> LAYER_MODE_SET
         EXPORT_COMPOSITE     -> COMPOSITE_EXPORTED
@@ -1439,6 +1448,86 @@ class BlendGimpConnection:
 
 
     # ========================================================
+    # LAYER MASKS
+    # ========================================================
+
+    def add_layer_mask(self, image_id, layer_id, mask_type="WHITE"):
+        mask_type = str(mask_type or "WHITE").upper()
+        if mask_type not in {"WHITE", "BLACK", "ALPHA", "ALPHA_TRANSFER", "SELECTION", "COPY"}:
+            raise ValueError("Unsupported layer mask type")
+        response = self.request({
+            "type": "ADD_LAYER_MASK",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "mask_type": mask_type,
+            "request_id": self._next_request_id("add-layer-mask"),
+        })
+        self._validate_write_response(response, expected_type="LAYER_MASK_ADDED")
+        return response
+
+    def set_layer_mask_edit(self, image_id, layer_id, edit_mask):
+        if not isinstance(edit_mask, bool):
+            raise TypeError("edit_mask must be a bool")
+        response = self.request({
+            "type": "SET_LAYER_MASK_EDIT",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "edit_mask": edit_mask,
+            "request_id": self._next_request_id("set-layer-mask-edit"),
+        })
+        self._validate_write_response(response, expected_type="LAYER_MASK_EDIT_SET")
+        return response
+
+    def set_layer_mask_apply(self, image_id, layer_id, apply_mask):
+        if not isinstance(apply_mask, bool):
+            raise TypeError("apply_mask must be a bool")
+        response = self.request({
+            "type": "SET_LAYER_MASK_APPLY",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "apply_mask": apply_mask,
+            "request_id": self._next_request_id("set-layer-mask-apply"),
+        })
+        self._validate_write_response(response, expected_type="LAYER_MASK_APPLY_SET")
+        return response
+
+    def set_layer_mask_show(self, image_id, layer_id, show_mask):
+        if not isinstance(show_mask, bool):
+            raise TypeError("show_mask must be a bool")
+        response = self.request({
+            "type": "SET_LAYER_MASK_SHOW",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "show_mask": show_mask,
+            "request_id": self._next_request_id("set-layer-mask-show"),
+        })
+        self._validate_write_response(response, expected_type="LAYER_MASK_SHOW_SET")
+        return response
+
+    def remove_layer_mask(self, image_id, layer_id, apply=False):
+        if not isinstance(apply, bool):
+            raise TypeError("apply must be a bool")
+        response = self.request({
+            "type": "REMOVE_LAYER_MASK",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "apply": apply,
+            "request_id": self._next_request_id("remove-layer-mask"),
+        })
+        self._validate_write_response(response, expected_type="LAYER_MASK_REMOVED")
+        return response
+
+    # ========================================================
     # ADD LAYER
     # ========================================================
 
@@ -1710,6 +1799,209 @@ class BlendGimpConnection:
         return response
 
     # ========================================================
+    # MERGE VISIBLE / FLATTEN / GROUP DUPLICATE / COLOR TAG
+    # ========================================================
+
+    def merge_visible_layers(self, image_id):
+        response = self.request({
+            "type": "MERGE_VISIBLE_LAYERS",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "request_id": self._next_request_id("merge-visible-layers"),
+        })
+        self._validate_write_response(response, expected_type="VISIBLE_LAYERS_MERGED")
+        return response
+
+    def flatten_image(self, image_id):
+        response = self.request({
+            "type": "FLATTEN_IMAGE",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "request_id": self._next_request_id("flatten-image"),
+        })
+        self._validate_write_response(response, expected_type="IMAGE_FLATTENED")
+        return response
+
+    def duplicate_group(self, image_id, layer_id):
+        response = self.request({
+            "type": "DUPLICATE_GROUP",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "request_id": self._next_request_id("duplicate-group"),
+        })
+        self._validate_write_response(response, expected_type="GROUP_DUPLICATED")
+        return response
+
+    def set_layer_color_tag(self, image_id, layer_id, color_tag):
+        color_tag = str(color_tag or "NONE").upper()
+        response = self.request({
+            "type": "SET_LAYER_COLOR_TAG",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "color_tag": color_tag,
+            "request_id": self._next_request_id("set-layer-color-tag"),
+        })
+        self._validate_write_response(response, expected_type="LAYER_COLOR_TAG_SET")
+        return response
+
+
+    # ========================================================
+    # PHASE 7.2 GIMP SELECTIONS
+    # ========================================================
+
+    def get_selection_state(self, image_id):
+        response = self.request({
+            "type": "GET_SELECTION_STATE",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "request_id": self._next_request_id("get-selection-state"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_STATE")
+        return response
+
+    @staticmethod
+    def _selection_operation(operation):
+        value = str(operation or "REPLACE").upper().strip()
+        if value not in {"REPLACE", "ADD", "SUBTRACT", "INTERSECT"}:
+            raise ValueError(f"Unsupported selection operation: {value}")
+        return value
+
+    def select_rectangle(self, image_id, x, y, width, height, operation="REPLACE"):
+        operation = self._selection_operation(operation)
+        response = self.request({
+            "type": "SELECT_RECTANGLE",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "x": float(x), "y": float(y),
+            "width": float(width), "height": float(height),
+            "operation": operation,
+            "request_id": self._next_request_id("select-rectangle"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_ellipse(self, image_id, x, y, width, height, operation="REPLACE"):
+        operation = self._selection_operation(operation)
+        response = self.request({
+            "type": "SELECT_ELLIPSE",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "x": float(x), "y": float(y),
+            "width": float(width), "height": float(height),
+            "operation": operation,
+            "request_id": self._next_request_id("select-ellipse"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_polygon(self, image_id, points, operation="REPLACE"):
+        operation = self._selection_operation(operation)
+        response = self.request({
+            "type": "SELECT_POLYGON",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "points": [float(v) for v in points],
+            "operation": operation,
+            "request_id": self._next_request_id("select-polygon"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_fuzzy(
+        self, image_id, layer_id, x, y, operation="REPLACE", threshold=0.15,
+        sample_merged=False, sample_transparent=True,
+    ):
+        operation = self._selection_operation(operation)
+        response = self.request({
+            "type": "SELECT_FUZZY",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "x": float(x), "y": float(y),
+            "operation": operation,
+            "threshold": float(threshold),
+            "sample_merged": bool(sample_merged),
+            "sample_transparent": bool(sample_transparent),
+            "request_id": self._next_request_id("select-fuzzy"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_by_color(
+        self, image_id, layer_id, x, y, operation="REPLACE", threshold=0.15,
+        sample_merged=False, sample_transparent=True,
+    ):
+        operation = self._selection_operation(operation)
+        response = self.request({
+            "type": "SELECT_BY_COLOR",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "layer_id": int(layer_id),
+            "x": float(x), "y": float(y),
+            "operation": operation,
+            "threshold": float(threshold),
+            "sample_merged": bool(sample_merged),
+            "sample_transparent": bool(sample_transparent),
+            "request_id": self._next_request_id("select-by-color"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def modify_selection(self, image_id, action, radius=1.0):
+        action = str(action or "").upper().strip()
+        if action not in {"GROW", "SHRINK", "FEATHER", "BORDER"}:
+            raise ValueError(f"Unsupported selection modifier: {action}")
+        response = self.request({
+            "type": f"SELECT_{action}",
+            "component": "blender",
+            "protocol": PROTOCOL_VERSION,
+            "image_id": int(image_id),
+            "radius": float(radius),
+            "request_id": self._next_request_id(f"select-{action.lower()}"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_all(self, image_id):
+        response = self.request({
+            "type": "SELECT_ALL", "component": "blender",
+            "protocol": PROTOCOL_VERSION, "image_id": int(image_id),
+            "request_id": self._next_request_id("select-all"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_none(self, image_id):
+        response = self.request({
+            "type": "SELECT_NONE", "component": "blender",
+            "protocol": PROTOCOL_VERSION, "image_id": int(image_id),
+            "request_id": self._next_request_id("select-none"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    def select_invert(self, image_id):
+        response = self.request({
+            "type": "SELECT_INVERT", "component": "blender",
+            "protocol": PROTOCOL_VERSION, "image_id": int(image_id),
+            "request_id": self._next_request_id("select-invert"),
+        })
+        self._validate_write_response(response, expected_type="SELECTION_CHANGED")
+        return response
+
+    # ========================================================
     # SET LAYER LOCK
     # ========================================================
 
@@ -1728,10 +2020,11 @@ class BlendGimpConnection:
         if lock_type not in {
             "CONTENT",
             "POSITION",
+            "VISIBILITY",
             "ALPHA"
         }:
             raise ValueError(
-                "lock_type must be CONTENT, POSITION, or ALPHA"
+                "lock_type must be CONTENT, POSITION, VISIBILITY, or ALPHA"
             )
 
         if not isinstance(
@@ -1949,6 +2242,27 @@ class BlendGimpConnection:
             timeout=5.0,
         )
         self._validate_write_response(response, expected_type="BRUSH_STATE_SET")
+        return response
+
+    def get_brush_preview(self, max_size=256):
+        response = self.request(
+            {
+                "type": "GET_BRUSH_PREVIEW",
+                "component": "blender",
+                "protocol": PROTOCOL_VERSION,
+                "max_size": max(32, min(512, int(max_size or 256))),
+                "request_id": self._next_request_id("get-brush-preview"),
+            },
+            timeout=5.0,
+        )
+        if response.get("type") == "ERROR":
+            raise RuntimeError(response.get("error", "GIMP returned an error"))
+        if response.get("type") != "BRUSH_PREVIEW":
+            raise RuntimeError(
+                f"Unexpected GET_BRUSH_PREVIEW response: {response.get('type')}"
+            )
+        if not response.get("ok", False):
+            raise RuntimeError(response.get("error", "GET_BRUSH_PREVIEW failed"))
         return response
 
     def get_brush_state(

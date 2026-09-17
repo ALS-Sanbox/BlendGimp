@@ -1,8 +1,9 @@
-"""BlendGimp Phase 6.3.5A — unified Blender/GIMP paint sync + shared GIMP paint tools for Texture/Object Paint.
+"""BlendGimp shared GIMP paint tools for Texture/Object Paint.
 
-This module adds the first real artist-facing GIMP tools to the Phase 6.1
-BlendGimp Area. Raster edits still happen in the persistent GIMP process; the
-Image Editor only captures pointer coordinates and displays synchronized pixels.
+Raster edits remain authoritative in the persistent GIMP process. The Image
+Editor captures pointer input, shows an immediate non-authoritative GPU brush
+preview/cursor, and progressively replaces that preview with synchronized GIMP
+pixels as they arrive.
 """
 
 import base64
@@ -33,7 +34,7 @@ from . import main_panel
 from . import texture_editor
 from . import preferences as blendgimp_preferences
 
-BUILD_ID = "7.0-image-material-ui"
+BUILD_ID = "7.2-real-brush-preview-hotkeys"
 
 
 LIVE_REFRESH_INTERVAL = 0.125  # Throttled authoritative GIMP updates while LMB is down.
@@ -52,6 +53,11 @@ _BRUSH_SYNC_SCENE_NAME = ""
 _BRUSH_SYNC_DUE_AT = 0.0
 _SYNCED_BRUSH_PAYLOADS = {}
 BRUSH_SYNC_DEBOUNCE = 0.075
+TEXTURE_PREVIEW_MAX_DABS = 1024
+TEXTURE_PREVIEW_DAB_SEGMENTS = 14
+TEXTURE_CURSOR_SEGMENTS = 64
+BRUSH_PREVIEW_MAX_SIZE = 256
+_BRUSH_PREVIEW_CACHE = {}
 
 
 def _tablet_input_from_event(event):
@@ -170,6 +176,10 @@ def _set_scene_from_gimp(scene, state):
             f"{scene.blendgimp_brush_size:.1f}px • "
             f"{scene.blendgimp_brush_opacity:.0f}%"
         )
+        # Brush masks are cached by resource name, so normal size/opacity
+        # updates remain cheap while a newly selected brush fetches its real
+        # GIMP silhouette exactly once.
+        _refresh_active_brush_preview(scene, force=False)
         _remember_synced_brush_state(scene)
     finally:
         _STATE_SYNCING = False
@@ -237,8 +247,109 @@ def _flush_pending_brush_sync():
     return None
 
 
+def _tag_texture_preview_redraw():
+    """Redraw Image Editor windows so cursor size/color changes are immediate."""
+    try:
+        wm = bpy.context.window_manager
+        for window in getattr(wm, "windows", ()):
+            screen = getattr(window, "screen", None)
+            if screen is None:
+                continue
+            for area in getattr(screen, "areas", ()):
+                if getattr(area, "type", "") == "IMAGE_EDITOR":
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _refresh_active_brush_preview(scene, force=False):
+    """Cache the active GIMP brush mask for non-authoritative GPU feedback."""
+    if scene is None or not connection_manager.is_connected():
+        return None
+    name = str(getattr(scene, "blendgimp_brush_name", "") or "").strip()
+    if not name:
+        return None
+    cached = _BRUSH_PREVIEW_CACHE.get(name)
+    if cached is not None and not force:
+        return cached
+    try:
+        response = connection_manager.get_brush_preview(BRUSH_PREVIEW_MAX_SIZE)
+        returned_name = str(response.get("brush_name", "") or name)
+        width = max(1, int(response.get("preview_width", 0) or 0))
+        height = max(1, int(response.get("preview_height", 0) or 0))
+        mask = base64.b64decode(str(response.get("mask_b64", "") or ""), validate=True)
+        if len(mask) != width * height:
+            raise RuntimeError(
+                f"Unexpected brush preview mask size: {len(mask)} for {width}x{height}"
+            )
+        rgba = bytearray(width * height * 4)
+        for index, alpha in enumerate(mask):
+            offset = index * 4
+            rgba[offset] = 255
+            rgba[offset + 1] = 255
+            rgba[offset + 2] = 255
+            rgba[offset + 3] = int(alpha)
+        entry = {
+            "brush_name": returned_name,
+            "brush_id": str(response.get("brush_id", "") or ""),
+            "width": width,
+            "height": height,
+            "native_width": int(response.get("native_width", 0) or 0),
+            "native_height": int(response.get("native_height", 0) or 0),
+            "color_bpp": int(response.get("color_bpp", 0) or 0),
+            "mask_sha256": str(response.get("mask_sha256", "") or ""),
+            "rgba": bytes(rgba),
+            "texture": None,
+        }
+        _BRUSH_PREVIEW_CACHE[returned_name] = entry
+        if returned_name != name:
+            _BRUSH_PREVIEW_CACHE[name] = entry
+        _tag_texture_preview_redraw()
+        print(
+            "BLENDGIMP: Real GIMP brush preview cached "
+            f"brush={returned_name} mask={width}x{height} "
+            f"native={entry['native_width']}x{entry['native_height']}"
+        )
+        return entry
+    except Exception as exc:
+        print(f"BLENDGIMP: GIMP brush preview unavailable for {name}: {exc}")
+        return None
+
+
+def _active_brush_preview(scene):
+    """Return only already-cached data; draw callbacks never block on IPC."""
+    name = str(getattr(scene, "blendgimp_brush_name", "") or "").strip()
+    if not name:
+        return None
+    return _BRUSH_PREVIEW_CACHE.get(name)
+
+
+def _brush_preview_gpu_texture(entry):
+    if gpu is None or not isinstance(entry, dict):
+        return None
+    texture = entry.get("texture")
+    if texture is not None:
+        return texture
+    try:
+        width = int(entry["width"])
+        height = int(entry["height"])
+        rgba = entry["rgba"]
+        data = gpu.types.Buffer("UBYTE", len(rgba), rgba)
+        texture = gpu.types.GPUTexture((width, height), format="RGBA8", data=data)
+        entry["texture"] = texture
+        return texture
+    except Exception as exc:
+        if not entry.get("texture_error_logged", False):
+            entry["texture_error_logged"] = True
+            print(f"BLENDGIMP: GPU brush preview texture unavailable: {exc}")
+        return None
+
+
 def _brush_property_update(_self, context):
     global _BRUSH_SYNC_SCENE_NAME, _BRUSH_SYNC_DUE_AT
+    # The cursor is local GPU feedback and should resize/recolor immediately,
+    # even while GIMP is disconnected or while an inbound state sync is active.
+    _tag_texture_preview_redraw()
     if _STATE_SYNCING or context is None or getattr(context, "scene", None) is None:
         return
     if not connection_manager.is_connected():
@@ -539,6 +650,7 @@ class BLENDGIMP_OT_refresh_brush_state(bpy.types.Operator):
         try:
             state = connection_manager.get_brush_state()
             _set_scene_from_gimp(context.scene, state)
+            _refresh_active_brush_preview(context.scene, force=True)
             names = _refresh_brush_cache(context.scene)
             dynamics = _refresh_dynamics_cache(context.scene)
             self.report({"INFO"}, f"Loaded {len(names)} GIMP brushes and {len(dynamics)} dynamics")
@@ -1053,6 +1165,255 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         except Exception:
             return None
 
+    def _cursor_has_brush_footprint(self):
+        return str(getattr(self, "_active_tool", "PAINTBRUSH")) in {
+            "PAINTBRUSH", "PENCIL", "ERASER", "AIRBRUSH", "SMUDGE", "CLONE", "HEAL"
+        }
+
+    def _brush_screen_radii(self, center=None, brush_size=None):
+        """Convert GIMP brush diameter in image pixels to Image Editor pixels."""
+        region = getattr(self, "_window_region", None)
+        if region is None:
+            return (1.0, 1.0)
+        scene = getattr(bpy.context, "scene", None)
+        try:
+            diameter = float(
+                brush_size if brush_size is not None
+                else getattr(scene, "blendgimp_brush_size", 1.0)
+            )
+        except Exception:
+            diameter = 1.0
+        diameter = max(1.0, diameter)
+        try:
+            if center is None:
+                cx = float(region.width) * 0.5
+                cy = float(region.height) * 0.5
+            else:
+                cx, cy = float(center[0]), float(center[1])
+            u, v = region.view2d.region_to_view(cx, cy)
+            du = (diameter * 0.5) / max(1.0, float(self._width - 1))
+            dv = (diameter * 0.5) / max(1.0, float(self._height - 1))
+            rcx, rcy = region.view2d.view_to_region(u, v, clip=False)
+            rx, _ = region.view2d.view_to_region(u + du, v, clip=False)
+            _, ry = region.view2d.view_to_region(u, v + dv, clip=False)
+            return (
+                max(0.75, abs(float(rx) - float(rcx))),
+                max(0.75, abs(float(ry) - float(rcy))),
+            )
+        except Exception:
+            # Keep the overlay usable even if View2D is transiently invalid.
+            return (max(0.75, diameter * 0.5), max(0.75, diameter * 0.5))
+
+    @staticmethod
+    def _ellipse_polyline(center, rx, ry, segments=64):
+        cx, cy = float(center[0]), float(center[1])
+        segments = max(12, int(segments))
+        points = []
+        for index in range(segments + 1):
+            angle = (math.tau * index) / segments
+            points.append((cx + math.cos(angle) * rx, cy + math.sin(angle) * ry, 0.0))
+        return points
+
+    def _stroke_preview_samples(self, points, pressures, rx, ry):
+        """Interpolate GIMP-spacing-aware screen dabs for the local preview."""
+        if not points:
+            return []
+        pressures = list(pressures or ())
+        if len(pressures) < len(points):
+            pressures.extend([1.0] * (len(points) - len(pressures)))
+        scene = getattr(bpy.context, "scene", None)
+        try:
+            spacing_fraction = max(0.01, min(2.0, float(scene.blendgimp_brush_spacing_percent) / 100.0))
+        except Exception:
+            spacing_fraction = 0.10
+        diameter_screen = max(1.5, max(float(rx), float(ry)) * 2.0)
+        spacing = max(0.75, min(96.0, diameter_screen * spacing_fraction))
+
+        samples = []
+        previous_input = None
+        for index, point in enumerate(points):
+            px, py = float(point[0]), float(point[1])
+            pressure = max(0.05, min(1.0, float(pressures[index])))
+            if previous_input is None:
+                samples.append((px, py, pressure))
+                previous_input = (px, py, pressure)
+                continue
+            x0, y0, p0 = previous_input
+            distance = math.hypot(px - x0, py - y0)
+            steps = max(1, int(math.ceil(distance / spacing)))
+            for step in range(1, steps + 1):
+                t = step / steps
+                samples.append((
+                    x0 + (px - x0) * t,
+                    y0 + (py - y0) * t,
+                    p0 + (pressure - p0) * t,
+                ))
+                if len(samples) >= TEXTURE_PREVIEW_MAX_DABS:
+                    return samples[-TEXTURE_PREVIEW_MAX_DABS:]
+            previous_input = (px, py, pressure)
+        return samples[-TEXTURE_PREVIEW_MAX_DABS:]
+
+    def _brush_mask_radii(self, rx, ry, entry):
+        """Fit the cached native brush-mask aspect inside the GIMP size diameter."""
+        if not isinstance(entry, dict):
+            return (float(rx), float(ry))
+        width = max(1.0, float(entry.get("width", 1)))
+        height = max(1.0, float(entry.get("height", 1)))
+        if width >= height:
+            return (float(rx), max(0.75, float(ry) * (height / width)))
+        return (max(0.75, float(rx) * (width / height)), float(ry))
+
+    @staticmethod
+    def _rotated_stamp_geometry(cx, cy, rx, ry, pressure, angle_degrees):
+        rx = max(0.75, float(rx) * max(0.05, float(pressure)))
+        ry = max(0.75, float(ry) * max(0.05, float(pressure)))
+        # GIMP image Y runs downward while Blender POST_PIXEL Y runs upward.
+        # Negating the angle preserves the visual brush rotation.
+        angle = math.radians(-float(angle_degrees))
+        ca = math.cos(angle)
+        sa = math.sin(angle)
+
+        def point(dx, dy):
+            return (
+                float(cx) + dx * ca - dy * sa,
+                float(cy) + dx * sa + dy * ca,
+                0.0,
+            )
+
+        bl = point(-rx, -ry)
+        br = point(rx, -ry)
+        tr = point(rx, ry)
+        tl = point(-rx, ry)
+        # GIMP's byte rows are top-down. Reverse V so the cached stamp is not
+        # vertically mirrored by GPU texture coordinates.
+        return (
+            (bl, (0.0, 1.0)), (br, (1.0, 1.0)), (tr, (1.0, 0.0)),
+            (bl, (0.0, 1.0)), (tr, (1.0, 0.0)), (tl, (0.0, 0.0)),
+        )
+
+    def _draw_real_brush_dabs(self, points, pressures, rx, ry, color):
+        scene = getattr(bpy.context, "scene", None)
+        entry = _active_brush_preview(scene) if scene is not None else None
+        texture = _brush_preview_gpu_texture(entry)
+        if texture is None:
+            return False
+        mask_rx, mask_ry = self._brush_mask_radii(rx, ry, entry)
+        samples = self._stroke_preview_samples(points, pressures, mask_rx, mask_ry)
+        if not samples:
+            return False
+        try:
+            angle = float(getattr(scene, "blendgimp_brush_angle", 0.0))
+        except Exception:
+            angle = 0.0
+        vertices = []
+        texcoords = []
+        for cx, cy, pressure in samples:
+            for position, uv in self._rotated_stamp_geometry(
+                cx, cy, mask_rx, mask_ry, pressure, angle
+            ):
+                vertices.append(position)
+                texcoords.append(uv)
+        shader = gpu.shader.from_builtin("IMAGE_COLOR")
+        batch = batch_for_shader(
+            shader, "TRIS", {"pos": vertices, "texCoord": texcoords}
+        )
+        shader.bind()
+        shader.uniform_sampler("image", texture)
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+        return True
+
+    def _stroke_preview_vertices(self, points, pressures, rx, ry):
+        """Fallback circular dabs when the GIMP brush mask is unavailable."""
+        if not points:
+            return []
+        dab_samples = self._stroke_preview_samples(points, pressures, rx, ry)
+
+        vertices = []
+        segments = TEXTURE_PREVIEW_DAB_SEGMENTS
+        for cx, cy, pressure in dab_samples[-TEXTURE_PREVIEW_MAX_DABS:]:
+            prx = max(0.75, float(rx) * pressure)
+            pry = max(0.75, float(ry) * pressure)
+            for segment in range(segments):
+                a0 = (math.tau * segment) / segments
+                a1 = (math.tau * (segment + 1)) / segments
+                vertices.extend((
+                    (cx, cy, 0.0),
+                    (cx + math.cos(a0) * prx, cy + math.sin(a0) * pry, 0.0),
+                    (cx + math.cos(a1) * prx, cy + math.sin(a1) * pry, 0.0),
+                ))
+        return vertices
+
+    def _update_cursor_preview(self, event):
+        old = getattr(self, "_cursor_preview_point", None)
+        preview = None
+        if self._event_image_point(event) is not None:
+            preview = self._event_preview_point(event)
+        if preview is not None:
+            preview = (float(preview[0]), float(preview[1]))
+        if old != preview:
+            self._cursor_preview_point = preview
+            self._preview_tag_redraw()
+
+    def _draw_brush_cursor(self, cursor_point):
+        if cursor_point is None or not self._cursor_has_brush_footprint():
+            return
+        scene = getattr(bpy.context, "scene", None)
+        region = getattr(self, "_window_region", None)
+        if scene is None or region is None:
+            return
+        try:
+            u, v = region.view2d.region_to_view(float(cursor_point[0]), float(cursor_point[1]))
+            if float(u) < 0.0 or float(u) > 1.0 or float(v) < 0.0 or float(v) > 1.0:
+                return
+        except Exception:
+            return
+        rx, ry = self._brush_screen_radii(cursor_point)
+        # Show the real cached GIMP brush silhouette inside the size ring.
+        # The ring remains as a high-contrast diameter reference.
+        try:
+            fg = list(scene.blendgimp_foreground_color)
+            alpha = max(0.18, min(0.55, float(scene.blendgimp_brush_opacity) / 100.0 * 0.48))
+            tool = str(getattr(self, "_active_tool", "PAINTBRUSH"))
+            if tool == "ERASER":
+                cursor_color = (1.0, 0.35, 0.15, alpha)
+            elif tool == "SMUDGE":
+                cursor_color = (0.70, 0.70, 0.70, alpha)
+            elif tool == "CLONE":
+                cursor_color = (0.25, 0.85, 1.0, alpha)
+            elif tool == "HEAL":
+                cursor_color = (0.25, 1.0, 0.45, alpha)
+            else:
+                cursor_color = (float(fg[0]), float(fg[1]), float(fg[2]), alpha)
+            self._draw_real_brush_dabs([cursor_point], [1.0], rx, ry, cursor_color)
+        except Exception:
+            pass
+
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        outer = self._ellipse_polyline(cursor_point, rx, ry, TEXTURE_CURSOR_SEGMENTS)
+        batch = batch_for_shader(shader, "LINE_STRIP", {"pos": outer})
+        shader.bind()
+        gpu.state.line_width_set(3.0)
+        shader.uniform_float("color", (0.0, 0.0, 0.0, 0.92))
+        batch.draw(shader)
+        gpu.state.line_width_set(1.25)
+        shader.uniform_float("color", (1.0, 1.0, 1.0, 0.98))
+        batch.draw(shader)
+
+        try:
+            hardness = max(0.0, min(1.0, float(scene.blendgimp_brush_hardness)))
+        except Exception:
+            hardness = 1.0
+        if 0.03 < hardness < 0.97:
+            inner = self._ellipse_polyline(
+                cursor_point, max(0.75, rx * hardness), max(0.75, ry * hardness),
+                TEXTURE_CURSOR_SEGMENTS,
+            )
+            inner_batch = batch_for_shader(shader, "LINE_STRIP", {"pos": inner})
+            gpu.state.line_width_set(1.0)
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.58))
+            inner_batch.draw(shader)
+
     def _draw_preview(self):
         if gpu is None or batch_for_shader is None:
             return
@@ -1067,55 +1428,63 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 pass
 
         points = list(getattr(self, "_preview_points", ()) or ())
+        pressures = list(getattr(self, "_preview_pressures", ()) or ())
+        cursor_point = getattr(self, "_cursor_preview_point", None)
         clone_marker = self._clone_source_preview_point()
         heal_marker = self._heal_source_preview_point()
         source_marker = clone_marker if clone_marker is not None else heal_marker
         marker_color = (1.0, 0.2, 1.0, 0.95) if clone_marker is not None else (0.25, 1.0, 0.45, 0.95)
-        if len(points) < 2 and source_marker is None:
+        if not points and source_marker is None and cursor_point is None:
             return
 
         try:
             gpu.state.blend_set("ALPHA")
 
-            if len(points) >= 2:
-                shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-                batch = batch_for_shader(
-                    shader,
-                    "LINE_STRIP",
-                    {"pos": [(float(x), float(y), 0.0) for x, y in points]},
-                )
+            if points:
+                color = tuple(getattr(self, "_preview_color", (1.0, 0.5, 0.0, 0.90)))
+                active_tool = str(getattr(self, "_active_tool", "PAINTBRUSH"))
 
-                color = tuple(getattr(self, "_preview_color", (1.0, 0.5, 0.0, 0.95)))
-                luminance = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
-                outline = (0.05, 0.05, 0.05, 0.95) if luminance > 0.45 else (1.0, 1.0, 1.0, 0.95)
-
-                shader.bind()
-                gpu.state.line_width_set(7.0)
-                shader.uniform_float("color", outline)
-                batch.draw(shader)
-
-                gpu.state.line_width_set(3.0)
-                shader.uniform_float("color", color)
-                batch.draw(shader)
-
-                last = points[-1]
-                point_shader = gpu.shader.from_builtin("POINT_UNIFORM_COLOR")
-                point_batch = batch_for_shader(
-                    point_shader,
-                    "POINTS",
-                    {"pos": [(float(last[0]), float(last[1]), 0.0)]},
-                )
-                point_shader.bind()
-                point_shader.uniform_float("color", color)
-                point_shader.uniform_float("size", 9.0)
-                gpu.state.program_point_size_set(True)
-                point_batch.draw(point_shader)
+                if active_tool == "GRADIENT" and len(points) >= 2:
+                    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+                    batch = batch_for_shader(
+                        shader, "LINE_STRIP",
+                        {"pos": [(float(x), float(y), 0.0) for x, y in points]},
+                    )
+                    luminance = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+                    outline = (0.05, 0.05, 0.05, 0.95) if luminance > 0.45 else (1.0, 1.0, 1.0, 0.95)
+                    shader.bind()
+                    gpu.state.line_width_set(7.0)
+                    shader.uniform_float("color", outline)
+                    batch.draw(shader)
+                    gpu.state.line_width_set(3.0)
+                    shader.uniform_float("color", color)
+                    batch.draw(shader)
+                elif self._cursor_has_brush_footprint():
+                    rx, ry = self._brush_screen_radii(points[-1])
+                    if not self._draw_real_brush_dabs(points, pressures, rx, ry, color):
+                        vertices = self._stroke_preview_vertices(points, pressures, rx, ry)
+                        if vertices:
+                            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+                            batch = batch_for_shader(shader, "TRIS", {"pos": vertices})
+                            shader.bind()
+                            shader.uniform_float("color", color)
+                            batch.draw(shader)
 
                 if not getattr(self, "_preview_draw_confirmed", False):
                     self._preview_draw_confirmed = True
+                    try:
+                        diameter = float(getattr(bpy.context.scene, "blendgimp_brush_size", 0.0))
+                    except Exception:
+                        diameter = 0.0
+                    entry = _active_brush_preview(getattr(bpy.context, "scene", None))
+                    mask_text = (
+                        f"{int(entry.get('width', 0))}x{int(entry.get('height', 0))}"
+                        if isinstance(entry, dict) else "fallback-circle"
+                    )
                     print(
-                        "BLENDGIMP: 2D live preview first frame drawn "
-                        f"points={len(points)} region={int(target_region.width) if target_region else -1}x"
+                        "BLENDGIMP: 2D live brush preview first frame drawn "
+                        f"points={len(points)} brush_px={diameter:.1f} mask={mask_text} "
+                        f"region={int(target_region.width) if target_region else -1}x"
                         f"{int(target_region.height) if target_region else -1}"
                     )
 
@@ -1123,36 +1492,26 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 mx, my = source_marker
                 marker_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
                 marker_batch = batch_for_shader(
-                    marker_shader,
-                    "LINES",
-                    {
-                        "pos": [
-                            (mx - 9.0, my, 0.0), (mx + 9.0, my, 0.0),
-                            (mx, my - 9.0, 0.0), (mx, my + 9.0, 0.0),
-                        ]
-                    },
+                    marker_shader, "LINES",
+                    {"pos": [
+                        (mx - 9.0, my, 0.0), (mx + 9.0, my, 0.0),
+                        (mx, my - 9.0, 0.0), (mx, my + 9.0, 0.0),
+                    ]},
                 )
                 marker_shader.bind()
                 gpu.state.line_width_set(3.0)
                 marker_shader.uniform_float("color", marker_color)
                 marker_batch.draw(marker_shader)
 
-                marker_point_shader = gpu.shader.from_builtin("POINT_UNIFORM_COLOR")
-                marker_point_batch = batch_for_shader(
-                    marker_point_shader,
-                    "POINTS",
-                    {"pos": [(mx, my, 0.0)]},
-                )
-                marker_point_shader.bind()
-                marker_point_shader.uniform_float("color", marker_color)
-                marker_point_shader.uniform_float("size", 7.0)
-                gpu.state.program_point_size_set(True)
-                marker_point_batch.draw(marker_point_shader)
+            # Draw the footprint last so it stays readable over both the image
+            # and the temporary stroke preview. It is always computed from the
+            # current Scene brush size, so UI size changes appear immediately.
+            self._draw_brush_cursor(cursor_point)
 
         except Exception as exc:
             if not getattr(self, "_preview_draw_error_logged", False):
                 self._preview_draw_error_logged = True
-                print(f"BLENDGIMP: 2D live preview draw failed: {exc}")
+                print(f"BLENDGIMP: 2D live brush preview draw failed: {exc}")
         finally:
             try:
                 gpu.state.line_width_set(1.0)
@@ -1175,27 +1534,42 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if point is None:
             return
         points = self._preview_points
+        pressures = self._preview_pressures
         if points and math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) < 0.5:
             return
+        pressure = max(0.05, min(1.0, float(_tablet_input_from_event(event)[0])))
         points.append(point)
+        pressures.append(pressure)
         # Keep the live overlay bounded even during very long strokes.
         if len(points) > 8192:
-            del points[: len(points) - 8192]
+            trim = len(points) - 8192
+            del points[:trim]
+            del pressures[:trim]
+        self._cursor_preview_point = point
         self._preview_tag_redraw()
 
     def _clear_preview(self):
+        changed = False
         if getattr(self, "_preview_points", None):
             self._preview_points.clear()
+            changed = True
+        if getattr(self, "_preview_pressures", None):
+            self._preview_pressures.clear()
+            changed = True
+        if changed:
             self._preview_tag_redraw()
 
     def _trim_preview_committed(self, count):
-        """Drop the oldest preview samples once real GIMP pixels are visible."""
+        """Drop oldest temporary dabs once real GIMP pixels are visible."""
         count = max(0, int(count or 0))
         points = getattr(self, "_preview_points", None)
         if not points or count <= 0:
             return 0
         removed = min(count, len(points))
         del points[:removed]
+        pressures = getattr(self, "_preview_pressures", None)
+        if pressures:
+            del pressures[:removed]
         self._preview_tag_redraw()
         return removed
 
@@ -1770,6 +2144,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         self._gradient_start_image = (float(point[0]), float(point[1]))
         self._gradient_start_preview = (float(preview[0]), float(preview[1]))
         self._preview_points[:] = [self._gradient_start_preview, self._gradient_start_preview]
+        self._preview_pressures[:] = [1.0, 1.0]
         self._preview_color = tuple(list(context.scene.blendgimp_foreground_color[:3]) + [0.95])
         self._preview_tag_redraw()
         self._set_status(context, "Gradient drag active — release LMB to apply in GIMP")
@@ -1783,6 +2158,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if current is None:
             return False
         self._preview_points[:] = [start, (float(current[0]), float(current[1]))]
+        self._preview_pressures[:] = [1.0, 1.0]
+        self._cursor_preview_point = (float(current[0]), float(current[1]))
         self._preview_tag_redraw()
         return True
 
@@ -1964,8 +2341,9 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         self._pressure_application = "metadata-only"
         self._pressure_subsegments = 0
         self._preview_points.clear()
+        self._preview_pressures.clear()
         fg = list(context.scene.blendgimp_foreground_color)
-        alpha = 0.90
+        alpha = max(0.05, min(0.95, float(context.scene.blendgimp_brush_opacity) / 100.0 * float(fg[3]) * 0.95))
         if tool == "ERASER":
             self._preview_color = (1.0, 0.35, 0.15, alpha)
         elif tool == "SMUDGE":
@@ -2088,6 +2466,8 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         self._last_refresh_request = 0.0
         self._stroke_sample_count = 0
         self._preview_points = []
+        self._preview_pressures = []
+        self._cursor_preview_point = None
         self._preview_color = (1.0, 0.5, 0.0, 0.9)
         self._preview_handler = None
         self._preview_draw_error_logged = False
@@ -2254,6 +2634,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
             return {"PASS_THROUGH"}
 
         if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+            self._update_cursor_preview(event)
             try:
                 over_canvas = self._inside_window_region(event)
                 area = getattr(self, "_area", None)
@@ -2271,6 +2652,35 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                     )
             except Exception:
                 pass
+
+        if (
+            event.type in {"LEFT_BRACKET", "RIGHT_BRACKET"}
+            and event.value == "PRESS"
+            and not interaction_active
+            and self._inside_window_region(event)
+            and self._cursor_has_brush_footprint()
+        ):
+            scene = context.scene
+            step = 10.0 if bool(getattr(event, "shift", False)) else 1.0
+            current = float(getattr(scene, "blendgimp_brush_size", 1.0))
+            if event.type == "LEFT_BRACKET":
+                target = max(1.0, current - step)
+            else:
+                target = min(2000.0, current + step)
+            if abs(target - current) > 1e-6:
+                scene.blendgimp_brush_size = target
+                self._preview_tag_redraw()
+                self._set_status(
+                    context,
+                    f"Auto Texture Paint — {tool_label(self._active_tool)} • "
+                    f"Brush {target:.0f}px  ([ / ] resize; Shift = 10px)",
+                )
+                print(
+                    "BLENDGIMP: Texture Paint brush size hotkey "
+                    f"{current:.1f}->{target:.1f}px key={event.type} "
+                    f"step={step:.0f}"
+                )
+            return {"RUNNING_MODAL"}
 
         if event.type == "TIMER":
             error = self._drain_worker_results(context)
@@ -2292,6 +2702,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
         if event.type == "LEFTMOUSE":
             active_tool = self._active_tool
             if event.value == "PRESS":
+                self._update_cursor_preview(event)
                 point = self._event_image_point(event)
                 if point is None:
                     return {"PASS_THROUGH"}
@@ -2324,6 +2735,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                 return {"RUNNING_MODAL"}
 
             if event.value == "RELEASE" and self._painting:
+                self._update_cursor_preview(event)
                 point = self._event_image_point(event)
                 if point is not None:
                     self._queue_point(point, event=event)
@@ -2337,7 +2749,7 @@ class BLENDGIMP_OT_gimp_2d_paint(bpy.types.Operator):
                         self._schedule_end_if_ready()
                 return {"RUNNING_MODAL"}
 
-        if event.type == "MOUSEMOVE":
+        if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
             if self._active_tool == "GRADIENT" and getattr(self, "_gradient_start_image", None) is not None:
                 self._update_gradient_preview(event)
                 return {"RUNNING_MODAL"}
@@ -2451,10 +2863,6 @@ def _draw_layer_controls(layout, context):
     if image_id >= 0:
         op = header.operator("blendgimp.get_image_layers", text="", icon="FILE_REFRESH")
         op.image_id = image_id
-        add = header.operator("blendgimp.add_layer", text="", icon="ADD")
-        add.image_id = image_id
-        group = header.operator("blendgimp.create_group", text="", icon="NEWFOLDER")
-        group.image_id = image_id
 
     if not expanded:
         return
@@ -2566,6 +2974,7 @@ def _draw_brush_controls(box, context):
         row.operator("blendgimp.refresh_brush_state", text="", icon="FILE_REFRESH")
 
         brush_box.prop(scene, "blendgimp_brush_size", text="Size")
+        brush_box.label(text="[ / ] resize under cursor • Shift = 10 px")
         brush_box.prop(scene, "blendgimp_brush_opacity", text="Opacity", slider=True)
         brush_box.prop(scene, "blendgimp_brush_hardness", text="Hardness", slider=True)
         brush_box.prop(scene, "blendgimp_brush_spacing_percent", text="Spacing %")
@@ -2589,6 +2998,7 @@ def _draw_brush_controls(box, context):
         color_box.label(text="Colors", icon="COLORSET_03_VEC")
         colors = color_box.row(align=True)
         colors.prop(scene, "blendgimp_foreground_color", text="FG")
+        colors.operator("blendgimp.swap_fg_bg", text="", icon="ARROW_LEFTRIGHT")
         colors.prop(scene, "blendgimp_background_color", text="BG")
         if tool in {"FILL", "GRADIENT"}:
             color_box.prop(scene, "blendgimp_brush_opacity", text="Opacity", slider=True)
@@ -2605,6 +3015,57 @@ def _draw_brush_controls(box, context):
         row.menu("BLENDGIMP_MT_dynamics", text="", icon="DOWNARROW_HLT")
         row.operator("blendgimp.refresh_dynamics", text="", icon="FILE_REFRESH")
         dynamics_box.prop(scene, "blendgimp_brush_dynamics_enabled", text="Enable Dynamics")
+
+
+class BLENDGIMP_OT_swap_fg_bg(bpy.types.Operator):
+    bl_idname = "blendgimp.swap_fg_bg"
+    bl_label = "Swap FG / BG"
+    bl_description = "Swap the shared GIMP foreground and background colors"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        return (
+            scene is not None
+            and hasattr(scene, "blendgimp_foreground_color")
+            and hasattr(scene, "blendgimp_background_color")
+        )
+
+    def execute(self, context):
+        global _STATE_SYNCING, _BRUSH_SYNC_SCENE_NAME, _BRUSH_SYNC_DUE_AT
+        scene = context.scene
+        fg = tuple(float(v) for v in scene.blendgimp_foreground_color)
+        bg = tuple(float(v) for v in scene.blendgimp_background_color)
+
+        # Treat the swap as one state change. This avoids publishing a transient
+        # half-swapped FG/BG pair through the normal property debounce.
+        _STATE_SYNCING = True
+        try:
+            scene.blendgimp_foreground_color = bg
+            scene.blendgimp_background_color = fg
+        finally:
+            _STATE_SYNCING = False
+
+        _BRUSH_SYNC_SCENE_NAME = ""
+        _BRUSH_SYNC_DUE_AT = 0.0
+        if bpy.app.timers.is_registered(_flush_pending_brush_sync):
+            try:
+                bpy.app.timers.unregister(_flush_pending_brush_sync)
+            except Exception:
+                pass
+
+        if connection_manager.is_connected():
+            if _push_scene_brush_state(scene, quiet=False, force=True):
+                self.report({"INFO"}, "Foreground / Background colors swapped")
+            else:
+                self.report({"WARNING"}, "Colors swapped locally; GIMP color sync failed")
+        else:
+            scene.blendgimp_brush_status = "FG / BG swapped - GIMP not connected"
+            self.report({"INFO"}, "Foreground / Background colors swapped locally")
+
+        print("BLENDGIMP: Foreground / Background colors swapped")
+        return {"FINISHED"}
 
 
 def _draw_projection_controls(layout, context):
@@ -2723,6 +3184,7 @@ classes = (
     BLENDGIMP_OT_choose_brush,
     BLENDGIMP_MT_brushes,
     BLENDGIMP_OT_set_paint_tool,
+    BLENDGIMP_OT_swap_fg_bg,
     BLENDGIMP_OT_clear_clone_source,
     BLENDGIMP_OT_clear_heal_source,
     BLENDGIMP_OT_gimp_2d_paint,
@@ -2981,11 +3443,12 @@ def register():
         name="Show Surface Projection",
         default=False,
     )
-    print(f"BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability registered — build {BUILD_ID}")
+    print(f"BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys registered — build {BUILD_ID}")
 
 
 def unregister():
     global _BRUSH_SYNC_SCENE_NAME, _BRUSH_SYNC_DUE_AT
+    _BRUSH_PREVIEW_CACHE.clear()
     if bpy.app.timers.is_registered(_flush_pending_brush_sync):
         try:
             bpy.app.timers.unregister(_flush_pending_brush_sync)
@@ -3046,4 +3509,4 @@ def unregister():
         except RuntimeError:
             pass
 
-    print(f"BLENDGIMP: BlendGimp 0.5.3 — Phase 7.0 Usability unregistered — build {BUILD_ID}")
+    print(f"BLENDGIMP: BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys unregistered — build {BUILD_ID}")

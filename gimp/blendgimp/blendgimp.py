@@ -12,6 +12,7 @@ import tempfile
 import uuid
 import hashlib
 import base64
+import math
 
 import gi
 gi.require_version("Gimp", "3.0")
@@ -27,7 +28,7 @@ PLUGIN_PROC = "extension-blendgimp"
 HOST = "127.0.0.1"
 PORT = 8765
 PROTOCOL_VERSION = 1
-BLENDGIMP_VERSION = "0.5.3"
+BLENDGIMP_VERSION = "0.5.18"
 
 # One generated token per open GIMP image ID for the lifetime of this
 # persistent BlendGimp plug-in session. This keeps refresh paths stable while
@@ -443,6 +444,25 @@ def _gimp_layer_mode_name(mode):
     return f"UNKNOWN_{mode_value}"
 
 
+BLENDGIMP_COLOR_TAG_NAMES = [
+    "NONE", "BLUE", "GREEN", "YELLOW", "ORANGE",
+    "BROWN", "RED", "VIOLET", "GRAY",
+]
+
+
+def _gimp_color_tag_name(color_tag):
+    """Return a stable JSON-safe GIMP color-tag name."""
+    try:
+        value = int(color_tag)
+    except Exception:
+        return "NONE"
+    for name in BLENDGIMP_COLOR_TAG_NAMES:
+        enum_value = getattr(Gimp.ColorTag, name, None)
+        if enum_value is not None and int(enum_value) == value:
+            return name
+    return "NONE"
+
+
 def _gimp_layer_snapshot(layer, selected_ids):
     """
     MAIN THREAD ONLY.
@@ -492,6 +512,17 @@ def _gimp_layer_snapshot(layer, selected_ids):
                 )
             )
 
+    mask = None
+    if not is_group:
+        try:
+            mask = layer.get_mask()
+        except Exception:
+            mask = None
+
+    has_mask = bool(mask is not None and mask.is_valid())
+    mask_id = int(mask.get_id()) if has_mask else -1
+    mask_name = str(mask.get_name() or "Layer Mask") if has_mask else ""
+
     return {
         "id": layer_id,
         "name": "" if name is None else str(name),
@@ -503,7 +534,15 @@ def _gimp_layer_snapshot(layer, selected_ids):
         "position": position,
         "lock_content": bool(layer.get_lock_content()),
         "lock_position": bool(layer.get_lock_position()),
+        "lock_visibility": bool(layer.get_lock_visibility()),
         "lock_alpha": bool(layer.get_lock_alpha()),
+        "color_tag": _gimp_color_tag_name(layer.get_color_tag()),
+        "has_mask": has_mask,
+        "mask_id": mask_id,
+        "mask_name": mask_name,
+        "mask_apply": bool(layer.get_apply_mask()) if has_mask else False,
+        "mask_edit": bool(layer.get_edit_mask()) if has_mask else False,
+        "mask_show": bool(layer.get_show_mask()) if has_mask else False,
         "mode": _gimp_layer_mode_name(
             layer.get_mode()
         ),
@@ -620,6 +659,151 @@ def _gimp_resolve_image_layer(image_id, layer_id):
         )
 
     return image, layer
+
+
+def _gimp_layer_edit_drawable(layer):
+    """MAIN THREAD ONLY. Return the raster drawable currently edited for a layer.
+
+    Layer-mask edit state is authoritative in GIMP. BlendGimp continues to
+    identify the owner by layer ID, while raster operations are redirected to
+    the layer mask when GIMP reports edit-mask=True.
+    """
+    if layer is None or not layer.is_valid():
+        raise ValueError("Invalid GIMP layer")
+    if layer.is_group():
+        raise ValueError("Layer groups do not expose an editable raster drawable")
+    try:
+        if bool(layer.get_edit_mask()):
+            mask = layer.get_mask()
+            if mask is not None and mask.is_valid():
+                return mask, "MASK"
+    except Exception:
+        pass
+    return layer, "LAYER"
+
+
+BLENDGIMP_MASK_TYPES = {
+    "WHITE": Gimp.AddMaskType.WHITE,
+    "BLACK": Gimp.AddMaskType.BLACK,
+    "ALPHA": Gimp.AddMaskType.ALPHA,
+    "ALPHA_TRANSFER": Gimp.AddMaskType.ALPHA_TRANSFER,
+    "SELECTION": Gimp.AddMaskType.SELECTION,
+    "COPY": Gimp.AddMaskType.COPY,
+}
+
+
+def gimp_add_layer_mask(image_id, layer_id, mask_type="WHITE"):
+    """Create and attach a native GIMP layer mask, then enter mask-edit mode."""
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    if layer.is_group():
+        raise ValueError("Layer masks can only be added to raster layers")
+    existing = layer.get_mask()
+    if existing is not None and existing.is_valid():
+        raise ValueError(f"Layer ID {layer_id} already has a mask")
+    mask_key = str(mask_type or "WHITE").upper().strip()
+    if mask_key not in BLENDGIMP_MASK_TYPES:
+        raise ValueError(f"Unsupported layer mask type: {mask_key}")
+    mask = layer.create_mask(BLENDGIMP_MASK_TYPES[mask_key])
+    if mask is None or not mask.is_valid():
+        raise RuntimeError("GIMP could not create the layer mask")
+    if layer.add_mask(mask) is False:
+        raise RuntimeError("GIMP could not attach the layer mask")
+    if layer.set_apply_mask(True) is False:
+        raise RuntimeError("GIMP could not enable the new layer mask")
+    if layer.set_edit_mask(True) is False:
+        raise RuntimeError("GIMP could not enter layer-mask edit mode")
+    try:
+        layer.set_show_mask(False)
+    except Exception:
+        pass
+    image.set_selected_layers([layer])
+    Gimp.displays_flush()
+    return {
+        "image_id": int(image.get_id()),
+        "layer_id": int(layer.get_id()),
+        "mask_id": int(mask.get_id()),
+        "mask_type": mask_key,
+        "mask_apply": bool(layer.get_apply_mask()),
+        "mask_edit": bool(layer.get_edit_mask()),
+        "mask_show": bool(layer.get_show_mask()),
+    }
+
+
+def gimp_set_layer_mask_edit(image_id, layer_id, edit_mask):
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    if layer.is_group():
+        raise ValueError("Layer groups do not have layer masks")
+    mask = layer.get_mask()
+    if mask is None or not mask.is_valid():
+        raise ValueError(f"Layer ID {layer_id} does not have a mask")
+    if layer.set_edit_mask(bool(edit_mask)) is False:
+        raise RuntimeError("GIMP could not change layer-mask edit state")
+    image.set_selected_layers([layer])
+    Gimp.displays_flush()
+    return {
+        "image_id": int(image.get_id()),
+        "layer_id": int(layer.get_id()),
+        "mask_id": int(mask.get_id()),
+        "mask_edit": bool(layer.get_edit_mask()),
+        "target_kind": "MASK" if bool(layer.get_edit_mask()) else "LAYER",
+    }
+
+
+def gimp_set_layer_mask_apply(image_id, layer_id, apply_mask):
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    mask = layer.get_mask()
+    if mask is None or not mask.is_valid():
+        raise ValueError(f"Layer ID {layer_id} does not have a mask")
+    if layer.set_apply_mask(bool(apply_mask)) is False:
+        raise RuntimeError("GIMP could not change layer-mask enabled state")
+    Gimp.displays_flush()
+    return {
+        "image_id": int(image.get_id()),
+        "layer_id": int(layer.get_id()),
+        "mask_id": int(mask.get_id()),
+        "mask_apply": bool(layer.get_apply_mask()),
+    }
+
+
+def gimp_set_layer_mask_show(image_id, layer_id, show_mask):
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    mask = layer.get_mask()
+    if mask is None or not mask.is_valid():
+        raise ValueError(f"Layer ID {layer_id} does not have a mask")
+    if layer.set_show_mask(bool(show_mask)) is False:
+        raise RuntimeError("GIMP could not change layer-mask display state")
+    Gimp.displays_flush()
+    return {
+        "image_id": int(image.get_id()),
+        "layer_id": int(layer.get_id()),
+        "mask_id": int(mask.get_id()),
+        "mask_show": bool(layer.get_show_mask()),
+    }
+
+
+def gimp_remove_layer_mask(image_id, layer_id, apply=False):
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    mask = layer.get_mask()
+    if mask is None or not mask.is_valid():
+        raise ValueError(f"Layer ID {layer_id} does not have a mask")
+    mask_id = int(mask.get_id())
+    # Return editing to the layer before the mask object is destroyed.
+    try:
+        layer.set_edit_mask(False)
+    except Exception:
+        pass
+    mode = Gimp.MaskApplyMode.APPLY if bool(apply) else Gimp.MaskApplyMode.DISCARD
+    if layer.remove_mask(mode) is False:
+        raise RuntimeError("GIMP could not remove the layer mask")
+    image.set_selected_layers([layer])
+    Gimp.displays_flush()
+    return {
+        "image_id": int(image.get_id()),
+        "layer_id": int(layer.get_id()),
+        "mask_id": mask_id,
+        "applied": bool(apply),
+        "has_mask": False,
+    }
 
 
 def gimp_set_active_layer(image_id, layer_id):
@@ -1398,6 +1582,617 @@ def gimp_merge_layer_down(
     }
 
 
+def gimp_merge_visible_layers(image_id):
+    """Merge all visible layers into one authoritative GIMP layer."""
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    merged = image.merge_visible_layers(Gimp.MergeType.EXPAND_AS_NECESSARY)
+    if merged is None or not merged.is_valid():
+        raise RuntimeError("GIMP could not merge the visible layers")
+    image.set_selected_layers([merged])
+    Gimp.displays_flush()
+    return {
+        "image_id": image_id,
+        "layer_id": int(merged.get_id()),
+        "name": str(merged.get_name() or "Merged"),
+    }
+
+
+def gimp_flatten_image(image_id):
+    """Flatten all visible layers and discard hidden layers."""
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    flattened = image.flatten()
+    if flattened is None or not flattened.is_valid():
+        raise RuntimeError("GIMP could not flatten the image")
+    image.set_selected_layers([flattened])
+    Gimp.displays_flush()
+    return {
+        "image_id": image_id,
+        "layer_id": int(flattened.get_id()),
+        "name": str(flattened.get_name() or "Flattened"),
+    }
+
+
+def gimp_duplicate_group(image_id, layer_id):
+    """Duplicate a native GIMP group and its child hierarchy."""
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    if not layer.is_group():
+        raise ValueError(f"Layer ID {layer_id} is not a GIMP group")
+    result = gimp_duplicate_layer(image_id, layer_id)
+    duplicate = Gimp.Layer.get_by_id(int(result["layer_id"]))
+    if duplicate is None or not duplicate.is_valid() or not duplicate.is_group():
+        raise RuntimeError("GIMP group duplication did not return a valid group")
+    result["is_group"] = True
+    return result
+
+
+def gimp_set_layer_color_tag(image_id, layer_id, color_tag):
+    """Set a native GIMP item color tag on a layer or group."""
+    image, layer = _gimp_resolve_image_layer(image_id, layer_id)
+    tag_name = str(color_tag or "NONE").upper().strip()
+    if tag_name not in BLENDGIMP_COLOR_TAG_NAMES:
+        raise ValueError(f"Unsupported GIMP color tag: {tag_name}")
+    enum_value = getattr(Gimp.ColorTag, tag_name, None)
+    if enum_value is None:
+        raise ValueError(f"GIMP runtime does not expose color tag {tag_name}")
+    if layer.set_color_tag(enum_value) is False:
+        raise RuntimeError(f"GIMP could not set color tag for layer ID {layer_id}")
+    Gimp.displays_flush()
+    return {
+        "image_id": int(image.get_id()),
+        "layer_id": int(layer.get_id()),
+        "color_tag": _gimp_color_tag_name(layer.get_color_tag()),
+    }
+
+
+
+def _gimp_selection_state(image):
+    """Return a compact snapshot of the authoritative GIMP selection."""
+    image_id = int(image.get_id())
+    width = int(image.get_width())
+    height = int(image.get_height())
+
+    try:
+        empty = bool(Gimp.Selection.is_empty(image))
+    except Exception:
+        empty = False
+
+    non_empty = not empty
+    bounds_valid = False
+    x1 = y1 = x2 = y2 = 0
+
+    if non_empty:
+        try:
+            raw = Gimp.Selection.bounds(image)
+            values = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+
+            # GI bindings may expose C's success return plus output args, or
+            # only the output args. Accept both shapes so BlendGimp remains
+            # tolerant across GIMP 3.x introspection builds.
+            if len(values) >= 6:
+                success = bool(values[0])
+                non_empty = bool(values[1])
+                x1, y1, x2, y2 = [int(v) for v in values[2:6]]
+                bounds_valid = bool(success and non_empty)
+            elif len(values) == 5:
+                non_empty = bool(values[0])
+                x1, y1, x2, y2 = [int(v) for v in values[1:5]]
+                bounds_valid = bool(non_empty)
+            elif len(values) == 4:
+                x1, y1, x2, y2 = [int(v) for v in values]
+                bounds_valid = True
+        except Exception as exc:
+            log(f"Selection bounds warning for image ID {image_id}: {exc}")
+
+    if not non_empty:
+        x1 = y1 = x2 = y2 = 0
+        bounds_valid = True
+
+    return {
+        "image_id": image_id,
+        "active": bool(non_empty),
+        "bounds_valid": bool(bounds_valid),
+        "x1": int(x1),
+        "y1": int(y1),
+        "x2": int(x2),
+        "y2": int(y2),
+        "image_width": width,
+        "image_height": height,
+    }
+
+
+def _gimp_selection_outline_points(image, state=None, max_points=14000):
+    """Return a compact dotted-outline point cloud for the current selection mask.
+
+    The selection remains authoritative in GIMP.  This function samples the
+    actual selection channel and emits boundary points only, so Blender can
+    display fuzzy/by-color/combined/morphology selections without replacing
+    their real shape with a bounding rectangle.  Sampling automatically gets
+    coarser for large/complex masks to keep the UI payload bounded.
+    """
+    state = dict(state or _gimp_selection_state(image))
+    if not bool(state.get("active", False)) or not bool(state.get("bounds_valid", False)):
+        return [], 1, False
+
+    image_width = max(1, int(state.get("image_width", image.get_width())))
+    image_height = max(1, int(state.get("image_height", image.get_height())))
+    x1 = max(0, min(int(state.get("x1", 0)), image_width))
+    y1 = max(0, min(int(state.get("y1", 0)), image_height))
+    x2 = max(x1, min(int(state.get("x2", image_width)), image_width))
+    y2 = max(y1, min(int(state.get("y2", image_height)), image_height))
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return [], 1, False
+
+    selection = image.get_selection()
+    if selection is None or not selection.is_valid():
+        return [], 1, False
+    buffer = selection.get_buffer()
+    if buffer is None:
+        return [], 1, False
+
+    rectangle = Gegl.Rectangle.new(x1, y1, width, height)
+    raw = None
+    last_exc = None
+    for pixel_format in ("Y u8", "Y' u8"):
+        try:
+            raw = _blendgimp_bytes_from_gi(
+                buffer.get(rectangle, 1.0, pixel_format, Gegl.AbyssPolicy.NONE)
+            )
+            if len(raw) == width * height:
+                break
+        except Exception as exc:
+            last_exc = exc
+            raw = None
+    if raw is None or len(raw) != width * height:
+        if last_exc is not None:
+            log(f"Selection outline warning for image ID {int(image.get_id())}: {last_exc}")
+        return [], 1, False
+
+    # Keep Python-side contour extraction cheap enough that a broad Select by
+    # Color operation cannot make the selection command appear to hang.
+    # Target roughly <=300k sampled cells regardless of texture dimensions.
+    sample_budget = 300000.0
+    base_step = max(1, int(math.ceil(math.sqrt((float(width) * float(height)) / sample_budget))))
+    max_points = max(256, int(max_points))
+
+    def build(step):
+        pts = []
+        threshold = 128
+        # Sample one cell per step and emit a point when that selected cell
+        # touches an unselected neighbor or the image boundary.  This captures
+        # disconnected islands and holes without needing ordered contours.
+        for ly in range(0, height, step):
+            gy = y1 + ly
+            row = ly * width
+            for lx in range(0, width, step):
+                idx = row + lx
+                if raw[idx] < threshold:
+                    continue
+                gx = x1 + lx
+                left_selected = (lx - step >= 0 and raw[row + (lx - step)] >= threshold)
+                right_selected = (lx + step < width and raw[row + (lx + step)] >= threshold)
+                up_selected = (ly - step >= 0 and raw[(ly - step) * width + lx] >= threshold)
+                down_selected = (ly + step < height and raw[(ly + step) * width + lx] >= threshold)
+                on_image_edge = (gx <= 0 or gy <= 0 or gx + step >= image_width or gy + step >= image_height)
+                if on_image_edge or not (left_selected and right_selected and up_selected and down_selected):
+                    pts.extend((float(gx) + 0.5 * step, float(gy) + 0.5 * step))
+                    if len(pts) // 2 > max_points:
+                        return pts, True
+        return pts, False
+
+    step = base_step
+    points, truncated = build(step)
+    # If a noisy color selection creates too many boundary points, increase the
+    # sampling stride and rescan so points remain distributed across the whole
+    # image instead of truncating only the bottom/right of the contour.
+    while truncated and step < 32:
+        step *= 2
+        points, truncated = build(step)
+    if truncated:
+        points = points[: max_points * 2]
+    return points, step, truncated
+
+
+def _gimp_attach_selection_outline(image, result):
+    """Best-effort contour metadata; never fail the underlying selection.
+
+    Selection creation/modification is authoritative in GIMP.  A contour is
+    only Blender UI metadata, so contour extraction errors or expensive masks
+    must not turn a successful Select by Color/Fuzzy operation into an IPC
+    failure.
+    """
+    try:
+        points, stride, truncated = _gimp_selection_outline_points(image, result)
+        result["outline_points"] = points
+        result["outline_stride"] = int(stride)
+        result["outline_truncated"] = bool(truncated)
+        if bool(result.get("active", False)) and points:
+            result["shape"] = "MASK"
+    except Exception as exc:
+        result["outline_points"] = []
+        result["outline_stride"] = 0
+        result["outline_truncated"] = False
+        log(f"Selection outline metadata skipped for image ID {int(image.get_id())}: {exc}")
+    return result
+
+
+def gimp_get_selection_state(image_id):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    result = _gimp_selection_state(image)
+    if bool(result.get("active", False)):
+        _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def _gimp_clamp_selection_rect(image, x, y, width, height):
+    image_width = max(1, int(image.get_width()))
+    image_height = max(1, int(image.get_height()))
+    x1 = max(0.0, min(float(x), float(image_width)))
+    y1 = max(0.0, min(float(y), float(image_height)))
+    x2 = max(0.0, min(float(x) + float(width), float(image_width)))
+    y2 = max(0.0, min(float(y) + float(height), float(image_height)))
+    left = min(x1, x2)
+    top = min(y1, y2)
+    right = max(x1, x2)
+    bottom = max(y1, y2)
+    if right - left < 1.0 or bottom - top < 1.0:
+        raise ValueError("Selection must be at least one pixel wide and high")
+    return left, top, right - left, bottom - top
+
+
+
+def _gimp_channel_op(operation):
+    """Resolve a BlendGimp selection-combine name to Gimp.ChannelOps."""
+    name = str(operation or "REPLACE").upper().strip()
+    if name not in {"REPLACE", "ADD", "SUBTRACT", "INTERSECT"}:
+        raise ValueError(f"Unsupported selection operation: {name}")
+    value = getattr(Gimp.ChannelOps, name, None)
+    if value is None:
+        raise RuntimeError(f"GIMP runtime does not expose ChannelOps.{name}")
+    return value, name
+
+
+def _gimp_selection_drawable(image_id, layer_id):
+    """Resolve a raster layer/mask usable by fuzzy and by-color selection."""
+    image, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
+    if layer.is_group():
+        raise ValueError("Color-based selection requires a raster layer, not a group")
+    drawable, target_kind = _gimp_layer_edit_drawable(layer)
+    return image, layer, drawable, target_kind
+
+
+def _gimp_selection_context(threshold, sample_merged, sample_transparent):
+    """Push and fully configure an isolated GIMP color-selection context.
+
+    GIMP's Select by Color result depends on the current sample criterion as
+    well as threshold/merged/transparent state.  Leaving the criterion at the
+    user's previous GIMP value made BlendGimp appear intermittent, so the
+    bridge now pins the same deterministic COMPOSITE criterion every time.
+    """
+    pushed = bool(Gimp.context_push())
+    if not pushed:
+        raise RuntimeError("GIMP could not isolate the selection context")
+    try:
+        Gimp.context_set_antialias(True)
+    except Exception:
+        pass
+    try:
+        Gimp.context_set_feather(False)
+    except Exception:
+        pass
+    criterion_enum = getattr(Gimp, "SelectCriterion", None)
+    composite = getattr(criterion_enum, "COMPOSITE", None) if criterion_enum is not None else None
+    if composite is not None:
+        try:
+            if Gimp.context_set_sample_criterion(composite) is False:
+                raise RuntimeError("GIMP could not set the selection sample criterion")
+        except AttributeError:
+            # Older 3.x GI builds may omit this setter; keep compatibility.
+            pass
+    if Gimp.context_set_sample_threshold(max(0.0, min(1.0, float(threshold)))) is False:
+        Gimp.context_pop()
+        raise RuntimeError("GIMP could not set the selection threshold")
+    if Gimp.context_set_sample_merged(bool(sample_merged)) is False:
+        Gimp.context_pop()
+        raise RuntimeError("GIMP could not set sample-merged selection state")
+    if Gimp.context_set_sample_transparent(bool(sample_transparent)) is False:
+        Gimp.context_pop()
+        raise RuntimeError("GIMP could not set transparent sampling state")
+    return True
+
+
+def _gimp_drawable_color_at(drawable, x, y):
+    """Read one drawable pixel as a Gegl.Color without touching GIMP state."""
+    width = int(drawable.get_width())
+    height = int(drawable.get_height())
+    ix = max(0, min(int(round(float(x))), max(0, width - 1)))
+    iy = max(0, min(int(round(float(y))), max(0, height - 1)))
+    buffer = drawable.get_buffer()
+    if buffer is None:
+        raise RuntimeError("GIMP did not return a buffer for color sampling")
+    rect = Gegl.Rectangle.new(ix, iy, 1, 1)
+    raw = _blendgimp_bytes_from_gi(
+        buffer.get(rect, 1.0, "R'G'B'A u8", Gegl.AbyssPolicy.NONE)
+    )
+    if len(raw) < 4:
+        raise RuntimeError("GIMP returned an incomplete color sample")
+    r, g, b, a = [int(v) for v in raw[:4]]
+    return Gegl.Color.new(
+        f"rgba({r / 255.0:.9f},{g / 255.0:.9f},{b / 255.0:.9f},{a / 255.0:.9f})"
+    )
+
+
+def _gimp_pick_color_native(image, drawable, x, y, sample_merged=False):
+    """Sample through GIMP's own color pipeline for Select by Color.
+
+    Using Image.pick_color() keeps the sampled Gegl.Color in the exact same
+    color-management path that Image.select_color() expects.  This avoids
+    subtle mismatches caused by reconstructing an sRGB u8 color manually from
+    the drawable buffer.
+    """
+    raw = image.pick_color(
+        [drawable], float(x), float(y), bool(sample_merged), False, 0.0
+    )
+    values = list(raw) if isinstance(raw, (tuple, list)) else [raw]
+    if values and isinstance(values[0], bool) and not values[0]:
+        raise RuntimeError("GIMP could not sample a color at that point")
+    for value in reversed(values):
+        if isinstance(value, Gegl.Color) or value.__class__.__name__.lower().endswith("color"):
+            return value
+    raise RuntimeError("GIMP pick_color did not return a color")
+
+
+def _gimp_pick_merged_color(image, drawable, x, y):
+    return _gimp_pick_color_native(image, drawable, x, y, sample_merged=True)
+
+
+def gimp_select_rectangle(image_id, x, y, width, height, operation="REPLACE"):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    channel_op, op_name = _gimp_channel_op(operation)
+    x, y, width, height = _gimp_clamp_selection_rect(image, x, y, width, height)
+    ok = image.select_rectangle(channel_op, x, y, width, height)
+    if ok is False:
+        raise RuntimeError("GIMP could not create the rectangular selection")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result["shape"] = "RECTANGLE" if op_name == "REPLACE" else "BOUNDS"
+    result["operation"] = op_name
+    if op_name != "REPLACE":
+        _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def gimp_select_ellipse(image_id, x, y, width, height, operation="REPLACE"):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    channel_op, op_name = _gimp_channel_op(operation)
+    x, y, width, height = _gimp_clamp_selection_rect(image, x, y, width, height)
+    ok = image.select_ellipse(channel_op, x, y, width, height)
+    if ok is False:
+        raise RuntimeError("GIMP could not create the elliptical selection")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result["shape"] = "ELLIPSE" if op_name == "REPLACE" else "BOUNDS"
+    result["operation"] = op_name
+    if op_name != "REPLACE":
+        _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def gimp_select_polygon(image_id, points, operation="REPLACE"):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    if not isinstance(points, (list, tuple)):
+        raise ValueError("Free Select points must be a list")
+    flat = [float(v) for v in points]
+    if len(flat) < 6 or len(flat) % 2:
+        raise ValueError("Free Select requires at least three x/y points")
+    if len(flat) > 8192:
+        raise ValueError("Free Select contains too many points")
+    channel_op, op_name = _gimp_channel_op(operation)
+    ok = image.select_polygon(channel_op, flat)
+    if ok is False:
+        raise RuntimeError("GIMP could not create the free selection")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result["shape"] = "FREE" if op_name == "REPLACE" else "BOUNDS"
+    result["operation"] = op_name
+    result["points"] = flat if op_name == "REPLACE" else []
+    if op_name != "REPLACE":
+        _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def gimp_select_fuzzy(
+    image_id,
+    layer_id,
+    x,
+    y,
+    operation="REPLACE",
+    threshold=0.15,
+    sample_merged=False,
+    sample_transparent=True,
+):
+    image, layer, drawable, target_kind = _gimp_selection_drawable(image_id, layer_id)
+    channel_op, op_name = _gimp_channel_op(operation)
+    pushed = _gimp_selection_context(threshold, sample_merged, sample_transparent)
+    try:
+        px = float(x)
+        py = float(y)
+        if not bool(sample_merged):
+            offx, offy = _blendgimp_layer_offsets(layer)
+            px -= float(offx)
+            py -= float(offy)
+        ok = image.select_contiguous_color(channel_op, drawable, px, py)
+        if ok is False:
+            raise RuntimeError("GIMP could not create the fuzzy selection")
+    finally:
+        if pushed:
+            Gimp.context_pop()
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result.update({
+        "shape": "BOUNDS",
+        "operation": op_name,
+        "target_kind": target_kind,
+        "threshold": float(threshold),
+        "sample_merged": bool(sample_merged),
+    })
+    _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def gimp_select_by_color(
+    image_id,
+    layer_id,
+    x,
+    y,
+    operation="REPLACE",
+    threshold=0.15,
+    sample_merged=False,
+    sample_transparent=True,
+):
+    image, layer, drawable, target_kind = _gimp_selection_drawable(image_id, layer_id)
+    channel_op, op_name = _gimp_channel_op(operation)
+    pushed = _gimp_selection_context(threshold, sample_merged, sample_transparent)
+    sample_source = "gimp-pick-color"
+    retry_used = False
+    try:
+        try:
+            color = _gimp_pick_color_native(
+                image, drawable, x, y, sample_merged=bool(sample_merged)
+            )
+        except Exception:
+            # GIMP intentionally rejects pick_color() on fully transparent
+            # pixels.  When transparent sampling is enabled, preserve expected
+            # Select by Color behavior with an exact drawable-buffer fallback.
+            if bool(sample_merged) or not bool(sample_transparent):
+                raise
+            offx, offy = _blendgimp_layer_offsets(layer)
+            color = _gimp_drawable_color_at(drawable, float(x) - offx, float(y) - offy)
+            sample_source = "drawable-buffer-transparent-fallback"
+        ok = image.select_color(channel_op, drawable, color)
+        if ok is False:
+            raise RuntimeError("GIMP could not create the Select by Color selection")
+
+        # If a replace operation unexpectedly produces an empty selection,
+        # retry once with the exact drawable pixel.  This is a guarded fallback
+        # for GI/color-profile edge cases and never changes combine semantics.
+        if op_name == "REPLACE":
+            probe = _gimp_selection_state(image)
+            if not bool(probe.get("active", False)) and not bool(sample_merged):
+                offx, offy = _blendgimp_layer_offsets(layer)
+                fallback = _gimp_drawable_color_at(drawable, float(x) - offx, float(y) - offy)
+                ok = image.select_color(channel_op, drawable, fallback)
+                if ok is False:
+                    raise RuntimeError("GIMP could not retry the Select by Color selection")
+                sample_source = "drawable-buffer-retry"
+                retry_used = True
+    finally:
+        if pushed:
+            Gimp.context_pop()
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result.update({
+        "shape": "BOUNDS",
+        "operation": op_name,
+        "target_kind": target_kind,
+        "threshold": float(threshold),
+        "sample_merged": bool(sample_merged),
+        "sample_source": sample_source,
+        "sample_retry": bool(retry_used),
+    })
+    _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def gimp_select_all(image_id):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    ok = Gimp.Selection.all(image)
+    if ok is False:
+        raise RuntimeError("GIMP could not select the entire image")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result["shape"] = "ALL"
+    return result
+
+
+def gimp_select_none(image_id):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    ok = Gimp.Selection.none(image)
+    if ok is False:
+        raise RuntimeError("GIMP could not clear the selection")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result["shape"] = "NONE"
+    return result
+
+
+def gimp_select_invert(image_id):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    ok = Gimp.Selection.invert(image)
+    if ok is False:
+        raise RuntimeError("GIMP could not invert the selection")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result["shape"] = "BOUNDS"
+    _gimp_attach_selection_outline(image, result)
+    return result
+
+
+def gimp_modify_selection(image_id, action, radius):
+    image_id = int(image_id)
+    image = Gimp.Image.get_by_id(image_id)
+    if image is None or not image.is_valid():
+        raise ValueError(f"Image ID {image_id} is not a valid open GIMP image")
+    if Gimp.Selection.is_empty(image):
+        raise ValueError("There is no active GIMP selection to modify")
+    action = str(action or "").upper().strip()
+    amount = max(0.0, float(radius))
+    if action == "GROW":
+        ok = Gimp.Selection.grow(image, max(1, int(round(amount))))
+    elif action == "SHRINK":
+        ok = Gimp.Selection.shrink(image, max(1, int(round(amount))))
+    elif action == "FEATHER":
+        ok = Gimp.Selection.feather(image, max(0.1, amount))
+    elif action == "BORDER":
+        ok = Gimp.Selection.border(image, max(1, int(round(amount))))
+    else:
+        raise ValueError(f"Unsupported selection modifier: {action}")
+    if ok is False:
+        raise RuntimeError(f"GIMP could not {action.lower()} the selection")
+    Gimp.displays_flush()
+    result = _gimp_selection_state(image)
+    result.update({"shape": "BOUNDS", "modifier": action, "radius": amount})
+    _gimp_attach_selection_outline(image, result)
+    return result
+
 def gimp_set_layer_lock(
     image_id,
     layer_id,
@@ -1445,6 +2240,16 @@ def gimp_set_layer_lock(
             layer.get_lock_position()
         )
 
+    elif lock_type == "VISIBILITY":
+
+        success = layer.set_lock_visibility(
+            locked
+        )
+
+        actual = bool(
+            layer.get_lock_visibility()
+        )
+
     elif lock_type == "ALPHA":
 
         success = layer.set_lock_alpha(
@@ -1458,7 +2263,7 @@ def gimp_set_layer_lock(
     else:
 
         raise ValueError(
-            "lock_type must be CONTENT, POSITION, or ALPHA"
+            "lock_type must be CONTENT, POSITION, VISIBILITY, or ALPHA"
         )
 
     if not success:
@@ -2202,6 +3007,116 @@ def gimp_get_brush_state():
     }
 
 
+def _gimp_brush_info_tuple(brush):
+    """Return best-effort native brush metadata across GI tuple variants."""
+    try:
+        result = brush.get_info()
+    except Exception:
+        return {"width": 0, "height": 0, "mask_bpp": 0, "color_bpp": 0}
+
+    values = list(result) if isinstance(result, (tuple, list)) else []
+    if values and isinstance(values[0], bool):
+        values = values[1:] if values[0] else []
+    if len(values) >= 4:
+        try:
+            return {
+                "width": int(values[0]),
+                "height": int(values[1]),
+                "mask_bpp": int(values[2]),
+                "color_bpp": int(values[3]),
+            }
+        except Exception:
+            pass
+    return {"width": 0, "height": 0, "mask_bpp": 0, "color_bpp": 0}
+
+
+def gimp_get_brush_preview(max_size=256):
+    """MAIN THREAD ONLY. Return the active GIMP brush's real alpha mask.
+
+    BlendGimp deliberately transports only a compact display mask here.  GIMP
+    remains authoritative for the real stroke.  The mask is enough for Blender
+    to show the actual star/splatter/textured silhouette immediately while the
+    authoritative GIMP pixels stream back in the background.
+    """
+    brush = Gimp.context_get_brush()
+    if brush is None:
+        raise RuntimeError("GIMP has no active brush")
+
+    try:
+        brush_name = str(brush.get_name() or "")
+    except Exception:
+        brush_name = str(brush)
+
+    max_size = max(32, min(512, int(max_size or 256)))
+    mask_buffer = brush.get_mask(max_size, max_size, None)
+    if mask_buffer is None:
+        raise RuntimeError(f"GIMP did not return a mask for brush: {brush_name}")
+
+    extent = None
+    try:
+        extent = mask_buffer.get_extent()
+    except Exception:
+        extent = None
+
+    info = _gimp_brush_info_tuple(brush)
+    if extent is not None:
+        x = int(getattr(extent, "x", 0))
+        y = int(getattr(extent, "y", 0))
+        width = int(getattr(extent, "width", 0))
+        height = int(getattr(extent, "height", 0))
+    else:
+        native_w = max(1, int(info.get("width", 1) or 1))
+        native_h = max(1, int(info.get("height", 1) or 1))
+        scale = min(1.0, float(max_size) / native_w, float(max_size) / native_h)
+        x = 0
+        y = 0
+        width = max(1, int(round(native_w * scale)))
+        height = max(1, int(round(native_h * scale)))
+
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"GIMP returned an empty mask for brush: {brush_name}")
+
+    rect = Gegl.Rectangle.new(x, y, width, height)
+    raw = None
+    last_exc = None
+    for pixel_format in ("Y u8", "Y' u8"):
+        try:
+            candidate = _blendgimp_bytes_from_gi(
+                mask_buffer.get(rect, 1.0, pixel_format, Gegl.AbyssPolicy.NONE)
+            )
+            if len(candidate) == width * height:
+                raw = candidate
+                break
+        except Exception as exc:
+            last_exc = exc
+
+    if raw is None:
+        if last_exc is not None:
+            raise RuntimeError(f"Could not read GIMP brush mask: {last_exc}")
+        raise RuntimeError(
+            f"Unexpected GIMP brush mask byte count for {brush_name}: expected {width * height}"
+        )
+
+    brush_id = ""
+    try:
+        brush_id = str(brush.get_id() or "")
+    except Exception:
+        pass
+
+    return {
+        "brush_name": brush_name,
+        "brush_id": brush_id,
+        "preview_width": width,
+        "preview_height": height,
+        "native_width": int(info.get("width", 0) or 0),
+        "native_height": int(info.get("height", 0) or 0),
+        "mask_bpp": int(info.get("mask_bpp", 0) or 0),
+        "color_bpp": int(info.get("color_bpp", 0) or 0),
+        "mask_b64": base64.b64encode(raw).decode("ascii"),
+        "mask_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def gimp_set_brush_state(state):
     """MAIN THREAD ONLY. Update any supplied fields in the shared GIMP paint context."""
 
@@ -2280,6 +3195,7 @@ def gimp_bucket_fill(
     image, layer = _gimp_resolve_image_layer(image_id, layer_id)
     if layer.is_group():
         raise ValueError("GIMP Fill requires a raster layer")
+    drawable, target_kind = _gimp_layer_edit_drawable(layer)
 
     image_width = int(image.get_width())
     image_height = int(image.get_height())
@@ -2340,7 +3256,7 @@ def gimp_bucket_fill(
         raise RuntimeError("GIMP could not start the Fill undo group")
 
     try:
-        success = layer.edit_bucket_fill(
+        success = drawable.edit_bucket_fill(
             BLENDGIMP_FILL_TYPES[fill_key],
             float(bucket_x),
             float(bucket_y),
@@ -2376,6 +3292,7 @@ def gimp_bucket_fill(
         "sample_transparent": True,
         "layer_offset_x": int(layer_offset_x),
         "layer_offset_y": int(layer_offset_y),
+        "target_kind": target_kind,
     }
 
 
@@ -2491,6 +3408,7 @@ def gimp_gradient_fill(
     image, layer = _gimp_resolve_image_layer(image_id, layer_id)
     if layer.is_group():
         raise ValueError("GIMP Gradient requires a raster layer")
+    drawable, target_kind = _gimp_layer_edit_drawable(layer)
 
     layer_offset_x, layer_offset_y = _blendgimp_layer_offsets(layer)
     drawable_x1 = x1 - float(layer_offset_x)
@@ -2522,7 +3440,7 @@ def gimp_gradient_fill(
         raise RuntimeError("GIMP could not start the Gradient undo group")
 
     try:
-        success = layer.edit_gradient_fill(
+        success = drawable.edit_gradient_fill(
             BLENDGIMP_GRADIENT_TYPES[type_key],
             0.0,
             False,
@@ -2561,6 +3479,7 @@ def gimp_gradient_fill(
         "repeat_mode": repeat_key,
         "layer_offset_x": int(layer_offset_x),
         "layer_offset_y": int(layer_offset_y),
+        "target_kind": target_kind,
     }
 
 
@@ -2679,6 +3598,8 @@ def _blendgimp_clone_segment(
 
     if layer.is_group() or source_layer.is_group():
         raise ValueError("GIMP Clone requires raster source and destination layers")
+    drawable, _target_kind = _gimp_layer_edit_drawable(layer)
+    source_drawable, _source_target_kind = _gimp_layer_edit_drawable(source_layer)
     if not isinstance(strokes, (list, tuple)) or len(strokes) < 2 or len(strokes) % 2:
         raise ValueError("Clone stroke coordinates must contain x/y pairs")
 
@@ -2708,8 +3629,8 @@ def _blendgimp_clone_segment(
         ))
 
     _call_gimp_clone_tool(
-        layer,
-        source_layer,
+        drawable,
+        source_drawable,
         adjusted_source_x,
         adjusted_source_y,
         local_coordinates,
@@ -2734,6 +3655,8 @@ def _blendgimp_heal_segment(
 
     if layer.is_group() or source_layer.is_group():
         raise ValueError("GIMP Heal requires raster source and destination layers")
+    drawable, _target_kind = _gimp_layer_edit_drawable(layer)
+    source_drawable, _source_target_kind = _gimp_layer_edit_drawable(source_layer)
     if not isinstance(strokes, (list, tuple)) or len(strokes) < 2 or len(strokes) % 2:
         raise ValueError("Heal stroke coordinates must contain x/y pairs")
 
@@ -2763,8 +3686,8 @@ def _blendgimp_heal_segment(
         ))
 
     _call_gimp_heal_tool(
-        layer,
-        source_layer,
+        drawable,
+        source_drawable,
         adjusted_source_x,
         adjusted_source_y,
         local_coordinates,
@@ -2790,6 +3713,7 @@ def gimp_paint_stroke(
 
     if layer.is_group():
         raise ValueError("Direct GIMP painting requires a raster layer")
+    drawable, target_kind = _gimp_layer_edit_drawable(layer)
 
     if not isinstance(strokes, (list, tuple)):
         raise ValueError("Stroke coordinates must be a list")
@@ -2806,7 +3730,7 @@ def gimp_paint_stroke(
     coordinates = [float(value) for value in strokes]
     if tool in {"CLONE", "HEAL"}:
         raise ValueError(f"{BLENDGIMP_PAINT_TOOL_NAMES[tool]} strokes require an explicit source and streamed source state")
-    _call_gimp_stroke_tool(tool, layer, coordinates)
+    _call_gimp_stroke_tool(tool, drawable, coordinates)
 
     if flush:
         Gimp.displays_flush()
@@ -2817,6 +3741,7 @@ def gimp_paint_stroke(
         "image_id": image_id,
         "layer_id": layer_id,
         "tool": tool,
+        "target_kind": target_kind,
         "point_count": int(len(coordinates) // 2),
         **brush_state,
     }
@@ -2846,6 +3771,7 @@ def gimp_begin_direct_paint_stroke(
 
     if layer.is_group():
         raise ValueError("Direct GIMP painting requires a raster layer")
+    _drawable, target_kind = _gimp_layer_edit_drawable(layer)
 
     if stroke_id in BLENDGIMP_ACTIVE_DIRECT_STROKES:
         raise ValueError(f"Direct paint stroke {stroke_id} is already active")
@@ -2897,6 +3823,7 @@ def gimp_begin_direct_paint_stroke(
         "image_id": image_id,
         "layer_id": layer_id,
         "tool": tool,
+        "target_kind": target_kind,
         "base_brush_size": float(base_brush_state.get("brush_size", 20.0)),
         "base_brush_opacity": float(base_brush_state.get("brush_opacity", 100.0)),
         "pressure_application": "metadata-only",
@@ -2917,6 +3844,7 @@ def gimp_begin_direct_paint_stroke(
         "image_id": image_id,
         "layer_id": layer_id,
         "tool": tool,
+        "target_kind": target_kind,
         **({
             "source_image_id": int(source_state["source_image_id"]),
             "source_layer_id": int(source_state["source_layer_id"]),
@@ -3120,11 +4048,12 @@ def _gimp_paint_pressure_segment(image_id, layer_id, coordinates, samples, tool,
         return int(result.get("point_count", 0)), "metadata-only", 0
 
     _image, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
+    drawable, _target_kind = _gimp_layer_edit_drawable(layer)
     calls = 0
     try:
         for group_coordinates, pressure in groups:
             if _call_gimp_pressure_tool(
-                tool, layer, group_coordinates, pressure, float(base_brush_size)
+                tool, drawable, group_coordinates, pressure, float(base_brush_size)
             ):
                 calls += 1
     finally:
@@ -3168,6 +4097,10 @@ def gimp_paint_direct_stroke_chunk(
         raise ValueError("Direct paint stroke target changed while streaming")
 
     tool = _normalize_blendgimp_paint_tool(active.get("tool", "PAINTBRUSH"))
+    _image, current_layer = _gimp_resolve_image_layer(image_id, layer_id)
+    _current_drawable, current_target_kind = _gimp_layer_edit_drawable(current_layer)
+    if str(active.get("target_kind", "LAYER")) != current_target_kind:
+        raise ValueError("Layer/mask paint target changed while streaming")
 
     if isinstance(segments, (list, tuple)) and segments:
         stroke_segments = list(segments)
@@ -3587,6 +4520,7 @@ def gimp_set_layer_pixels_binary(
         raise ValueError(
             "Cannot write raster pixels directly to a GIMP group layer"
         )
+    drawable, target_kind = _gimp_layer_edit_drawable(layer)
 
     expected_length = (
         region_width
@@ -3609,11 +4543,11 @@ def gimp_set_layer_pixels_binary(
     )
 
     layer_width = int(
-        layer.get_width()
+        drawable.get_width()
     )
 
     layer_height = int(
-        layer.get_height()
+        drawable.get_height()
     )
 
     requested_left = image_x
@@ -3708,7 +4642,7 @@ def gimp_set_layer_pixels_binary(
         - layer_offset_y
     )
 
-    shadow = layer.get_shadow_buffer()
+    shadow = drawable.get_shadow_buffer()
 
     if shadow is None:
         raise RuntimeError(
@@ -3746,7 +4680,7 @@ def gimp_set_layer_pixels_binary(
 
     shadow.flush()
 
-    merged = layer.merge_shadow(
+    merged = drawable.merge_shadow(
         True
     )
 
@@ -3755,7 +4689,7 @@ def gimp_set_layer_pixels_binary(
             "GIMP could not merge the Blender pixel write into the layer"
         )
 
-    updated = layer.update(
+    updated = drawable.update(
         local_x,
         local_y,
         write_width,
@@ -3811,6 +4745,7 @@ def gimp_set_layer_pixels_binary(
         "composite_width": write_width,
         "composite_height": write_height,
         "composite_byte_length": len(composite_patch),
+        "target_kind": target_kind,
         "_binary_payload": composite_patch,
         "clipped": bool(
             write_width != region_width
@@ -3834,11 +4769,12 @@ def gimp_get_layer_pixels_binary(
     image, layer = _gimp_resolve_image_layer(int(image_id), int(layer_id))
     if layer.is_group():
         raise ValueError("Cannot read raster pixels directly from a GIMP group layer")
+    drawable, target_kind = _gimp_layer_edit_drawable(layer)
 
     image_width = int(image.get_width())
     image_height = int(image.get_height())
-    layer_width = int(layer.get_width())
-    layer_height = int(layer.get_height())
+    layer_width = int(drawable.get_width())
+    layer_height = int(drawable.get_height())
     layer_offset_x, layer_offset_y = _blendgimp_layer_offsets(layer)
 
     if image_x is None or image_y is None or region_width is None or region_height is None:
@@ -3864,14 +4800,14 @@ def gimp_get_layer_pixels_binary(
             "x": int(read_left), "y": int(read_top),
             "width": 0, "height": 0, "layer_offset_x": layer_offset_x,
             "layer_offset_y": layer_offset_y, "pixel_format": "R'G'B'A u8",
-            "origin": "top-left", "byte_length": 0, "_binary_payload": b"",
+            "origin": "top-left", "target_kind": target_kind, "byte_length": 0, "_binary_payload": b"",
         }
 
     read_width = read_right - read_left
     read_height = read_bottom - read_top
     local_x = read_left - layer_offset_x
     local_y = read_top - layer_offset_y
-    buffer = layer.get_buffer()
+    buffer = drawable.get_buffer()
     if buffer is None:
         raise RuntimeError("GIMP did not return a GEGL buffer for the selected layer")
     rectangle = Gegl.Rectangle.new(local_x, local_y, read_width, read_height)
@@ -3890,7 +4826,7 @@ def gimp_get_layer_pixels_binary(
         "layer_offset_x": int(layer_offset_x), "layer_offset_y": int(layer_offset_y),
         "layer_width": int(layer_width), "layer_height": int(layer_height),
         "pixel_format": "R'G'B'A u8", "alpha": "straight",
-        "origin": "top-left", "byte_length": len(raw_pixels),
+        "origin": "top-left", "target_kind": target_kind, "byte_length": len(raw_pixels),
         "_binary_payload": raw_pixels,
     }
 
@@ -7074,6 +8010,89 @@ class BlendGimpIPCServer:
                 )
 
 
+        if message_type == "ADD_LAYER_MASK":
+            log("ADD_LAYER_MASK received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                mask_type = str(message.get("mask_type", "WHITE"))
+                result = self.dispatcher.call(
+                    gimp_add_layer_mask, image_id, layer_id, mask_type, timeout=5.0
+                )
+                response = {"type": "LAYER_MASK_ADDED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"ADD_LAYER_MASK layer ID {layer_id} mask ID {result['mask_id']} type={result['mask_type']}")
+                return response
+            except Exception as exc:
+                log(f"ADD_LAYER_MASK failed: {exc}")
+                return self._error_response(message, command="ADD_LAYER_MASK", error=str(exc))
+
+        if message_type == "SET_LAYER_MASK_EDIT":
+            log("SET_LAYER_MASK_EDIT received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                edit_mask = bool(message["edit_mask"])
+                result = self.dispatcher.call(
+                    gimp_set_layer_mask_edit, image_id, layer_id, edit_mask, timeout=5.0
+                )
+                response = {"type": "LAYER_MASK_EDIT_SET", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"SET_LAYER_MASK_EDIT layer ID {layer_id} target={result['target_kind']}")
+                return response
+            except Exception as exc:
+                log(f"SET_LAYER_MASK_EDIT failed: {exc}")
+                return self._error_response(message, command="SET_LAYER_MASK_EDIT", error=str(exc))
+
+        if message_type == "SET_LAYER_MASK_APPLY":
+            log("SET_LAYER_MASK_APPLY received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                apply_mask = bool(message["apply_mask"])
+                result = self.dispatcher.call(
+                    gimp_set_layer_mask_apply, image_id, layer_id, apply_mask, timeout=5.0
+                )
+                response = {"type": "LAYER_MASK_APPLY_SET", "ok": True, **result}
+                self._copy_request_id(message, response)
+                return response
+            except Exception as exc:
+                log(f"SET_LAYER_MASK_APPLY failed: {exc}")
+                return self._error_response(message, command="SET_LAYER_MASK_APPLY", error=str(exc))
+
+        if message_type == "SET_LAYER_MASK_SHOW":
+            log("SET_LAYER_MASK_SHOW received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                show_mask = bool(message["show_mask"])
+                result = self.dispatcher.call(
+                    gimp_set_layer_mask_show, image_id, layer_id, show_mask, timeout=5.0
+                )
+                response = {"type": "LAYER_MASK_SHOW_SET", "ok": True, **result}
+                self._copy_request_id(message, response)
+                return response
+            except Exception as exc:
+                log(f"SET_LAYER_MASK_SHOW failed: {exc}")
+                return self._error_response(message, command="SET_LAYER_MASK_SHOW", error=str(exc))
+
+        if message_type == "REMOVE_LAYER_MASK":
+            log("REMOVE_LAYER_MASK received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                apply_mask = bool(message.get("apply", False))
+                result = self.dispatcher.call(
+                    gimp_remove_layer_mask, image_id, layer_id, apply_mask, timeout=5.0
+                )
+                response = {"type": "LAYER_MASK_REMOVED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"REMOVE_LAYER_MASK layer ID {layer_id} applied={bool(apply_mask)}")
+                return response
+            except Exception as exc:
+                log(f"REMOVE_LAYER_MASK failed: {exc}")
+                return self._error_response(message, command="REMOVE_LAYER_MASK", error=str(exc))
+
         if message_type == "ADD_LAYER":
             log("ADD_LAYER received")
 
@@ -7424,6 +8443,199 @@ class BlendGimpIPCServer:
                     error=str(exc),
                 )
 
+        if message_type == "MERGE_VISIBLE_LAYERS":
+            log("MERGE_VISIBLE_LAYERS received")
+            try:
+                image_id = int(message["image_id"])
+                result = self.dispatcher.call(
+                    gimp_merge_visible_layers, image_id, timeout=5.0
+                )
+                response = {"type": "VISIBLE_LAYERS_MERGED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"MERGE_VISIBLE_LAYERS image ID {image_id} -> layer ID {result['layer_id']}")
+                return response
+            except Exception as exc:
+                log(f"MERGE_VISIBLE_LAYERS failed: {exc}")
+                return self._error_response(message, command="MERGE_VISIBLE_LAYERS", error=str(exc))
+
+        if message_type == "FLATTEN_IMAGE":
+            log("FLATTEN_IMAGE received")
+            try:
+                image_id = int(message["image_id"])
+                result = self.dispatcher.call(
+                    gimp_flatten_image, image_id, timeout=5.0
+                )
+                response = {"type": "IMAGE_FLATTENED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"FLATTEN_IMAGE image ID {image_id} -> layer ID {result['layer_id']}")
+                return response
+            except Exception as exc:
+                log(f"FLATTEN_IMAGE failed: {exc}")
+                return self._error_response(message, command="FLATTEN_IMAGE", error=str(exc))
+
+        if message_type == "DUPLICATE_GROUP":
+            log("DUPLICATE_GROUP received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                result = self.dispatcher.call(
+                    gimp_duplicate_group, image_id, layer_id, timeout=5.0
+                )
+                response = {"type": "GROUP_DUPLICATED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"DUPLICATE_GROUP group ID {layer_id} -> group ID {result['layer_id']}")
+                return response
+            except Exception as exc:
+                log(f"DUPLICATE_GROUP failed: {exc}")
+                return self._error_response(message, command="DUPLICATE_GROUP", error=str(exc))
+
+        if message_type == "SET_LAYER_COLOR_TAG":
+            log("SET_LAYER_COLOR_TAG received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                color_tag = str(message.get("color_tag", "NONE"))
+                result = self.dispatcher.call(
+                    gimp_set_layer_color_tag, image_id, layer_id, color_tag, timeout=5.0
+                )
+                response = {"type": "LAYER_COLOR_TAG_SET", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"SET_LAYER_COLOR_TAG layer ID {layer_id} tag={result['color_tag']}")
+                return response
+            except Exception as exc:
+                log(f"SET_LAYER_COLOR_TAG failed: {exc}")
+                return self._error_response(message, command="SET_LAYER_COLOR_TAG", error=str(exc))
+
+
+        if message_type == "GET_SELECTION_STATE":
+            try:
+                image_id = int(message["image_id"])
+                result = self.dispatcher.call(gimp_get_selection_state, image_id, timeout=5.0)
+                response = {"type": "SELECTION_STATE", "ok": True, **result}
+                self._copy_request_id(message, response)
+                return response
+            except Exception as exc:
+                log(f"GET_SELECTION_STATE failed: {exc}")
+                return self._error_response(message, command="GET_SELECTION_STATE", error=str(exc))
+
+        if message_type in {"SELECT_RECTANGLE", "SELECT_ELLIPSE"}:
+            log(f"{message_type} received")
+            try:
+                image_id = int(message["image_id"])
+                x = float(message["x"])
+                y = float(message["y"])
+                width = float(message["width"])
+                height = float(message["height"])
+                operation = str(message.get("operation", "REPLACE"))
+                func = gimp_select_rectangle if message_type == "SELECT_RECTANGLE" else gimp_select_ellipse
+                result = self.dispatcher.call(
+                    func, image_id, x, y, width, height, operation, timeout=5.0
+                )
+                response = {"type": "SELECTION_CHANGED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(
+                    f"{message_type} image ID {image_id} operation={result.get('operation', operation)} "
+                    f"bounds={result['x1']},{result['y1']}..{result['x2']},{result['y2']}"
+                )
+                return response
+            except Exception as exc:
+                log(f"{message_type} failed: {exc}")
+                return self._error_response(message, command=message_type, error=str(exc))
+
+        if message_type == "SELECT_POLYGON":
+            log("SELECT_POLYGON received")
+            try:
+                image_id = int(message["image_id"])
+                points = message.get("points", [])
+                operation = str(message.get("operation", "REPLACE"))
+                result = self.dispatcher.call(
+                    gimp_select_polygon, image_id, points, operation, timeout=5.0
+                )
+                response = {"type": "SELECTION_CHANGED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(
+                    f"SELECT_POLYGON image ID {image_id} operation={result.get('operation', operation)} "
+                    f"points={len(points)//2} active={result['active']}"
+                )
+                return response
+            except Exception as exc:
+                log(f"SELECT_POLYGON failed: {exc}")
+                return self._error_response(message, command="SELECT_POLYGON", error=str(exc))
+
+        if message_type in {"SELECT_FUZZY", "SELECT_BY_COLOR"}:
+            log(f"{message_type} received")
+            try:
+                image_id = int(message["image_id"])
+                layer_id = int(message["layer_id"])
+                x = float(message["x"])
+                y = float(message["y"])
+                operation = str(message.get("operation", "REPLACE"))
+                threshold = float(message.get("threshold", 0.15))
+                sample_merged = bool(message.get("sample_merged", False))
+                sample_transparent = bool(message.get("sample_transparent", True))
+                func = gimp_select_fuzzy if message_type == "SELECT_FUZZY" else gimp_select_by_color
+                result = self.dispatcher.call(
+                    func,
+                    image_id,
+                    layer_id,
+                    x,
+                    y,
+                    operation,
+                    threshold,
+                    sample_merged,
+                    sample_transparent,
+                    timeout=15.0,
+                )
+                response = {"type": "SELECTION_CHANGED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(
+                    f"{message_type} image ID {image_id} layer ID {layer_id} "
+                    f"operation={result.get('operation', operation)} threshold={threshold:.3f} "
+                    f"active={result['active']}"
+                )
+                return response
+            except Exception as exc:
+                log(f"{message_type} failed: {exc}")
+                return self._error_response(message, command=message_type, error=str(exc))
+
+        if message_type in {"SELECT_GROW", "SELECT_SHRINK", "SELECT_FEATHER", "SELECT_BORDER"}:
+            log(f"{message_type} received")
+            try:
+                image_id = int(message["image_id"])
+                radius = float(message.get("radius", 1.0))
+                action = message_type.removeprefix("SELECT_")
+                result = self.dispatcher.call(
+                    gimp_modify_selection, image_id, action, radius, timeout=5.0
+                )
+                response = {"type": "SELECTION_CHANGED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(
+                    f"{message_type} image ID {image_id} radius={radius:.2f} "
+                    f"active={result['active']}"
+                )
+                return response
+            except Exception as exc:
+                log(f"{message_type} failed: {exc}")
+                return self._error_response(message, command=message_type, error=str(exc))
+
+        if message_type in {"SELECT_ALL", "SELECT_NONE", "SELECT_INVERT"}:
+            log(f"{message_type} received")
+            try:
+                image_id = int(message["image_id"])
+                func = {
+                    "SELECT_ALL": gimp_select_all,
+                    "SELECT_NONE": gimp_select_none,
+                    "SELECT_INVERT": gimp_select_invert,
+                }[message_type]
+                result = self.dispatcher.call(func, image_id, timeout=5.0)
+                response = {"type": "SELECTION_CHANGED", "ok": True, **result}
+                self._copy_request_id(message, response)
+                log(f"{message_type} image ID {image_id} active={result['active']}")
+                return response
+            except Exception as exc:
+                log(f"{message_type} failed: {exc}")
+                return self._error_response(message, command=message_type, error=str(exc))
+
         if message_type == "SET_LAYER_LOCK":
             log("SET_LAYER_LOCK received")
 
@@ -7718,6 +8930,35 @@ class BlendGimpIPCServer:
                 return self._error_response(
                     message,
                     command="GET_BRUSHES",
+                    error=str(exc),
+                )
+
+        if message_type == "GET_BRUSH_PREVIEW":
+            log("GET_BRUSH_PREVIEW received")
+
+            try:
+                result = self.dispatcher.call(
+                    gimp_get_brush_preview,
+                    message.get("max_size", 256),
+                    timeout=5.0,
+                )
+                response = {
+                    "type": "BRUSH_PREVIEW",
+                    "ok": True,
+                    **result,
+                }
+                self._copy_request_id(message, response)
+                log(
+                    "GET_BRUSH_PREVIEW returned "
+                    f"brush={result.get('brush_name', '')} "
+                    f"size={result.get('preview_width', 0)}x{result.get('preview_height', 0)}"
+                )
+                return response
+            except Exception as exc:
+                log(f"GET_BRUSH_PREVIEW failed: {exc}")
+                return self._error_response(
+                    message,
+                    command="GET_BRUSH_PREVIEW",
                     error=str(exc),
                 )
 

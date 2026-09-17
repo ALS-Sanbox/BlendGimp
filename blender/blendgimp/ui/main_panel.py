@@ -7,6 +7,11 @@ import tempfile
 import re
 from bpy.app.handlers import persistent
 
+try:
+    from bpy.utils import previews as bpy_previews
+except Exception:
+    bpy_previews = None
+
 from ..core import gimp_manager
 from . import preferences as blendgimp_preferences
 from ..ipc.connection import (
@@ -265,6 +270,88 @@ BLENDGIMP_LAYER_MODE_ITEMS = [
     ("REPLACE", "Replace", "GIMP Replace blend mode"),
     ("OVERWRITE", "Overwrite", "GIMP Overwrite blend mode"),
 ]
+
+
+BLENDGIMP_COLOR_TAG_ITEMS = [
+    ("NONE", "None", "No GIMP layer color tag"),
+    ("BLUE", "Blue", "Blue GIMP layer color tag"),
+    ("GREEN", "Green", "Green GIMP layer color tag"),
+    ("YELLOW", "Yellow", "Yellow GIMP layer color tag"),
+    ("ORANGE", "Orange", "Orange GIMP layer color tag"),
+    ("BROWN", "Brown", "Brown GIMP layer color tag"),
+    ("RED", "Red", "Red GIMP layer color tag"),
+    ("VIOLET", "Violet", "Violet GIMP layer color tag"),
+    ("GRAY", "Gray", "Gray GIMP layer color tag"),
+]
+
+
+def blendgimp_color_tag_label(tag_name):
+    tag_name = str(tag_name or "NONE").upper()
+    for identifier, label, _description in BLENDGIMP_COLOR_TAG_ITEMS:
+        if identifier == tag_name:
+            return label
+    return "None"
+
+
+# 0.5.10: true visual swatches for native GIMP color tags.  Blender does not
+# expose arbitrary row background tinting through UILayout, so small bundled
+# preview icons provide an actual colored cue while the text label remains a
+# fallback if custom previews are unavailable.
+_COLOR_TAG_PREVIEWS = None
+_COLOR_TAG_ICON_FILES = {
+    "BLUE": "tag_blue.png",
+    "GREEN": "tag_green.png",
+    "YELLOW": "tag_yellow.png",
+    "ORANGE": "tag_orange.png",
+    "BROWN": "tag_brown.png",
+    "RED": "tag_red.png",
+    "VIOLET": "tag_violet.png",
+    "GRAY": "tag_gray.png",
+}
+
+
+def _register_color_tag_previews():
+    global _COLOR_TAG_PREVIEWS
+    if _COLOR_TAG_PREVIEWS is not None or bpy_previews is None:
+        return
+    try:
+        collection = bpy_previews.new()
+        icon_dir = os.path.join(os.path.dirname(__file__), "icons", "color_tags")
+        loaded = 0
+        for tag_name, filename in _COLOR_TAG_ICON_FILES.items():
+            path = os.path.join(icon_dir, filename)
+            if os.path.isfile(path):
+                collection.load(tag_name, path, "IMAGE")
+                loaded += 1
+        _COLOR_TAG_PREVIEWS = collection
+        print(f"BLENDGIMP: Color Tag visual swatches loaded={loaded}")
+    except Exception as exc:
+        _COLOR_TAG_PREVIEWS = None
+        print(f"BLENDGIMP: Color Tag preview icons unavailable: {exc}")
+
+
+def _unregister_color_tag_previews():
+    global _COLOR_TAG_PREVIEWS
+    collection = _COLOR_TAG_PREVIEWS
+    _COLOR_TAG_PREVIEWS = None
+    if collection is not None and bpy_previews is not None:
+        try:
+            bpy_previews.remove(collection)
+        except Exception:
+            pass
+
+
+def blendgimp_color_tag_icon_value(tag_name):
+    tag_name = str(tag_name or "NONE").upper()
+    if tag_name == "NONE":
+        return 0
+    collection = _COLOR_TAG_PREVIEWS
+    if collection is None:
+        return 0
+    try:
+        return int(collection[tag_name].icon_id)
+    except Exception:
+        return 0
 
 
 def blendgimp_layer_mode_label(
@@ -1818,6 +1905,7 @@ def load_active_layer_buffer_from_gimp(scene, image_id, layer_id, *, region=None
     )
     _patch_blendgimp_layer_buffer(buffer_image, response, clear_first=clear_first)
     buffer_image["blendgimp_gimp_layer_id"] = layer_id
+    buffer_image["blendgimp_target_kind"] = str(response.get("target_kind", "LAYER"))
     buffer_image["blendgimp_layer_offset_x"] = int(response.get("layer_offset_x", 0))
     buffer_image["blendgimp_layer_offset_y"] = int(response.get("layer_offset_y", 0))
     scene.blendgimp_blender_paint_sync_image_id = image_id
@@ -1832,6 +1920,7 @@ def load_active_layer_buffer_from_gimp(scene, image_id, layer_id, *, region=None
     print(
         "BLENDGIMP: Active Layer Buffer loaded "
         f"image ID {image_id} layer ID {layer_id} "
+        f"target={str(response.get('target_kind', 'LAYER'))} "
         f"canvas={width}x{height} source={int(response.get('width',0))}x{int(response.get('height',0))}"
     )
     return buffer_image
@@ -5165,13 +5254,55 @@ def draw_layer_tree(
 # PHASE 6.5.2 — COMPACT / NATIVE-FEELING LAYER STACK
 # ============================================================
 
-def _iter_layer_stack_rows(layers, depth=0):
-    """Yield layer rows in display order while preserving GIMP hierarchy."""
+def _collapsed_group_ids(scene):
+    # 0.5.11: tolerate hot-reload / older scenes where the RNA property is
+    # not available yet. The registered Scene StringProperty is the normal
+    # storage path; the ID-property fallback keeps the UI usable even during
+    # unusual extension reload sequences.
+    raw = getattr(scene, "blendgimp_collapsed_group_ids", None)
+    if raw is None:
+        try:
+            raw = scene.get("_blendgimp_collapsed_group_ids", "")
+        except Exception:
+            raw = ""
+    raw = str(raw or "")
+    result = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _set_collapsed_group_ids(scene, values):
+    encoded = ",".join(str(v) for v in sorted(set(values)))
+    try:
+        scene.blendgimp_collapsed_group_ids = encoded
+    except (AttributeError, TypeError):
+        # Defensive fallback for an extension hot-reload where the RNA
+        # property has not been attached yet.
+        try:
+            scene["_blendgimp_collapsed_group_ids"] = encoded
+        except Exception:
+            pass
+
+
+def _iter_layer_stack_rows(layers, depth=0, collapsed_ids=None):
+    """Yield visible layer rows in display order while preserving GIMP hierarchy."""
+    collapsed_ids = collapsed_ids or set()
     for sibling_index, layer in enumerate(layers or []):
         yield layer, depth, sibling_index, len(layers or [])
         children = layer.get("children", []) if isinstance(layer, dict) else []
-        if children:
-            yield from _iter_layer_stack_rows(children, depth + 1)
+        try:
+            layer_id = int(layer.get("id", -1))
+        except Exception:
+            layer_id = -1
+        if children and layer_id not in collapsed_ids:
+            yield from _iter_layer_stack_rows(children, depth + 1, collapsed_ids)
 
 
 def _find_selected_layer_any(layers):
@@ -5183,20 +5314,23 @@ def _find_selected_layer_any(layers):
 
 
 def draw_layer_stack_compact(layout, layers, image_id):
-    """Draw a compact layer stack plus controls for the active GIMP layer.
+    """Draw the production Layers panel as a compact Blender-style stack.
 
-    Phase 6.5.2 keeps the existing GIMP layer protocol/operators authoritative;
-    only the Blender presentation changes.  One compact row represents each
-    layer/group, while detailed controls are shown once for the selected layer.
+    0.5.11 preserves the compact production stack and adds native GIMP
+    advanced layer operations, color tags, group duplication, and full locks.
     """
     layers = list(layers or [])
-    stack = layout.column(align=True)
-
     if not layers:
-        stack.label(text="No layers returned by GIMP", icon="INFO")
+        layout.label(text="No layers returned by GIMP", icon="INFO")
         return
 
-    for layer, depth, _sibling_index, _sibling_count in _iter_layer_stack_rows(layers):
+    selected_layer, _depth, sibling_index, sibling_count = _find_selected_layer_any(layers)
+    scene = getattr(bpy.context, "scene", None)
+    collapsed_ids = _collapsed_group_ids(scene) if scene is not None else set()
+
+    # Main stack: visibility + hierarchy disclosure + name/group identity + opacity.
+    stack = layout.column(align=True)
+    for layer, depth, _row_index, _row_count in _iter_layer_stack_rows(layers, collapsed_ids=collapsed_ids):
         try:
             layer_id = int(layer.get("id", -1))
         except (TypeError, ValueError):
@@ -5208,17 +5342,15 @@ def draw_layer_stack_compact(layout, layers, image_id):
         visible = bool(layer.get("visible", False))
         is_group = bool(layer.get("is_group", False))
         name = str(layer.get("name", "[Unnamed]"))
-        prefix = "    " * max(0, int(depth))
+        color_tag = str(layer.get("color_tag", "NONE") or "NONE").upper()
+        color_label = blendgimp_color_tag_label(color_tag)
+        display_name = name if color_tag == "NONE" else f"{name} [{color_label}]"
+        try:
+            opacity = max(0.0, min(100.0, float(layer.get("opacity", 100.0))))
+        except (TypeError, ValueError):
+            opacity = 100.0
 
         row = stack.row(align=True)
-        active = row.operator(
-            "blendgimp.set_active_layer",
-            text=prefix + name,
-            icon="FILE_FOLDER" if is_group else "IMAGE_DATA",
-            depress=selected,
-        )
-        active.image_id = int(image_id)
-        active.layer_id = layer_id
 
         visibility = row.operator(
             "blendgimp.set_layer_visibility",
@@ -5230,8 +5362,79 @@ def draw_layer_stack_compact(layout, layers, image_id):
         visibility.layer_id = layer_id
         visibility.visible = not visible
 
-    selected_layer, _depth, sibling_index, sibling_count = _find_selected_layer_any(layers)
+        # Make hierarchy visually obvious. Children get fixed-width indentation,
+        # while groups get an explicit disclosure arrow immediately after Eye.
+        if depth > 0:
+            for _ in range(int(depth)):
+                row.label(text="", icon="BLANK1")
+
+        children = layer.get("children", []) if isinstance(layer, dict) else []
+        if is_group:
+            collapsed = layer_id in collapsed_ids
+            disclosure = row.operator(
+                "blendgimp.toggle_group_collapse",
+                text="",
+                icon="TRIA_RIGHT" if collapsed else "TRIA_DOWN",
+                emboss=False,
+            )
+            disclosure.group_id = layer_id
+        elif depth > 0:
+            row.label(text="", icon="DOT")
+
+        # Native GIMP Color Tags need a real visual cue in Blender.  The
+        # swatch is clickable (opens the existing Color Tag picker) and the
+        # [Color] suffix remains as an accessibility/fallback cue.
+        tag_icon_value = blendgimp_color_tag_icon_value(color_tag)
+        if color_tag != "NONE":
+            tag_badge = row.operator(
+                "blendgimp.set_layer_color_tag",
+                text="" if tag_icon_value else color_label[:1],
+                icon_value=tag_icon_value,
+                emboss=True,
+            )
+            tag_badge.image_id = int(image_id)
+            tag_badge.layer_id = layer_id
+            tag_badge.color_tag = color_tag
+
+        if is_group and children:
+            display_name = f"{display_name} ({len(children)})"
+        active = row.operator(
+            "blendgimp.set_active_layer",
+            text=display_name,
+            icon="FILE_FOLDER" if is_group else "IMAGE_DATA",
+            depress=selected,
+        )
+        active.image_id = int(image_id)
+        active.layer_id = layer_id
+
+        if bool(layer.get("has_mask", False)) and not is_group:
+            mask_marker = row.operator(
+                "blendgimp.set_layer_mask_edit",
+                text="M",
+                icon="MOD_MASK",
+                depress=bool(layer.get("mask_edit", False)),
+            )
+            mask_marker.image_id = int(image_id)
+            mask_marker.layer_id = layer_id
+            mask_marker.edit_mask = True
+
+        opacity_op = row.operator(
+            "blendgimp.set_layer_opacity",
+            text=f"{opacity:.0f}%",
+        )
+        opacity_op.image_id = int(image_id)
+        opacity_op.layer_id = layer_id
+        opacity_op.opacity = opacity
+
+    # Native-feeling compact action strip underneath the stack.
+    toolbar = layout.row(align=True)
+    add = toolbar.operator("blendgimp.add_layer", text="", icon="ADD")
+    add.image_id = int(image_id)
+    group = toolbar.operator("blendgimp.create_group", text="", icon="NEWFOLDER")
+    group.image_id = int(image_id)
+
     if selected_layer is None:
+        toolbar.separator()
         layout.label(text="Select a layer to edit its properties", icon="INFO")
         return
 
@@ -5250,23 +5453,44 @@ def draw_layer_stack_compact(layout, layers, image_id):
         opacity = 100.0
     mode_name = str(selected_layer.get("mode", "NORMAL"))
 
+    duplicate = toolbar.operator(
+        "blendgimp.duplicate_group" if is_group else "blendgimp.duplicate_layer",
+        text="",
+        icon="DUPLICATE",
+    )
+    duplicate.image_id = int(image_id)
+    duplicate.layer_id = layer_id
+
+    delete = toolbar.operator("blendgimp.delete_layer", text="", icon="X")
+    delete.image_id = int(image_id)
+    delete.layer_id = layer_id
+    delete.layer_name = name
+
+    if sibling_index > 0:
+        up = toolbar.operator("blendgimp.reorder_layer", text="", icon="TRIA_UP")
+        up.image_id = int(image_id)
+        up.layer_id = layer_id
+        up.direction = "UP"
+
+    if 0 <= sibling_index < max(0, sibling_count - 1):
+        down = toolbar.operator("blendgimp.reorder_layer", text="", icon="TRIA_DOWN")
+        down.image_id = int(image_id)
+        down.layer_id = layer_id
+        down.direction = "DOWN"
+
+    # Selected-layer properties are shown once instead of repeating a large
+    # control box for every row in the stack.
     details = layout.box()
     header = details.row(align=True)
     header.label(
-        text=f"Active {'Group' if is_group else 'Layer'}: {name}",
+        text=f"Active {'Group' if is_group else 'Layer'}",
         icon="FILE_FOLDER" if is_group else "IMAGE_DATA",
     )
+    header.label(text=name)
 
-    props = details.row(align=True)
-    opacity_operator = props.operator(
-        "blendgimp.set_layer_opacity",
-        text=f"Opacity {opacity:.0f}%",
-    )
-    opacity_operator.image_id = int(image_id)
-    opacity_operator.layer_id = layer_id
-    opacity_operator.opacity = opacity
-
-    mode_operator = props.operator(
+    blend_row = details.row(align=True)
+    blend_row.label(text="Blend")
+    mode_operator = blend_row.operator(
         "blendgimp.set_layer_mode",
         text=blendgimp_layer_mode_label(mode_name),
     )
@@ -5278,15 +5502,109 @@ def draw_layer_stack_compact(layout, layers, image_id):
         else "NORMAL"
     )
 
-    lock_row = details.row(align=True)
-    lock_row.label(text="Locks")
+    opacity_row = details.row(align=True)
+    opacity_row.label(text="Opacity")
+    opacity_operator = opacity_row.operator(
+        "blendgimp.set_layer_opacity",
+        text=f"{opacity:.0f}%",
+    )
+    opacity_operator.image_id = int(image_id)
+    opacity_operator.layer_id = layer_id
+    opacity_operator.opacity = opacity
+
+    color_tag = str(selected_layer.get("color_tag", "NONE") or "NONE").upper()
+    tag_row = details.row(align=True)
+    tag_row.label(text="Color Tag")
+    tag_icon_value = blendgimp_color_tag_icon_value(color_tag)
+    tag_operator = tag_row.operator(
+        "blendgimp.set_layer_color_tag",
+        text=blendgimp_color_tag_label(color_tag),
+        icon_value=tag_icon_value,
+    )
+    tag_operator.image_id = int(image_id)
+    tag_operator.layer_id = layer_id
+    tag_operator.color_tag = color_tag if any(
+        item[0] == color_tag for item in BLENDGIMP_COLOR_TAG_ITEMS
+    ) else "NONE"
+
+    if not is_group:
+        has_mask = bool(selected_layer.get("has_mask", False))
+        mask_box = details.box()
+        mask_header = mask_box.row(align=True)
+        mask_header.label(text="Layer Mask", icon="MOD_MASK")
+
+        if not has_mask:
+            add_mask = mask_box.operator(
+                "blendgimp.add_layer_mask", text="Add Mask", icon="ADD"
+            )
+            add_mask.image_id = int(image_id)
+            add_mask.layer_id = layer_id
+        else:
+            mask_edit = bool(selected_layer.get("mask_edit", False))
+            mask_apply = bool(selected_layer.get("mask_apply", True))
+            mask_show = bool(selected_layer.get("mask_show", False))
+
+            target_row = mask_box.row(align=True)
+            layer_target = target_row.operator(
+                "blendgimp.set_layer_mask_edit",
+                text="Layer",
+                depress=not mask_edit,
+            )
+            layer_target.image_id = int(image_id)
+            layer_target.layer_id = layer_id
+            layer_target.edit_mask = False
+            mask_target = target_row.operator(
+                "blendgimp.set_layer_mask_edit",
+                text="Mask",
+                icon="MOD_MASK",
+                depress=mask_edit,
+            )
+            mask_target.image_id = int(image_id)
+            mask_target.layer_id = layer_id
+            mask_target.edit_mask = True
+
+            state_row = mask_box.row(align=True)
+            enable_mask = state_row.operator(
+                "blendgimp.set_layer_mask_apply",
+                text="Enabled",
+                depress=mask_apply,
+            )
+            enable_mask.image_id = int(image_id)
+            enable_mask.layer_id = layer_id
+            enable_mask.apply_mask = not mask_apply
+            show_mask = state_row.operator(
+                "blendgimp.set_layer_mask_show",
+                text="Mask View",
+                depress=mask_show,
+            )
+            show_mask.image_id = int(image_id)
+            show_mask.layer_id = layer_id
+            show_mask.show_mask = not mask_show
+
+            remove_row = mask_box.row(align=True)
+            apply_mask = remove_row.operator(
+                "blendgimp.remove_layer_mask", text="Apply Mask", icon="CHECKMARK"
+            )
+            apply_mask.image_id = int(image_id)
+            apply_mask.layer_id = layer_id
+            apply_mask.apply = True
+            delete_mask = remove_row.operator(
+                "blendgimp.remove_layer_mask", text="Delete Mask", icon="TRASH"
+            )
+            delete_mask.image_id = int(image_id)
+            delete_mask.layer_id = layer_id
+            delete_mask.apply = False
+
+    details.label(text="Locks", icon="LOCKED")
+    lock_grid = details.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
     for lock_type, label, field_name in (
         ("CONTENT", "Pixels", "lock_content"),
         ("POSITION", "Position", "lock_position"),
+        ("VISIBILITY", "Visibility", "lock_visibility"),
         ("ALPHA", "Alpha", "lock_alpha"),
     ):
         current_locked = bool(selected_layer.get(field_name, False))
-        op = lock_row.operator(
+        op = lock_grid.operator(
             "blendgimp.set_layer_lock",
             text=label,
             depress=current_locked,
@@ -5296,42 +5614,31 @@ def draw_layer_stack_compact(layout, layers, image_id):
         op.lock_type = lock_type
         op.locked = not current_locked
 
-    actions = details.row(align=True)
-    rename = actions.operator("blendgimp.rename_layer", text="Rename")
+    edit = details.row(align=True)
+    rename = edit.operator("blendgimp.rename_layer", text="Rename")
     rename.image_id = int(image_id)
     rename.layer_id = layer_id
     rename.layer_name = name
 
-    duplicate = actions.operator("blendgimp.duplicate_layer", text="Duplicate")
-    duplicate.image_id = int(image_id)
-    duplicate.layer_id = layer_id
-
-    delete = actions.operator("blendgimp.delete_layer", text="Delete")
-    delete.image_id = int(image_id)
-    delete.layer_id = layer_id
-    delete.layer_name = name
-
-    order = details.row(align=True)
-    if sibling_index > 0:
-        up = order.operator("blendgimp.reorder_layer", text="Up")
-        up.image_id = int(image_id)
-        up.layer_id = layer_id
-        up.direction = "UP"
-    if 0 <= sibling_index < max(0, sibling_count - 1):
-        down = order.operator("blendgimp.reorder_layer", text="Down")
-        down.image_id = int(image_id)
-        down.layer_id = layer_id
-        down.direction = "DOWN"
-
-    move = order.operator("blendgimp.move_layer", text="Move…")
+    move = edit.operator("blendgimp.move_layer", text="Move…")
     move.image_id = int(image_id)
     move.layer_id = layer_id
 
     if 0 <= sibling_index < max(0, sibling_count - 1):
-        merge = order.operator("blendgimp.merge_layer_down", text="Merge Down")
+        merge = edit.operator("blendgimp.merge_layer_down", text="Merge Down")
         merge.image_id = int(image_id)
         merge.layer_id = layer_id
         merge.layer_name = name
+
+    image_ops = layout.row(align=True)
+    merge_visible = image_ops.operator(
+        "blendgimp.merge_visible_layers", text="Merge Visible"
+    )
+    merge_visible.image_id = int(image_id)
+    flatten = image_ops.operator(
+        "blendgimp.flatten_image", text="Flatten Image", icon="IMAGE_DATA"
+    )
+    flatten.image_id = int(image_id)
 
 
 # ============================================================
@@ -5827,6 +6134,173 @@ class BLENDGIMP_OT_ping(
 # ACTIVE IMAGE / MATERIAL UI HELPERS
 # ============================================================
 
+_ACTIVE_IMAGE_DATABLOCK_UPDATE_GUARD = False
+
+
+def _retire_active_image_runtime(scene, reason="active image switch", fail_if_unsent=True):
+    """Release paint/sync ownership before another image becomes authoritative.
+
+    The native Active Image datablock selector can change while a previous
+    image still owns the reusable active-layer buffer.  Flush pending Blender
+    paint first, then retire modal refresh ownership and invalidate the old
+    layer-buffer identity so no operation can combine image A with layer B.
+    """
+    if scene is None:
+        return
+
+    flush_blender_paint_changes(
+        scene,
+        reason=reason,
+        fail_if_unsent=bool(fail_if_unsent),
+    )
+
+    try:
+        from . import texture_editor
+        texture_editor.request_blendgimp_paint_release(scene, reason)
+    except Exception as exc:
+        print(f"BLENDGIMP: Active Image paint-release warning: {exc}")
+
+    # Release all named 2D/3D Auto Sync refresh owners. New routers reacquire
+    # ownership only after the new image/layer target is fully bound.
+    set_direct_paint_refresh_owner(False)
+
+    if hasattr(scene, "blendgimp_blender_paint_sync_enabled"):
+        scene.blendgimp_blender_paint_sync_enabled = False
+    if hasattr(scene, "blendgimp_blender_paint_sync_image_id"):
+        scene.blendgimp_blender_paint_sync_image_id = -1
+    if hasattr(scene, "blendgimp_blender_paint_sync_layer_id"):
+        scene.blendgimp_blender_paint_sync_layer_id = -1
+    if hasattr(scene, "blendgimp_blender_paint_sync_status"):
+        scene.blendgimp_blender_paint_sync_status = "Rebinding active image"
+    reset_blender_paint_sync_runtime()
+
+    if hasattr(scene, "blendgimp_direct_paint_image_id"):
+        scene.blendgimp_direct_paint_image_id = -1
+    if hasattr(scene, "blendgimp_direct_paint_layer_id"):
+        scene.blendgimp_direct_paint_layer_id = -1
+    if hasattr(scene, "blendgimp_2d_paint_layer_id"):
+        scene.blendgimp_2d_paint_layer_id = -1
+
+
+def _retarget_auto_sync_to_image(scene, image_id):
+    """Keep normal Auto Sync aligned with the explicitly selected image."""
+    if scene is None or not bool(getattr(scene, "blendgimp_auto_sync_enabled", False)):
+        return
+    image_id = int(image_id)
+    if image_id < 0:
+        return
+    try:
+        state = connection_manager.get_image_state(image_id)
+        revision = int(state.get("revision", 0))
+        scene.blendgimp_auto_sync_image_id = image_id
+        scene.blendgimp_auto_sync_revision = revision
+        scene.blendgimp_auto_sync_detector = str(state.get("detector", ""))
+        scene.blendgimp_auto_sync_status = f"Watching revision {revision}"
+        reset_auto_sync_runtime(image_id, revision)
+        print(
+            "BLENDGIMP: Active Image Auto Sync retargeted "
+            f"image ID {image_id} revision={revision}"
+        )
+    except Exception as exc:
+        print(f"BLENDGIMP: Active Image Auto Sync retarget warning: {exc}")
+
+
+def _set_active_image_datablock(scene, image):
+    """Set the production-facing Blender Image selector without recursive updates."""
+    global _ACTIVE_IMAGE_DATABLOCK_UPDATE_GUARD
+    if scene is None or not hasattr(scene, "blendgimp_active_image"):
+        return
+    try:
+        if getattr(scene, "blendgimp_active_image", None) is image:
+            return
+        _ACTIVE_IMAGE_DATABLOCK_UPDATE_GUARD = True
+        scene.blendgimp_active_image = image
+    finally:
+        _ACTIVE_IMAGE_DATABLOCK_UPDATE_GUARD = False
+
+
+def _active_image_datablock_update(scene, context):
+    """Make the native Blender Image datablock selector drive BlendGimp ownership."""
+    global _ACTIVE_IMAGE_DATABLOCK_UPDATE_GUARD
+    if _ACTIVE_IMAGE_DATABLOCK_UPDATE_GUARD:
+        return
+
+    image = getattr(scene, "blendgimp_active_image", None)
+    if image is None:
+        try:
+            if hasattr(scene, "blendgimp_texture_editor_image_id"):
+                scene.blendgimp_texture_editor_image_id = -1
+            if hasattr(scene, "blendgimp_texture_editor_image_name"):
+                scene.blendgimp_texture_editor_image_name = ""
+            if hasattr(scene, "blendgimp_texture_editor_status"):
+                scene.blendgimp_texture_editor_status = "No active BlendGimp texture"
+        except Exception:
+            pass
+        return
+
+    image_id = _image_gimp_id(image)
+    if image_id < 0:
+        # Option B behavior: ordinary Blender images can be selected with the
+        # native datablock picker, but they are not silently converted into a
+        # GIMP document. Retire the previous GIMP paint/layer owner first so a
+        # stale layer buffer cannot remain armed behind the view-only image.
+        previous_id = int(getattr(scene, "blendgimp_texture_editor_image_id", -1))
+        try:
+            if previous_id >= 0 or int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) >= 0:
+                _retire_active_image_runtime(
+                    scene,
+                    reason="before selecting unlinked Blender image",
+                    fail_if_unsent=True,
+                )
+        except Exception as exc:
+            previous_image = _find_blendgimp_image(previous_id, "") if previous_id >= 0 else None
+            if previous_image is not None:
+                _set_active_image_datablock(scene, previous_image)
+            print(f"BLENDGIMP: Unlinked Active Image switch blocked: {exc}")
+            return
+
+        try:
+            from . import texture_editor
+            if hasattr(scene, "blendgimp_texture_editor_image_id"):
+                scene.blendgimp_texture_editor_image_id = -1
+            if hasattr(scene, "blendgimp_texture_editor_image_name"):
+                scene.blendgimp_texture_editor_image_name = image.name
+            if hasattr(scene, "blendgimp_texture_editor_status"):
+                scene.blendgimp_texture_editor_status = (
+                    f"{image.name} is not linked to BlendGimp"
+                )
+            for area in texture_editor._iter_enabled_texture_areas():
+                texture_editor._configure_texture_area(area, scene, image=image)
+            print(
+                "BLENDGIMP: Active Image changed to unlinked Blender image "
+                f"name={image.name!r}; GIMP paint ownership retired"
+            )
+        except Exception as exc:
+            print(f"BLENDGIMP: Unlinked Active Image display warning: {exc}")
+        return
+
+    try:
+        from . import texture_editor
+        bound_image = texture_editor._set_active_texture(scene, image_id)
+        if bound_image is None:
+            return
+        if bound_image is not image:
+            # A pending Unified Paint Sync flush may block the texture switch.
+            # Keep the datablock picker truthful by restoring the actual target.
+            _set_active_image_datablock(scene, bound_image)
+        scene.blendgimp_texture_editor_follow_active = False
+        scene.blendgimp_texture_editor_status = f"Pinned Texture — {bound_image.name}"
+        if context is not None and getattr(context, "scene", None) is scene:
+            texture_editor._sync_texture_areas(context)
+        print(
+            "BLENDGIMP: Active Image selection complete "
+            f"Blender={bound_image.name!r} GIMP image ID={_image_gimp_id(bound_image)} "
+            f"layer ID={int(getattr(scene, 'blendgimp_blender_paint_sync_layer_id', -1))}"
+        )
+    except Exception as exc:
+        print(f"BLENDGIMP: Active Image datablock selection warning: {exc}")
+
+
 def _image_gimp_id(image):
     if image is None:
         return -1
@@ -5842,7 +6316,15 @@ def _resolve_active_gimp_image_id(context):
     if scene is None:
         return -1
 
-    # The BlendGimp Image Editor is the strongest artist-facing signal.
+    # The production-facing native Blender Image datablock picker is the
+    # strongest explicit user choice.  A selected ordinary Blender image is
+    # intentionally allowed here and resolves to -1 until it is BlendGimp-backed.
+    if hasattr(scene, "blendgimp_active_image"):
+        selected_image = getattr(scene, "blendgimp_active_image", None)
+        if selected_image is not None:
+            return _image_gimp_id(selected_image)
+
+    # The BlendGimp Image Editor is the next strongest artist-facing signal.
     space = getattr(context, "space_data", None)
     if getattr(space, "type", "") == "IMAGE_EDITOR":
         image_id = _image_gimp_id(getattr(space, "image", None))
@@ -5901,6 +6383,11 @@ def _resolve_active_gimp_image_id(context):
 
 
 def _resolve_active_blender_image(context, image_id=None):
+    scene = getattr(context, "scene", None)
+    if image_id is None and scene is not None and hasattr(scene, "blendgimp_active_image"):
+        selected_image = getattr(scene, "blendgimp_active_image", None)
+        if selected_image is not None:
+            return selected_image
     if image_id is None:
         image_id = _resolve_active_gimp_image_id(context)
     try:
@@ -6162,6 +6649,7 @@ class BLENDGIMP_OT_create_image(
             scene.blendgimp_auto_sync_enabled = True
             scene.blendgimp_auto_sync_image_id = image_id
             scene.blendgimp_auto_sync_revision = revision
+            _set_active_image_datablock(scene, blender_image)
             scene.blendgimp_auto_sync_status = (
                 f"Watching revision {revision}"
             )
@@ -6429,6 +6917,7 @@ class BLENDGIMP_OT_open_xcf(
             # Follow the reopened document in the BlendGimp texture editor.
             if hasattr(scene, "blendgimp_texture_editor_image_id"):
                 scene.blendgimp_texture_editor_image_id = image_id
+            _set_active_image_datablock(scene, blender_image)
 
             image_name = str(response.get("image_name", "") or os.path.basename(path))
             layer_count = int(layer_response.get("layer_count", 0))
@@ -7152,10 +7641,19 @@ class BLENDGIMP_OT_direct_live_refresh(
                 # Keep Blender's reusable raw-layer paint target coherent with
                 # the GIMP edit, using only the same dirty rectangle.
                 try:
+                    sync_image_id = int(getattr(
+                        context.scene, "blendgimp_blender_paint_sync_image_id", -1
+                    ))
                     sync_layer_id = int(getattr(
                         context.scene, "blendgimp_blender_paint_sync_layer_id", -1
                     ))
-                    if sync_layer_id >= 0:
+                    if sync_image_id != int(self.image_id):
+                        print(
+                            "BLENDGIMP: Active Layer Buffer live patch skipped — "
+                            f"operation image ID {int(self.image_id)} does not match "
+                            f"buffer owner image ID {sync_image_id}"
+                        )
+                    elif sync_layer_id >= 0:
                         x = int(transport_response.get("x", 0))
                         y = int(transport_response.get("y", 0))
                         rw = int(transport_response.get("region_width", 0))
@@ -7879,6 +8377,38 @@ class BLENDGIMP_OT_get_image_layers(
 
 
 # ============================================================
+# PHASE 7.1 — LAYER MASK TARGET OWNERSHIP
+# ============================================================
+
+def _retire_layer_edit_runtime(scene, reason):
+    """Flush pending pixels and release modal paint ownership before Layer↔Mask switches."""
+    flush_blender_paint_changes(
+        scene,
+        reason=reason,
+        fail_if_unsent=True,
+    )
+    try:
+        from . import texture_editor
+        texture_editor.request_blendgimp_paint_release(scene, reason)
+    except Exception as exc:
+        print(f"BLENDGIMP: Layer-mask paint-release warning: {exc}")
+    set_direct_paint_refresh_owner(False)
+    if hasattr(scene, "blendgimp_direct_paint_layer_id"):
+        scene.blendgimp_direct_paint_layer_id = -1
+    if hasattr(scene, "blendgimp_2d_paint_layer_id"):
+        scene.blendgimp_2d_paint_layer_id = -1
+
+
+def _reload_layer_or_mask_buffer(scene, image_id, layer_id):
+    """Reload the selected GIMP layer's currently edited drawable into Blender."""
+    if int(getattr(scene, "blendgimp_blender_paint_sync_image_id", -1)) not in {-1, int(image_id)}:
+        return None
+    return load_active_layer_buffer_from_gimp(
+        scene, int(image_id), int(layer_id), clear_first=True, activate_target=True
+    )
+
+
+# ============================================================
 # SET ACTIVE LAYER
 # ============================================================
 
@@ -8202,6 +8732,200 @@ class BLENDGIMP_OT_set_layer_opacity(
 
             return {"CANCELLED"}
 
+
+
+# ============================================================
+# PHASE 7.1 — LAYER MASK FOUNDATION
+# ============================================================
+
+class BLENDGIMP_OT_add_layer_mask(bpy.types.Operator):
+    bl_idname = "blendgimp.add_layer_mask"
+    bl_label = "Add GIMP Layer Mask"
+    bl_description = "Add a native GIMP layer mask and begin editing it"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Layer ID", default=-1)
+    mask_type: bpy.props.EnumProperty(
+        name="Initialize Mask",
+        items=(
+            ("WHITE", "White (Full Opacity)", "Keep the layer fully visible"),
+            ("BLACK", "Black (Full Transparency)", "Hide the layer completely"),
+            ("ALPHA", "Layer Alpha", "Initialize from the layer alpha channel"),
+            ("ALPHA_TRANSFER", "Transfer Alpha", "Transfer layer alpha into the mask"),
+            ("SELECTION", "Selection", "Initialize from the current GIMP selection"),
+            ("COPY", "Grayscale Copy", "Initialize from a grayscale copy of the layer"),
+        ),
+        default="WHITE",
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        self.layout.prop(self, "mask_type")
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _retire_layer_edit_runtime(scene, "before adding layer mask")
+            response = connection_manager.add_layer_mask(
+                self.image_id, self.layer_id, self.mask_type
+            )
+            refresh_layer_result(scene, self.image_id)
+            _reload_layer_or_mask_buffer(scene, self.image_id, self.layer_id)
+            try:
+                synchronize_gimp_composite(
+                    context, self.image_id, assign_material=False, dirty_only=True
+                )
+            except Exception as sync_exc:
+                print(f"BLENDGIMP: ADD_LAYER_MASK sync warning: {sync_exc}")
+            print(
+                "BLENDGIMP: Added layer mask "
+                f"image ID {self.image_id} layer ID {self.layer_id} "
+                f"mask ID {response.get('mask_id')} type={self.mask_type}"
+            )
+            self.report({"INFO"}, "Layer mask added - editing mask")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: ADD_LAYER_MASK failed: {exc}")
+            self.report({"ERROR"}, f"Add Layer Mask failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_set_layer_mask_edit(bpy.types.Operator):
+    bl_idname = "blendgimp.set_layer_mask_edit"
+    bl_label = "Choose Layer or Mask Editing"
+    bl_description = "Choose whether paint tools edit the raster layer or its GIMP layer mask"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Layer ID", default=-1)
+    edit_mask: bpy.props.BoolProperty(name="Edit Mask", default=True)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _retire_layer_edit_runtime(
+                scene, "before switching layer/mask paint target"
+            )
+            response = connection_manager.set_layer_mask_edit(
+                self.image_id, self.layer_id, bool(self.edit_mask)
+            )
+            refresh_layer_result(scene, self.image_id)
+            _reload_layer_or_mask_buffer(scene, self.image_id, self.layer_id)
+            target = str(response.get("target_kind", "MASK" if self.edit_mask else "LAYER"))
+            print(
+                "BLENDGIMP: Layer-mask paint target changed "
+                f"image ID {self.image_id} layer ID {self.layer_id} target={target}"
+            )
+            self.report({"INFO"}, f"Editing {target.title()}")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: SET_LAYER_MASK_EDIT failed: {exc}")
+            self.report({"ERROR"}, f"Layer/Mask switch failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_set_layer_mask_apply(bpy.types.Operator):
+    bl_idname = "blendgimp.set_layer_mask_apply"
+    bl_label = "Enable or Disable Layer Mask"
+    bl_description = "Enable or disable the GIMP layer mask without deleting it"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Layer ID", default=-1)
+    apply_mask: bpy.props.BoolProperty(name="Enabled", default=True)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            flush_blender_paint_changes(
+                scene, reason="before toggling layer mask", fail_if_unsent=True
+            )
+            response = connection_manager.set_layer_mask_apply(
+                self.image_id, self.layer_id, bool(self.apply_mask)
+            )
+            refresh_layer_result(scene, self.image_id)
+            try:
+                synchronize_gimp_composite(
+                    context, self.image_id, assign_material=False, dirty_only=True
+                )
+            except Exception as sync_exc:
+                print(f"BLENDGIMP: SET_LAYER_MASK_APPLY sync warning: {sync_exc}")
+            enabled = bool(response.get("mask_apply", self.apply_mask))
+            print(f"BLENDGIMP: Layer ID {self.layer_id} mask enabled={enabled}")
+            self.report({"INFO"}, f"Layer mask {'enabled' if enabled else 'disabled'}")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: SET_LAYER_MASK_APPLY failed: {exc}")
+            self.report({"ERROR"}, f"Mask enable/disable failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_set_layer_mask_show(bpy.types.Operator):
+    bl_idname = "blendgimp.set_layer_mask_show"
+    bl_label = "Show Layer Mask"
+    bl_description = "Toggle GIMP's mask-only display for this layer"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Layer ID", default=-1)
+    show_mask: bpy.props.BoolProperty(name="Show Mask", default=False)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            response = connection_manager.set_layer_mask_show(
+                self.image_id, self.layer_id, bool(self.show_mask)
+            )
+            refresh_layer_result(scene, self.image_id)
+            shown = bool(response.get("mask_show", self.show_mask))
+            print(f"BLENDGIMP: Layer ID {self.layer_id} show mask={shown}")
+            self.report({"INFO"}, f"Mask-only view {'enabled' if shown else 'disabled'}")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: SET_LAYER_MASK_SHOW failed: {exc}")
+            self.report({"ERROR"}, f"Show Mask failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_remove_layer_mask(bpy.types.Operator):
+    bl_idname = "blendgimp.remove_layer_mask"
+    bl_label = "Remove GIMP Layer Mask"
+    bl_description = "Apply the layer mask permanently or discard it"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Layer ID", default=-1)
+    apply: bpy.props.BoolProperty(name="Apply Mask", default=False)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _retire_layer_edit_runtime(
+                scene, "before applying/removing layer mask"
+            )
+            response = connection_manager.remove_layer_mask(
+                self.image_id, self.layer_id, bool(self.apply)
+            )
+            refresh_layer_result(scene, self.image_id)
+            _reload_layer_or_mask_buffer(scene, self.image_id, self.layer_id)
+            try:
+                synchronize_gimp_composite(
+                    context, self.image_id, assign_material=False, dirty_only=True
+                )
+            except Exception as sync_exc:
+                print(f"BLENDGIMP: REMOVE_LAYER_MASK sync warning: {sync_exc}")
+            action = "applied" if bool(response.get("applied", self.apply)) else "deleted"
+            print(
+                f"BLENDGIMP: Layer mask {action} "
+                f"image ID {self.image_id} layer ID {self.layer_id}"
+            )
+            self.report({"INFO"}, f"Layer mask {action}")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: REMOVE_LAYER_MASK failed: {exc}")
+            self.report({"ERROR"}, f"Remove Layer Mask failed: {exc}")
+            return {"CANCELLED"}
 
 
 # ============================================================
@@ -8853,6 +9577,35 @@ class BLENDGIMP_OT_move_layer(
 # CREATE GROUP
 # ============================================================
 
+class BLENDGIMP_OT_toggle_group_collapse(bpy.types.Operator):
+    bl_idname = "blendgimp.toggle_group_collapse"
+    bl_label = "Toggle Group Collapse"
+    bl_description = "Collapse or expand this GIMP layer group in the BlendGimp layer stack"
+    bl_options = {"INTERNAL"}
+
+    group_id: bpy.props.IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        group_id = int(self.group_id)
+        if group_id < 0:
+            return {"CANCELLED"}
+        collapsed = _collapsed_group_ids(scene)
+        if group_id in collapsed:
+            collapsed.remove(group_id)
+            state = "expanded"
+        else:
+            collapsed.add(group_id)
+            state = "collapsed"
+        _set_collapsed_group_ids(scene, collapsed)
+        try:
+            context.area.tag_redraw()
+        except Exception:
+            pass
+        print(f"BLENDGIMP: Layer group UI {state} ID {group_id}")
+        return {"FINISHED"}
+
+
 class BLENDGIMP_OT_create_group(
     bpy.types.Operator
 ):
@@ -9037,6 +9790,148 @@ class BLENDGIMP_OT_merge_layer_down(
                 f"MERGE_LAYER_DOWN failed: {exc}"
             )
 
+            return {"CANCELLED"}
+
+
+# ============================================================
+# ADVANCED LAYER OPERATIONS
+# ============================================================
+
+class BLENDGIMP_OT_duplicate_group(bpy.types.Operator):
+    bl_idname = "blendgimp.duplicate_group"
+    bl_label = "Duplicate GIMP Group"
+    bl_description = "Duplicate the selected GIMP group and its children"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Group ID", default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _retire_layer_edit_runtime(scene, "duplicate group")
+            response = connection_manager.duplicate_group(self.image_id, self.layer_id)
+            refresh_layer_result(scene, self.image_id)
+            try:
+                synchronize_gimp_composite(context, self.image_id, assign_material=False, dirty_only=True)
+            except Exception as sync_exc:
+                print(f"BLENDGIMP: DUPLICATE_GROUP sync warning: {sync_exc}")
+            print(
+                "BLENDGIMP: Duplicated GIMP group "
+                f"ID {self.layer_id} as ID {response.get('layer_id')}"
+            )
+            self.report({"INFO"}, f"Duplicated group as {response.get('name', '')}")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: DUPLICATE_GROUP failed: {exc}")
+            self.report({"ERROR"}, f"Duplicate Group failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_set_layer_color_tag(bpy.types.Operator):
+    bl_idname = "blendgimp.set_layer_color_tag"
+    bl_label = "Set GIMP Layer Color Tag"
+    bl_description = "Assign a native GIMP color tag to this layer or group"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+    layer_id: bpy.props.IntProperty(name="Layer ID", default=-1)
+    color_tag: bpy.props.EnumProperty(
+        name="Color Tag",
+        description="Native GIMP layer color tag",
+        items=BLENDGIMP_COLOR_TAG_ITEMS,
+        default="NONE",
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        self.layout.prop(self, "color_tag")
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            response = connection_manager.set_layer_color_tag(
+                self.image_id, self.layer_id, self.color_tag
+            )
+            refresh_layer_result(scene, self.image_id)
+            # Force the production Layers panel to redraw immediately so the
+            # new color swatch and label are visible without another click.
+            tag_texture_views_for_redraw(context)
+            actual = str(response.get("color_tag", self.color_tag))
+            print(f"BLENDGIMP: Layer ID {self.layer_id} color tag={actual}")
+            self.report({"INFO"}, f"Color tag: {blendgimp_color_tag_label(actual)}")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: SET_LAYER_COLOR_TAG failed: {exc}")
+            self.report({"ERROR"}, f"Set Color Tag failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_merge_visible_layers(bpy.types.Operator):
+    bl_idname = "blendgimp.merge_visible_layers"
+    bl_label = "Merge Visible GIMP Layers"
+    bl_description = "Merge all visible GIMP layers into one layer"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _retire_layer_edit_runtime(scene, "merge visible layers")
+            response = connection_manager.merge_visible_layers(self.image_id)
+            result_layer_id = int(response.get("layer_id", -1))
+            refresh_layer_result(scene, self.image_id)
+            synchronize_gimp_composite(
+                context, self.image_id, assign_material=False, dirty_only=True
+            )
+            if result_layer_id >= 0:
+                _reload_layer_or_mask_buffer(scene, self.image_id, result_layer_id)
+            print(
+                "BLENDGIMP: Merged visible layers "
+                f"image ID {self.image_id} -> layer ID {result_layer_id}"
+            )
+            self.report({"INFO"}, "Merged visible layers")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: MERGE_VISIBLE_LAYERS failed: {exc}")
+            self.report({"ERROR"}, f"Merge Visible failed: {exc}")
+            return {"CANCELLED"}
+
+
+class BLENDGIMP_OT_flatten_image(bpy.types.Operator):
+    bl_idname = "blendgimp.flatten_image"
+    bl_label = "Flatten GIMP Image"
+    bl_description = "Flatten visible layers into one layer and discard hidden layers"
+
+    image_id: bpy.props.IntProperty(name="Image ID", default=-1)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        scene = context.scene
+        try:
+            _retire_layer_edit_runtime(scene, "flatten image")
+            response = connection_manager.flatten_image(self.image_id)
+            result_layer_id = int(response.get("layer_id", -1))
+            refresh_layer_result(scene, self.image_id)
+            synchronize_gimp_composite(
+                context, self.image_id, assign_material=False, dirty_only=True
+            )
+            if result_layer_id >= 0:
+                _reload_layer_or_mask_buffer(scene, self.image_id, result_layer_id)
+            print(
+                "BLENDGIMP: Flattened GIMP image "
+                f"ID {self.image_id} -> layer ID {result_layer_id}"
+            )
+            self.report({"INFO"}, "Flattened image")
+            return {"FINISHED"}
+        except Exception as exc:
+            print(f"BLENDGIMP: FLATTEN_IMAGE failed: {exc}")
+            self.report({"ERROR"}, f"Flatten Image failed: {exc}")
             return {"CANCELLED"}
 
 
@@ -9339,7 +10234,7 @@ class BLENDGIMP_PT_main_panel(
         # ====================================================
 
         layout.label(
-            text="BlendGimp 0.5.3 — Production UI"
+            text="BlendGimp 0.5.18 — Phase 7.2 Real Brush Preview + Hotkeys"
         )
 
         layout.separator()
@@ -9460,18 +10355,28 @@ class BLENDGIMP_PT_main_panel(
                 material_row.label(text="No active object")
 
             image_id = _resolve_active_gimp_image_id(context)
-            blender_image = _resolve_active_blender_image(context, image_id)
-            image_name = (
-                blender_image.name
-                if blender_image is not None
-                else _stored_gimp_image_name(scene, image_id)
-            )
+            blender_image = _resolve_active_blender_image(context)
 
             image_row = connection_box.row(align=True)
             image_row.label(text="Active Image", icon="IMAGE_DATA")
-            image_row.label(
-                text=(image_name or "No BlendGimp image")
+            # Blender-native Image datablock browser, matching Blender's own
+            # Surface/Image workflows.  The folder button loads an ordinary
+            # Blender image datablock; BlendGimp-backed images immediately
+            # become the active BlendGimp texture through the update callback.
+            image_row.template_ID(
+                scene,
+                "blendgimp_active_image",
+                text="",
+                open="image.open",
             )
+
+            if blender_image is not None and _image_gimp_id(blender_image) < 0:
+                unlinked = connection_box.row()
+                unlinked.alert = True
+                unlinked.label(
+                    text="Selected image is not linked to BlendGimp",
+                    icon="INFO",
+                )
 
             actions = connection_box.row(align=True)
             actions.operator(
@@ -9569,6 +10474,16 @@ classes = (
 
     BLENDGIMP_OT_set_layer_opacity,
 
+    BLENDGIMP_OT_add_layer_mask,
+
+    BLENDGIMP_OT_set_layer_mask_edit,
+
+    BLENDGIMP_OT_set_layer_mask_apply,
+
+    BLENDGIMP_OT_set_layer_mask_show,
+
+    BLENDGIMP_OT_remove_layer_mask,
+
     BLENDGIMP_OT_add_layer,
 
     BLENDGIMP_OT_delete_layer,
@@ -9581,9 +10496,18 @@ classes = (
 
     BLENDGIMP_OT_move_layer,
 
+    BLENDGIMP_OT_toggle_group_collapse,
     BLENDGIMP_OT_create_group,
 
     BLENDGIMP_OT_merge_layer_down,
+
+    BLENDGIMP_OT_duplicate_group,
+
+    BLENDGIMP_OT_set_layer_color_tag,
+
+    BLENDGIMP_OT_merge_visible_layers,
+
+    BLENDGIMP_OT_flatten_image,
 
     BLENDGIMP_OT_set_layer_lock,
 
@@ -9754,6 +10678,8 @@ def blendgimp_undo_redo_post(_scene_arg=None):
 
 def register():
 
+    _register_color_tag_previews()
+
     global _EXIT_PRE_HANDLED
     _EXIT_PRE_HANDLED = False
 
@@ -9921,6 +10847,17 @@ def register():
         )
     )
 
+    bpy.types.Scene.blendgimp_collapsed_group_ids = (
+        bpy.props.StringProperty(
+            name="Collapsed BlendGimp Group IDs",
+            description=(
+                "Comma-separated GIMP group IDs collapsed in the Blender "
+                "Layers panel; this changes only Blender UI presentation"
+            ),
+            default="",
+        )
+    )
+
     bpy.types.Scene.blendgimp_create_width = (
         bpy.props.IntProperty(
             name="Texture Width",
@@ -9992,6 +10929,18 @@ def register():
         bpy.props.StringProperty(
             name="Initial Layer Name",
             default="BaseColor"
+        )
+    )
+
+    bpy.types.Scene.blendgimp_active_image = (
+        bpy.props.PointerProperty(
+            name="Active Image",
+            description=(
+                "Blender Image datablock used as the current production-facing "
+                "BlendGimp image selection"
+            ),
+            type=bpy.types.Image,
+            update=_active_image_datablock_update,
         )
     )
 
@@ -10368,6 +11317,8 @@ def unregister():
     except Exception:
         pass
 
+    _unregister_color_tag_previews()
+
     # --------------------------------------------------------
     # Stop lifecycle recovery before closing the connection.
     # --------------------------------------------------------
@@ -10722,6 +11673,11 @@ def unregister():
 
     del (
         bpy.types.Scene.
+        blendgimp_active_image
+    )
+
+    del (
+        bpy.types.Scene.
         blendgimp_created_image_id
     )
 
@@ -10754,6 +11710,9 @@ def unregister():
         bpy.types.Scene.
         blendgimp_create_width
     )
+
+    if hasattr(bpy.types.Scene, "blendgimp_collapsed_group_ids"):
+        del bpy.types.Scene.blendgimp_collapsed_group_ids
 
     del (
         bpy.types.Scene.
